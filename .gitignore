@@ -1,34 +1,19 @@
-# Gradle files
-.gradle/
-build/
+# Binaries
+huginn-messenger
+*.exe
+*.test
 
-# Local configuration file (sdk path, etc)
-local.properties
+# Go workspace
+go.work
+go.work.sum
 
-# Log/OS Files
+# OS files
 *.log
+.DS_Store
+Thumbs.db
 
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
-*.apk
-output-metadata.json
-
-# IntelliJ
-*.iml
+# IDE
 .idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
-
-# Keystore files
-*.jks
-*.keystore
-
-# Google Services (e.g. APIs or Firebase)
-google-services.json
-
-# Android Profiling
-*.hprof
+.vscode/
+*.swp
+*.swo
