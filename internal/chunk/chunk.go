@@ -7,11 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 )
 
-const ChunkSize = 1024
+const ChunkSize = 64
 
 type Envelope struct {
 	MessageID    string `json:"message_id"`
@@ -19,33 +20,35 @@ type Envelope struct {
 	RecipientID  string `json:"recipient_id"`
 	TotalChunks  int    `json:"total_chunks"`
 	ChunkIndex   int    `json:"chunk_index"`
-	EncryptedKey string `json:"encrypted_key"`
 	Ciphertext   string `json:"ciphertext"`
 	Nonce        string `json:"nonce"`
-	FullNonce    string `json:"full_nonce"`
+	EphemeralKey string `json:"ephemeral_key"`
 	Signature    string `json:"signature"`
 }
 
-func SplitAndEncrypt(messageID, senderID, recipientID string, plaintext []byte, aesKey []byte, signKey ed25519.PrivateKey) ([]Envelope, error) {
-	encryptedKey := crypto.EncodeKey(aesKey)
-
-	ciphertextFull, fullNonce, err := crypto.EncryptAES(plaintext, aesKey)
+func SplitAndEncrypt(messageID, senderID, recipientID string, plaintext []byte, recipientPubKey []byte, signKey ed25519.PrivateKey) ([]Envelope, error) {
+	ephemPriv, ephemPub, err := crypto.GenerateEncryptionKey()
 	if err != nil {
-		return nil, fmt.Errorf("encrypt full text: %w", err)
+		return nil, fmt.Errorf("generate ephemeral key: %w", err)
 	}
 
-	chunkSize := ChunkSize
-	total := (len(ciphertextFull) + chunkSize - 1) / chunkSize
+	aesKey, err := crypto.DeriveSharedKey(ephemPriv, recipientPubKey)
+	if err != nil {
+		return nil, fmt.Errorf("derive shared key: %w", err)
+	}
+
+	total := (len(plaintext) + ChunkSize - 1) / ChunkSize
 	envelopes := make([]Envelope, total)
+	ephemKeyEncoded := crypto.EncodeKey(ephemPub)
 
 	for i := 0; i < total; i++ {
-		start := i * chunkSize
-		end := start + chunkSize
-		if end > len(ciphertextFull) {
-			end = len(ciphertextFull)
+		start := i * ChunkSize
+		end := start + ChunkSize
+		if end > len(plaintext) {
+			end = len(plaintext)
 		}
 
-		ciphertext, nonce, err := crypto.EncryptAES(ciphertextFull[start:end], aesKey)
+		ciphertext, nonce, err := crypto.EncryptAES(plaintext[start:end], aesKey)
 		if err != nil {
 			return nil, fmt.Errorf("encrypt chunk %d: %w", i, err)
 		}
@@ -56,10 +59,9 @@ func SplitAndEncrypt(messageID, senderID, recipientID string, plaintext []byte, 
 			RecipientID:  recipientID,
 			TotalChunks:  total,
 			ChunkIndex:   i,
-			EncryptedKey: encryptedKey,
-			Ciphertext:   crypto.EncodeKey(ciphertext),
+			Ciphertext:   base64.StdEncoding.EncodeToString(ciphertext),
 			Nonce:        crypto.EncodeKey(nonce),
-			FullNonce:    crypto.EncodeKey(fullNonce),
+			EphemeralKey: ephemKeyEncoded,
 		}
 
 		sigData := envelopeBytes(env)
@@ -71,7 +73,7 @@ func SplitAndEncrypt(messageID, senderID, recipientID string, plaintext []byte, 
 	return envelopes, nil
 }
 
-func AssembleAndDecrypt(envelopes []Envelope, decryptKey []byte, verifyKey ed25519.PublicKey) ([]byte, error) {
+func AssembleAndDecrypt(envelopes []Envelope, myPrivateKey, myPublicKey []byte, verifyKey ed25519.PublicKey) ([]byte, error) {
 	if len(envelopes) == 0 {
 		return nil, fmt.Errorf("no envelopes")
 	}
@@ -79,53 +81,55 @@ func AssembleAndDecrypt(envelopes []Envelope, decryptKey []byte, verifyKey ed255
 	for _, env := range envelopes {
 		sig, err := crypto.DecodeKey(env.Signature)
 		if err != nil {
-			return nil, fmt.Errorf("decode sig chunk %d: %w", env.ChunkIndex, err)
+			return nil, fmt.Errorf("decode sig: %w", err)
 		}
 		sigData := envelopeBytes(env)
 		if !crypto.Verify(verifyKey, sigData, sig) {
-			return nil, fmt.Errorf("invalid signature on chunk %d", env.ChunkIndex)
+			return nil, fmt.Errorf("invalid signature on envelope")
 		}
 	}
 
-	var aesKey []byte
-	encKey, err := crypto.DecodeKey(envelopes[0].EncryptedKey)
+	ephemPub, err := crypto.DecodeKey(envelopes[0].EphemeralKey)
 	if err != nil {
-		return nil, fmt.Errorf("decode encrypted key: %w", err)
-	}
-	if bytes.Equal(encKey, decryptKey) {
-		aesKey = decryptKey
-	} else {
-		aesKey = encKey
+		return nil, fmt.Errorf("decode ephemeral key: %w", err)
 	}
 
-	fullNonce, err := crypto.DecodeKey(envelopes[0].FullNonce)
+	aesKey, err := crypto.DeriveSharedKey(myPrivateKey, ephemPub)
 	if err != nil {
-		return nil, fmt.Errorf("decode full nonce: %w", err)
+		return nil, fmt.Errorf("derive shared key: %w", err)
 	}
 
-	var outerBuf bytes.Buffer
+	type chunkData struct {
+		index int
+		data  []byte
+	}
+	var chunks []chunkData
+
 	for _, env := range envelopes {
-		ct, err := crypto.DecodeKey(env.Ciphertext)
+		nonce, err := crypto.DecodeKey(env.Nonce)
 		if err != nil {
-			return nil, fmt.Errorf("decode ct chunk %d: %w", env.ChunkIndex, err)
+			return nil, fmt.Errorf("decode nonce: %w", err)
 		}
-		innerNonce, err := crypto.DecodeKey(env.Nonce)
+		ciphertext, err := base64.StdEncoding.DecodeString(env.Ciphertext)
 		if err != nil {
-			return nil, fmt.Errorf("decode nonce chunk %d: %w", env.ChunkIndex, err)
+			return nil, fmt.Errorf("decode ciphertext: %w", err)
 		}
-		chunkPlain, err := crypto.DecryptAES(ct, innerNonce, aesKey)
+
+		plaintext, err := crypto.DecryptAES(ciphertext, nonce, aesKey)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt inner chunk %d: %w", env.ChunkIndex, err)
+			return nil, fmt.Errorf("decrypt chunk %d: %w", env.ChunkIndex, err)
 		}
-		outerBuf.Write(chunkPlain)
+		chunks = append(chunks, chunkData{index: env.ChunkIndex, data: plaintext})
 	}
 
-	plaintext, err := crypto.DecryptAES(outerBuf.Bytes(), fullNonce, aesKey)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt outer: %w", err)
+	sort.Slice(chunks, func(i, j int) bool { return chunks[i].index < chunks[j].index })
+
+	var buf bytes.Buffer
+	for _, c := range chunks {
+		buf.Write(c.data)
 	}
 
-	return plaintext, nil
+	return buf.Bytes(), nil
 }
 
 func ComputeHash(data []byte) string {
@@ -143,12 +147,11 @@ func envelopeBytes(env Envelope) []byte {
 		"message_id":    env.MessageID,
 		"sender_id":     env.SenderID,
 		"recipient_id":  env.RecipientID,
-		"chunk_index":   fmt.Sprintf("%d", env.ChunkIndex),
 		"total_chunks":  fmt.Sprintf("%d", env.TotalChunks),
-		"encrypted_key": env.EncryptedKey,
+		"chunk_index":   fmt.Sprintf("%d", env.ChunkIndex),
 		"ciphertext":    env.Ciphertext,
 		"nonce":         env.Nonce,
-		"full_nonce":    env.FullNonce,
+		"ephemeral_key": env.EphemeralKey,
 	}
 	b, _ := json.Marshal(data)
 	return b

@@ -17,3 +17,6 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+**.db*
+build.sh

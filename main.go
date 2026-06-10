@@ -21,7 +21,7 @@ func main() {
 
 	mc := muninn.NewClient(cfg.MuninnAddr)
 
-	m, err := messenger.New(cfg.Username, cfg.MsgPort, mc)
+	m, err := messenger.New(cfg.Username, mc, cfg.DBPath)
 	if err != nil {
 		log.Fatalf("failed to create messenger: %v", err)
 	}
@@ -29,16 +29,12 @@ func main() {
 	if err := m.Register(); err != nil {
 		log.Printf("warning: register failed: %v", err)
 	}
-	if err := m.RefreshPeers(); err != nil {
-		log.Printf("warning: refresh peers failed: %v", err)
-	}
 
 	uiSrv := ui.NewServer(cfg.UIPort, m)
 
 	go func() {
 		log.Printf("web UI started at http://localhost:%d", cfg.UIPort)
 		log.Printf("connect to muninn: %s", cfg.MuninnAddr)
-		log.Printf("P2P messaging on: %s", m.MsgAddr)
 		if err := uiSrv.Start(); err != nil {
 			log.Fatalf("UI server error: %v", err)
 		}

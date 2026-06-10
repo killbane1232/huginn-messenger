@@ -10,7 +10,7 @@ type Config struct {
 	MuninnAddr string
 	Username   string
 	UIPort     int
-	MsgPort    int
+	DBPath     string
 }
 
 func Parse() *Config {
@@ -18,7 +18,7 @@ func Parse() *Config {
 	flag.StringVar(&c.MuninnAddr, "muninn", "http://localhost:8080", "muninn server address")
 	flag.StringVar(&c.Username, "username", "", "your username (required)")
 	flag.IntVar(&c.UIPort, "ui-port", 0, "web UI port (default: random)")
-	flag.IntVar(&c.MsgPort, "msg-port", 0, "P2P message port (default: random)")
+	flag.StringVar(&c.DBPath, "db", "huginn.db", "path to SQLite database")
 	flag.Parse()
 
 	if c.Username == "" {
@@ -28,9 +28,6 @@ func Parse() *Config {
 	}
 	if c.UIPort == 0 {
 		c.UIPort = findFreePort()
-	}
-	if c.MsgPort == 0 {
-		c.MsgPort = findFreePort()
 	}
 	return c
 }

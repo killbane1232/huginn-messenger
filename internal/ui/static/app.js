@@ -1,6 +1,7 @@
 let peers = [];
 let activePeer = null;
 let me = {};
+let searchTimeout = null;
 
 async function fetchMe() {
   const r = await fetch('/api/me');
@@ -23,18 +24,16 @@ function renderPeerList() {
   list.innerHTML = '';
   peers.forEach(p => {
     const name = p.metadata && p.metadata.username ? p.metadata.username : p.id;
-    const addr = p.addresses && p.addresses[0] ? p.addresses[0] : 'unknown';
     const initials = name.charAt(0).toUpperCase();
 
     const div = document.createElement('div');
     div.className = 'peer-item' + (activePeer === p.id ? ' active' : '');
     div.innerHTML = `
-      <div class="peer-avatar">${initials}</div>
+      <div class="peer-avatar ${p.online ? 'online' : 'offline'}">${initials}</div>
       <div class="peer-info">
         <div class="peer-name">${name}</div>
-        <div class="peer-addr">${addr}</div>
+        <div class="peer-status"><span class="${p.online ? 'status-online' : 'status-offline'}">${p.online ? 'online' : 'offline'}</span></div>
       </div>
-      <div class="peer-score">${p.quality_score || 0}</div>
     `;
     div.addEventListener('click', () => selectPeer(p.id));
     list.appendChild(div);
@@ -67,7 +66,8 @@ function renderMessages(msgs, peerID) {
     const div = document.createElement('div');
     div.className = 'msg ' + (isSent ? 'sent' : 'received');
     const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    div.innerHTML = msg.text + '<div class="msg-time">' + time + '</div>';
+    const senderLabel = isSent ? '' : '<div class="msg-sender">' + msg.from + '</div>';
+    div.innerHTML = senderLabel + msg.text + '<div class="msg-time">' + time + '</div>';
     container.appendChild(div);
   });
   container.scrollTop = container.scrollHeight;
@@ -111,7 +111,7 @@ function setupSSE() {
 
   evtSource.addEventListener('message', async function(e) {
     const msg = JSON.parse(e.data);
-    if (activePeer && (msg.from === activePeer || msg.to === me.username)) {
+    if (activePeer && (msg.from === activePeer || msg.from === me.username)) {
       const msgs = await fetchMessages(activePeer);
       renderMessages(msgs, activePeer);
     }
@@ -130,5 +130,18 @@ document.addEventListener('DOMContentLoaded', async function() {
   document.getElementById('send-btn').addEventListener('click', sendMessage);
   document.getElementById('msg-input').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') sendMessage();
+  });
+  document.getElementById('peer-search').addEventListener('input', function() {
+    clearTimeout(searchTimeout);
+    const q = this.value.trim();
+    searchTimeout = setTimeout(async () => {
+      if (!q) {
+        await fetchPeers();
+        return;
+      }
+      const r = await fetch('/api/peers/search?q=' + encodeURIComponent(q));
+      peers = await r.json();
+      renderPeerList();
+    }, 200);
   });
 });

@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/killbane1232/huginn-messenger/internal/messenger"
@@ -38,6 +39,7 @@ func (s *Server) Start() error {
 
 	mux.HandleFunc("GET /", s.handleIndex)
 	mux.HandleFunc("GET /api/me", s.handleMe)
+	mux.HandleFunc("GET /api/peers/search", s.handlePeerSearch)
 	mux.HandleFunc("GET /api/peers", s.handlePeers)
 	mux.HandleFunc("GET /api/messages/{peer}", s.handleMessages)
 	mux.HandleFunc("POST /api/send", s.handleSend)
@@ -72,8 +74,22 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"id":       s.messenger.ID,
 		"username": s.messenger.Username,
-		"address":  s.messenger.MsgAddr,
 	})
+}
+
+type peerResponse struct {
+	muninn.Peer
+	Online bool `json:"online"`
+}
+
+func (s *Server) handlePeerSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	peers := s.messenger.SearchPeers(q)
+	resp := make([]peerResponse, len(peers))
+	for i, p := range peers {
+		resp[i] = peerResponse{Peer: p, Online: s.messenger.IsPeerOnline(p.ID)}
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +97,11 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 	if peers == nil {
 		peers = []muninn.Peer{}
 	}
-	json.NewEncoder(w).Encode(peers)
+	resp := make([]peerResponse, len(peers))
+	for i, p := range peers {
+		resp[i] = peerResponse{Peer: p, Online: s.messenger.IsPeerOnline(p.ID)}
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +110,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if messages == nil {
 		messages = []messenger.ChatMessage{}
 	}
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].Timestamp.Before(messages[j].Timestamp)
+	})
 	json.NewEncoder(w).Encode(messages)
 }
 
@@ -132,7 +155,11 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-peerCh:
 			peers := s.messenger.GetPeers()
-			data, _ := json.Marshal(peers)
+			resp := make([]peerResponse, len(peers))
+			for i, p := range peers {
+				resp[i] = peerResponse{Peer: p, Online: s.messenger.IsPeerOnline(p.ID)}
+			}
+			data, _ := json.Marshal(resp)
 			fmt.Fprintf(w, "event: peers\ndata: %s\n\n", data)
 			flusher.Flush()
 
@@ -140,9 +167,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			data, _ := json.Marshal(msg)
 			fmt.Fprintf(w, "event: message\ndata: %s\n\n", data)
 			flusher.Flush()
-
-		case <-ticker.C:
-			s.messenger.RefreshPeers()
 
 		case <-r.Context().Done():
 			return
@@ -165,6 +189,7 @@ var indexHTML = `<!DOCTYPE html>
       <h2>Huginn</h2>
       <div class="user-badge">{{.Username}}</div>
     </div>
+    <input type="text" id="peer-search" placeholder="Search users..." />
     <div id="peer-list"></div>
   </aside>
   <main id="main">

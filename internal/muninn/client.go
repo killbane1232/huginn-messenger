@@ -10,9 +10,19 @@ import (
 	"time"
 )
 
+type Signal struct {
+	From string `json:"from"`
+	Type string `json:"type"`
+	Data string `json:"data"`
+}
+
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
+}
+
+func (c *Client) BaseURL() string {
+	return c.baseURL
 }
 
 func NewClient(baseURL string) *Client {
@@ -60,6 +70,19 @@ type RegisterChunkRequest struct {
 	PeerID      string `json:"peer_id"`
 }
 
+type RegisterChunkBatchEntry struct {
+	ChunkIndex  int    `json:"chunk_index"`
+	SenderID    string `json:"sender_id"`
+	RecipientID string `json:"recipient_id"`
+	Hash        string `json:"hash"`
+	Signature   string `json:"signature"`
+	PeerID      string `json:"peer_id"`
+}
+
+type RegisterChunkBatchRequest struct {
+	Chunks []RegisterChunkBatchEntry `json:"chunks"`
+}
+
 type ChunkReportRequest struct {
 	ReporterID string `json:"reporter_id"`
 	FileID     string `json:"file_id"`
@@ -75,6 +98,51 @@ type ChunkRecord struct {
 	RecipientID string `json:"recipient_id"`
 	Hash        string `json:"hash"`
 	PeerID      string `json:"peer_id"`
+}
+
+func (c *Client) SendSignal(ctx context.Context, peerID string, sig Signal) error {
+	body, err := json.Marshal(sig)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	url := fmt.Sprintf("%s/api/v1/peers/%s/signals", c.baseURL, peerID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("send signal failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+func (c *Client) PollSignals(ctx context.Context, peerID string) ([]Signal, error) {
+	url := fmt.Sprintf("%s/api/v1/peers/%s/signals", c.baseURL, peerID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("poll signals failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	var sigs []Signal
+	if err := json.NewDecoder(resp.Body).Decode(&sigs); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return sigs, nil
 }
 
 func (c *Client) Register(ctx context.Context, req *RegisterRequest) error {
@@ -199,6 +267,29 @@ func (c *Client) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (c *Client) RegisterChunks(ctx context.Context, fileID string, req RegisterChunkBatchRequest) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	url := fmt.Sprintf("%s/api/v1/files/%s/chunks", c.baseURL, fileID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("register chunks failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
 func (c *Client) RegisterChunk(ctx context.Context, fileID string, chunkIndex int, req RegisterChunkRequest) error {
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -265,4 +356,21 @@ func (c *Client) GetChunksByRecipient(ctx context.Context, recipientID string) (
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 	return records, nil
+}
+
+func (c *Client) DeleteChunksByRecipient(ctx context.Context, recipientID string, fileID string) error {
+	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks/%s", c.baseURL, recipientID, fileID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("delete chunks failed (status %d)", resp.StatusCode)
+	}
+	return nil
 }
