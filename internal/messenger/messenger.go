@@ -121,15 +121,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string) (*Messenge
 	go m.rtcReconnectLoop()
 	storedPeers, _ := st.GetStoredPeers()
 	for _, peer := range storedPeers {
-		m.peers = append(m.peers, muninn.Peer{
-			ID:            peer.PeerID,
-			Addresses:     nil,
-			EncryptionKey: peer.EncryptionKey,
-			SignatureKey:  peer.SignatureKey,
-			Metadata:      nil,
-			LastSeen:      time.Now(),
-			QualityScore:  100,
-		})
+		m.peers = append(m.peers, peer.ToMuninnPeer())
 	}
 
 	go m.heartbeatLoop()
@@ -601,6 +593,7 @@ func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []st
 
 			if err := m.muninnClient.RegisterChunks(m.ctx, fileID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
 				log.Printf("register batch %s on %s: %v", fileID, pid, err)
+				/*
 				for _, c := range fileChunks {
 					if err := m.muninnClient.RegisterChunk(m.ctx, c.FileID, c.ChunkIndex, muninn.RegisterChunkRequest{
 						SenderID: c.SenderID, RecipientID: c.RecipientID,
@@ -608,7 +601,7 @@ func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []st
 					}); err != nil {
 						log.Printf("register chunk %s/%d on %s fallback warning: %v", c.FileID, c.ChunkIndex, pid, err)
 					}
-				}
+				}*/
 			}
 
 			for _, c := range fileChunks {
@@ -827,13 +820,15 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer) error {
 		}
 	}
 	if err := m.muninnClient.RegisterChunks(m.ctx, msgID, muninn.RegisterChunkBatchRequest{Chunks: localRegBatch}); err != nil {
+		log.Printf("register batch %s on %s: %v", msgID,  peer.ID, err)
+		/*
 		for i, c := range chunks {
 			if err := m.muninnClient.RegisterChunk(m.ctx, msgID, i, muninn.RegisterChunkRequest{
 				SenderID: m.ID, RecipientID: peer.ID, Hash: c.hash, Signature: c.sig, PeerID: m.ID,
 			}); err != nil {
 				log.Printf("register local chunk %d warning: %v", i, err)
 			}
-		}
+		}*/
 	}
 
 	for _, pid := range storagePeers {
@@ -862,13 +857,15 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer) error {
 			}
 		}
 		if err := m.muninnClient.RegisterChunks(m.ctx, msgID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
+			log.Printf("register batch %s on %s: %v", msgID, pid, err)
+			/*
 			for i, c := range chunks {
 				if err := m.muninnClient.RegisterChunk(m.ctx, msgID, i, muninn.RegisterChunkRequest{
 					SenderID: m.ID, RecipientID: peer.ID, Hash: c.hash, Signature: c.sig, PeerID: pid,
 				}); err != nil {
 					log.Printf("register chunk %d on %s fallback warning: %v", i, pid, err)
 				}
-			}
+			}*/
 		}
 	}
 
