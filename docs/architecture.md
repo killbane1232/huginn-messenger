@@ -230,7 +230,7 @@ flowchart TB
         D --> E[For each recipient]
         E --> F[GetBestPeers from Muninn]
         F --> G[Connect to storage peers]
-        G --> H[Round-robin: chunk[i] → peer[i % M]]
+        G --> H[Round-robin: chunk i → peer i % M]
         H --> I[SendChunkStoreBatch per peer]
         I --> J[RegisterChunks per file per peer]
         J --> K[MarkChunkPlaced in SQLite]
