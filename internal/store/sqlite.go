@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 type PendingChunk struct {
@@ -17,6 +19,7 @@ type PendingChunk struct {
 	Signature   string
 	CreatedAt   time.Time
 	Placed      bool
+	TTLSeconds  int
 }
 
 type SQLiteStore struct {
@@ -39,6 +42,8 @@ func New(path string) (*SQLiteStore, error) {
 			file_id TEXT NOT NULL,
 			chunk_index INTEGER NOT NULL,
 			data BLOB NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			ttl_seconds INTEGER NOT NULL DEFAULT 604800,
 			PRIMARY KEY (file_id, chunk_index)
 		);
 		CREATE TABLE IF NOT EXISTS stored_peers (
@@ -67,12 +72,27 @@ func New(path string) (*SQLiteStore, error) {
 			signature TEXT NOT NULL,
 			created_at DATETIME NOT NULL,
 			placed BOOLEAN NOT NULL DEFAULT 0,
+			ttl_seconds INTEGER NOT NULL DEFAULT 604800,
 			PRIMARY KEY (file_id, chunk_index)
 		);
 	`); err != nil {
 		return nil, err
 	}
-	return &SQLiteStore{db: db}, nil
+
+	s := &SQLiteStore{db: db}
+	s.migrate()
+	return s, nil
+}
+
+func (s *SQLiteStore) migrate() {
+	migrations := []string{
+		"ALTER TABLE chunks ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+		"ALTER TABLE chunks ADD COLUMN ttl_seconds INTEGER NOT NULL DEFAULT 604800",
+		"ALTER TABLE pending_chunks ADD COLUMN ttl_seconds INTEGER NOT NULL DEFAULT 604800",
+	}
+	for _, m := range migrations {
+		s.db.Exec(m)
+	}
 }
 
 func (s *SQLiteStore) Close() error {

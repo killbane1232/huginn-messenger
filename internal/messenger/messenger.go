@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/killbane1232/huginn-messenger/internal/chunk"
+	"github.com/killbane1232/huginn-messenger/internal/config"
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
 	"github.com/killbane1232/huginn-messenger/internal/store"
@@ -129,12 +130,17 @@ func New(username string, muninnClient *muninn.Client, dbPath string) (*Messenge
 	go m.signalPollLoop()
 	go m.processRTCMessages()
 	go m.pendingChunkLoop()
+	go m.chunkCleanupLoop()
 
 	return m, nil
 }
 
 func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest) {
-	if err := m.store.StoreChunk(req.FileID, req.ChunkIndex, req.Data); err != nil {
+	ttl := req.TTLSeconds
+	if ttl <= 0 {
+		ttl = 604800
+	}
+	if err := m.store.StoreChunk(req.FileID, req.ChunkIndex, req.Data, ttl); err != nil {
 		log.Printf("store chunk %s/%d: %v", req.FileID, req.ChunkIndex, err)
 		return
 	}
@@ -321,6 +327,28 @@ func (m *Messenger) pendingChunkLoop() {
 		select {
 		case <-ticker.C:
 			m.distributePendingChunks()
+		case <-m.ctx.Done():
+			return
+		}
+	}
+}
+
+func (m *Messenger) chunkCleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			if err := m.store.DeleteExpiredChunks(now); err != nil {
+				log.Printf("cleanup expired chunks: %v", err)
+			}
+			if err := m.store.DeleteExpiredPendingChunks(now); err != nil {
+				log.Printf("cleanup expired pending chunks: %v", err)
+			}
+			if err := m.store.DeleteChunksWithMessage(); err != nil {
+				log.Printf("cleanup message chunks: %v", err)
+			}
 		case <-m.ctx.Done():
 			return
 		}
@@ -574,11 +602,12 @@ func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []st
 		}
 
 		for fileID, fileChunks := range byFile {
+			ttlSeconds := fileChunks[0].TTLSeconds
 			batch := make([]webrtc.ChunkStoreRequest, len(fileChunks))
 			regBatch := make([]muninn.RegisterChunkBatchEntry, len(fileChunks))
 			for i, c := range fileChunks {
 				batch[i] = webrtc.ChunkStoreRequest{
-					FileID: c.FileID, ChunkIndex: c.ChunkIndex, Data: c.Data,
+					FileID: c.FileID, ChunkIndex: c.ChunkIndex, Data: c.Data, TTLSeconds: ttlSeconds,
 				}
 				regBatch[i] = muninn.RegisterChunkBatchEntry{
 					ChunkIndex: c.ChunkIndex, SenderID: c.SenderID, RecipientID: c.RecipientID,
@@ -664,7 +693,7 @@ func (m *Messenger) replicatePendingChunks() {
 			batch := make([]webrtc.ChunkStoreRequest, 0, len(chunkMap))
 			for idx, data := range chunkMap {
 				batch = append(batch, webrtc.ChunkStoreRequest{
-					FileID: fileID, ChunkIndex: idx, Data: data,
+					FileID: fileID, ChunkIndex: idx, Data: data, TTLSeconds: 604800,
 				})
 			}
 			if len(batch) == 0 {
@@ -678,11 +707,15 @@ func (m *Messenger) replicatePendingChunks() {
 	}
 }
 
-func (m *Messenger) SendMessage(toPeerID, text string) error {
+func (m *Messenger) SendMessage(toPeerID, text string, ttlSeconds int) error {
 	msgID := uuid.New().String()
 	peer := m.findPeerByID(toPeerID)
 	if peer == nil {
 		return fmt.Errorf("peer %s not found", toPeerID)
+	}
+
+	if ttlSeconds <= 0 {
+		ttlSeconds = config.ChunkTTLSeconds("1w")
 	}
 
 	if m.IsPeerOnline(toPeerID) {
@@ -694,7 +727,7 @@ func (m *Messenger) SendMessage(toPeerID, text string) error {
 	if m.IsPeerConnected(toPeerID) {
 		now := time.Now()
 		if err := m.rtcManager.SendMessage(toPeerID, text, now, msgID); err != nil {
-			return m.sendOffline(msgID, text, peer)
+			return m.sendOffline(msgID, text, peer, ttlSeconds)
 		}
 		cm := ChatMessage{From: m.ID, Text: text, Timestamp: now, MsgID: msgID}
 		jsonData, _ := json.Marshal(cm)
@@ -705,7 +738,7 @@ func (m *Messenger) SendMessage(toPeerID, text string) error {
 		return nil
 	}
 
-	return m.sendOffline(msgID, text, peer)
+	return m.sendOffline(msgID, text, peer, ttlSeconds)
 }
 
 func (m *Messenger) ConnectPeer(toPeerID string) error {
@@ -736,7 +769,7 @@ func (m *Messenger) DisconnectPeer(toPeerID string) {
 	log.Printf("disconnected peer %s", toPeerID)
 }
 
-func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer) error {
+func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSeconds int) error {
 	log.Printf("sending offline message %s to %s via chunks", msgID, peer.ID)
 
 	now := time.Now()
@@ -757,6 +790,10 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer) error {
 		return fmt.Errorf("split encrypt: %w", err)
 	}
 
+	if ttlSeconds <= 0 {
+		ttlSeconds = config.ChunkTTLSeconds("1w")
+	}
+
 	type chunkData struct {
 		envData []byte
 		hash    string
@@ -768,7 +805,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer) error {
 		if err != nil {
 			return fmt.Errorf("marshal env %d: %w", i, err)
 		}
-		if err := m.store.StoreChunk(msgID, i, envData); err != nil {
+		if err := m.store.StoreChunk(msgID, i, envData, ttlSeconds); err != nil {
 			return fmt.Errorf("store chunk %d: %w", i, err)
 		}
 		chunkHash := chunk.RegisteredHash(envData)
@@ -831,7 +868,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer) error {
 		}*/
 	}
 
-	for _, pid := range storagePeers {
+		for _, pid := range storagePeers {
 		if !m.IsPeerConnected(pid) {
 			continue
 		}
@@ -839,7 +876,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer) error {
 		batch := make([]webrtc.ChunkStoreRequest, len(chunks))
 		for i, c := range chunks {
 			batch[i] = webrtc.ChunkStoreRequest{
-				FileID: msgID, ChunkIndex: i, Data: c.envData,
+				FileID: msgID, ChunkIndex: i, Data: c.envData, TTLSeconds: ttlSeconds,
 			}
 		}
 		if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
@@ -880,6 +917,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer) error {
 			Signature:   c.sig,
 			CreatedAt:   time.Now(),
 			Placed:      len(storedOnPeers[i]) > 1,
+			TTLSeconds:  ttlSeconds,
 		}); err != nil {
 			log.Printf("store pending chunk %s/%d: %v", msgID, i, err)
 		}
@@ -1129,7 +1167,7 @@ func (m *Messenger) StoredChunkData(fileID string, chunkIndex int) ([]byte, bool
 }
 
 func (m *Messenger) InjectChunk(fileID string, chunkIndex int, data []byte) {
-	if err := m.store.StoreChunk(fileID, chunkIndex, data); err != nil {
+	if err := m.store.StoreChunk(fileID, chunkIndex, data, 604800); err != nil {
 		log.Printf("inject chunk: %v", err)
 	}
 	go m.checkPendingMessages()

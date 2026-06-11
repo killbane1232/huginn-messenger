@@ -47,7 +47,7 @@ func TestOfflineMessageWithoutWebRTC(t *testing.T) {
 	msgCh := bob.SubscribeMessages()
 	defer bob.UnsubscribeMessages(msgCh)
 
-	err = alice.SendMessage("bob", "hello from alice without webrtc")
+	err = alice.SendMessage("bob", "hello from alice without webrtc", 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +495,7 @@ func TestMessengerOfflineFlow(t *testing.T) {
 
 	t.Logf("alice peers: %d, bob peers: %d", len(alice.GetPeers()), len(bob.GetPeers()))
 
-	err = alice.SendMessage("bob", "hello from alice via offline chunks")
+	err = alice.SendMessage("bob", "hello from alice via offline chunks", 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +584,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 	t.Logf("alice peers: %d, bob peers: %d, charley peers: %d",
 		len(alice.GetPeers()), len(bob.GetPeers()), len(charley.GetPeers()))
 
-	err = alice.SendMessage("bob", "hello from alice via charley storage")
+	err = alice.SendMessage("bob", "hello from alice via charley storage", 604800)
 	if err != nil {
 		t.Fatal(err)
 	}

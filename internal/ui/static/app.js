@@ -42,6 +42,7 @@ function renderPeerList() {
 
 async function selectPeer(peerID) {
   activePeer = peerID;
+  showChat();
   renderPeerList();
 
   const p = peers.find(p => p.id === peerID);
@@ -78,11 +79,14 @@ async function sendMessage() {
   const text = input.value.trim();
   if (!text || !activePeer) return;
 
+  const ttlSelect = document.getElementById('ttl-select');
+  const ttl = parseInt(ttlSelect.value) || 0;
+
   input.value = '';
   const r = await fetch('/api/send', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ to: activePeer, text })
+    body: JSON.stringify({ to: activePeer, text, ttl })
   });
   if (!r.ok) {
     const err = await r.text();
@@ -91,6 +95,57 @@ async function sendMessage() {
   }
   const msgs = await fetchMessages(activePeer);
   renderMessages(msgs, activePeer);
+}
+
+function showChat() {
+  document.getElementById('config-panel').style.display = 'none';
+  document.getElementById('main').style.display = 'flex';
+}
+
+function showConfig() {
+  document.getElementById('main').style.display = 'none';
+  document.getElementById('no-chat').style.display = 'none';
+  document.getElementById('config-panel').style.display = 'flex';
+}
+
+async function loadConfig() {
+  const r = await fetch('/api/config');
+  const cfg = await r.json();
+  document.getElementById('cfg-username').value = cfg.username || '';
+  document.getElementById('cfg-muninn').value = cfg.muninn || '';
+  document.getElementById('cfg-ui-port').value = cfg.ui_port || 0;
+  if (cfg.chunk_ttl) {
+    document.getElementById('cfg-chunk-ttl').value = cfg.chunk_ttl;
+  }
+}
+
+async function saveConfig() {
+  const btn = document.getElementById('cfg-save');
+  const status = document.getElementById('cfg-status');
+  btn.disabled = true;
+  status.textContent = '';
+
+  const r = await fetch('/api/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: document.getElementById('cfg-username').value.trim(),
+      muninn: document.getElementById('cfg-muninn').value.trim(),
+      ui_port: parseInt(document.getElementById('cfg-ui-port').value) || 0,
+      chunk_ttl: document.getElementById('cfg-chunk-ttl').value
+    })
+  });
+
+  btn.disabled = false;
+
+  if (r.ok) {
+    status.textContent = 'Saved. Restart the app for changes to take effect.';
+    status.className = 'cfg-ok';
+  } else {
+    const err = await r.text();
+    status.textContent = 'Error: ' + err;
+    status.className = 'cfg-err';
+  }
 }
 
 function setupSSE() {
@@ -144,4 +199,18 @@ document.addEventListener('DOMContentLoaded', async function() {
       renderPeerList();
     }, 200);
   });
+
+  document.getElementById('settings-btn').addEventListener('click', async function() {
+    showConfig();
+    await loadConfig();
+  });
+  document.getElementById('cfg-cancel').addEventListener('click', function() {
+    if (activePeer) {
+      selectPeer(activePeer);
+    } else {
+      showChat();
+      document.getElementById('no-chat').style.display = 'flex';
+    }
+  });
+  document.getElementById('cfg-save').addEventListener('click', saveConfig);
 });

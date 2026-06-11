@@ -30,7 +30,7 @@ func main() {
 		log.Printf("warning: register failed: %v", err)
 	}
 
-	uiSrv := ui.NewServer(cfg.UIPort, m)
+	uiSrv := ui.NewServer(cfg, m)
 
 	go func() {
 		log.Printf("web UI started at http://localhost:%d", cfg.UIPort)

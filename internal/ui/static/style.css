@@ -42,7 +42,26 @@ body {
   background: #0f3460;
   padding: 4px 8px;
   border-radius: 4px;
-  display: inline-block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#settings-btn {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 4px;
+  line-height: 1;
+  border-radius: 4px;
+  transition: color 0.2s, background 0.2s;
+}
+
+#settings-btn:hover {
+  color: #e94560;
+  background: rgba(233, 69, 96, 0.1);
 }
 
 #peer-search {
@@ -249,6 +268,21 @@ body {
   border-color: #e94560;
 }
 
+#ttl-select {
+  padding: 10px 14px;
+  border: 1px solid #0f3460;
+  border-radius: 8px;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+}
+
+#ttl-select:focus {
+  border-color: #e94560;
+}
+
 #send-btn {
   padding: 10px 20px;
   background: #e94560;
@@ -268,6 +302,125 @@ body {
 #send-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+#config-panel {
+  flex: 1;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  padding: 40px 20px;
+  overflow-y: auto;
+}
+
+#config-header {
+  font-size: 20px;
+  font-weight: 600;
+  color: #e94560;
+  margin-bottom: 24px;
+}
+
+.config-form {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.config-form label {
+  font-size: 13px;
+  color: #888;
+  margin-bottom: -10px;
+}
+
+.config-form input {
+  padding: 10px 14px;
+  border: 1px solid #0f3460;
+  border-radius: 8px;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.config-form input:focus,
+.config-form select:focus {
+  border-color: #e94560;
+}
+
+.config-form select {
+  padding: 10px 14px;
+  border: 1px solid #0f3460;
+  border-radius: 8px;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  font-size: 14px;
+  outline: none;
+  cursor: pointer;
+}
+
+.config-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.config-actions .btn-primary {
+  flex: 1;
+  padding: 10px 20px;
+  background: #e94560;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.config-actions .btn-primary:hover {
+  background: #d63851;
+}
+
+.config-actions .btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.config-actions .btn-secondary {
+  flex: 1;
+  padding: 10px 20px;
+  background: #0f3460;
+  color: #e0e0e0;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.config-actions .btn-secondary:hover {
+  background: #1a4a7a;
+}
+
+#cfg-status {
+  font-size: 13px;
+  text-align: center;
+  padding: 8px;
+  border-radius: 6px;
+}
+
+#cfg-status.cfg-ok {
+  color: #2ecc71;
+  background: rgba(46, 204, 113, 0.1);
+}
+
+#cfg-status.cfg-err {
+  color: #e94560;
+  background: rgba(233, 69, 96, 0.1);
 }
 
 ::-webkit-scrollbar {

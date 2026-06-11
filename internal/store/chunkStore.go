@@ -2,12 +2,14 @@ package store
 
 import (
 	"database/sql"
+	"time"
 )
 
-func (s *SQLiteStore) StoreChunk(fileID string, chunkIndex int, data []byte) error {
+func (s *SQLiteStore) StoreChunk(fileID string, chunkIndex int, data []byte, ttlSeconds int) error {
 	return retry(func() error {
-		_, err := s.db.Exec("INSERT OR REPLACE INTO chunks (file_id, chunk_index, data) VALUES (?, ?, ?)",
-			fileID, chunkIndex, data)
+		_, err := s.db.Exec(
+			"INSERT OR REPLACE INTO chunks (file_id, chunk_index, data, created_at, ttl_seconds) VALUES (?, ?, ?, ?, ?)",
+			fileID, chunkIndex, data, time.Now(), ttlSeconds)
 		return err
 	})
 }
@@ -67,5 +69,22 @@ func (s *SQLiteStore) ListChunks(fileID string) (map[int][]byte, error) {
 			result[idx] = data
 		}
 		return result, rows.Err()
+	})
+}
+
+func (s *SQLiteStore) DeleteExpiredChunks(now time.Time) error {
+	return retry(func() error {
+		_, err := s.db.Exec(
+			"DELETE FROM chunks WHERE CAST((julianday(?) - julianday(created_at)) * 86400 AS INTEGER) > ttl_seconds",
+			now)
+		return err
+	})
+}
+
+func (s *SQLiteStore) DeleteChunksWithMessage() error {
+	return retry(func() error {
+		_, err := s.db.Exec(
+			"DELETE FROM chunks WHERE file_id IN (SELECT message_uid FROM messages)")
+		return err
 	})
 }

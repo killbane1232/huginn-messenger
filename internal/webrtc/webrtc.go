@@ -21,6 +21,7 @@ type ChunkStoreRequest struct {
 	FileID     string `json:"file_id"`
 	ChunkIndex int    `json:"chunk_index"`
 	Data       []byte `json:"data"`
+	TTLSeconds int    `json:"ttl_seconds,omitempty"`
 }
 
 type ChunkStoreBatchRequest struct {

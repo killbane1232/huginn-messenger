@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/killbane1232/huginn-messenger/internal/config"
 	"github.com/killbane1232/huginn-messenger/internal/messenger"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
 )
@@ -21,13 +22,15 @@ var staticFiles embed.FS
 type Server struct {
 	addr      string
 	messenger *messenger.Messenger
+	cfg       *config.Config
 	srv       *http.Server
 }
 
-func NewServer(port int, m *messenger.Messenger) *Server {
+func NewServer(cfg *config.Config, m *messenger.Messenger) *Server {
 	return &Server{
-		addr:      fmt.Sprintf(":%d", port),
+		addr:      fmt.Sprintf(":%d", cfg.UIPort),
 		messenger: m,
+		cfg:       cfg,
 	}
 }
 
@@ -44,6 +47,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/messages/{peer}", s.handleMessages)
 	mux.HandleFunc("POST /api/send", s.handleSend)
 	mux.HandleFunc("GET /api/events", s.handleSSE)
+	mux.HandleFunc("GET /api/config", s.handleGetConfig)
+	mux.HandleFunc("POST /api/config", s.handleSaveConfig)
 
 	s.srv = &http.Server{
 		Addr:         s.addr,
@@ -75,6 +80,42 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"id":       s.messenger.ID,
 		"username": s.messenger.Username,
 	})
+}
+
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"username":  s.cfg.Username,
+		"muninn":    s.cfg.MuninnAddr,
+		"ui_port":   s.cfg.UIPort,
+		"chunk_ttl": s.cfg.ChunkTTL,
+	})
+}
+
+func (s *Server) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username string `json:"username"`
+		Muninn   string `json:"muninn"`
+		UIPort   int    `json:"ui_port"`
+		ChunkTTL string `json:"chunk_ttl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	s.cfg.Username = req.Username
+	s.cfg.MuninnAddr = req.Muninn
+	s.cfg.UIPort = req.UIPort
+	if req.ChunkTTL != "" {
+		s.cfg.ChunkTTL = req.ChunkTTL
+	}
+
+	if err := s.cfg.Save(); err != nil {
+		http.Error(w, "failed to save config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 type peerResponse struct {
@@ -120,12 +161,17 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		To   string `json:"to"`
 		Text string `json:"text"`
+		TTL  int    `json:"ttl"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if err := s.messenger.SendMessage(req.To, req.Text); err != nil {
+	ttl := req.TTL
+	if ttl <= 0 {
+		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
+	}
+	if err := s.messenger.SendMessage(req.To, req.Text, ttl); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -187,7 +233,10 @@ var indexHTML = `<!DOCTYPE html>
   <aside id="sidebar">
     <div class="sidebar-header">
       <h2>Huginn</h2>
-      <div class="user-badge">{{.Username}}</div>
+      <div class="user-badge">
+        <span>{{.Username}}</span>
+        <button id="settings-btn" title="Settings">&#9881;</button>
+      </div>
     </div>
     <input type="text" id="peer-search" placeholder="Search users..." />
     <div id="peer-list"></div>
@@ -197,7 +246,39 @@ var indexHTML = `<!DOCTYPE html>
     <div id="messages"></div>
     <div id="input-area">
       <input type="text" id="msg-input" placeholder="Type a message..." autofocus>
+      <select id="ttl-select">
+        <option value="0">Default TTL</option>
+        <option value="86400">1 day</option>
+        <option value="604800" selected>1 week</option>
+        <option value="2592000">1 month</option>
+      </select>
       <button id="send-btn">Send</button>
+    </div>
+  </main>
+  <main id="config-panel" style="display:none">
+    <div id="config-header">Configuration</div>
+    <div class="config-form">
+      <label for="cfg-username">Username</label>
+      <input type="text" id="cfg-username" placeholder="your username">
+
+      <label for="cfg-muninn">Muninn address</label>
+      <input type="text" id="cfg-muninn" placeholder="http://localhost:8080">
+
+      <label for="cfg-ui-port">UI port (0 = random)</label>
+      <input type="number" id="cfg-ui-port" placeholder="0">
+
+      <label for="cfg-chunk-ttl">Chunk TTL</label>
+      <select id="cfg-chunk-ttl">
+        <option value="1d">1 day</option>
+        <option value="1w">1 week</option>
+        <option value="1m">1 month</option>
+      </select>
+
+      <div class="config-actions">
+        <button id="cfg-save" class="btn-primary">Save</button>
+        <button id="cfg-cancel" class="btn-secondary">Cancel</button>
+      </div>
+      <div id="cfg-status"></div>
     </div>
   </main>
 </div>
