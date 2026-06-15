@@ -235,7 +235,7 @@ func (s *Server) handleSendFile(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 	fileID := r.PathValue("fileName")
-	if fileID == nil || fileID == "" {
+	if fileID == "" {
 		fileID = r.PathValue("fileId")
 	}
 	fp := filepath.Join(s.messenger.DownloadsDir(), fileID)

@@ -106,6 +106,9 @@ type Messenger struct {
 
 	pendingFileDownloads map[string]*pendingFileDownload
 	pendingMu            sync.Mutex
+
+	processingMsg map[string]bool
+	processingMu  sync.Mutex
 }
 
 func New(username string, muninnClient *muninn.Client, dbPath string, opts ...MessengerOption) (*Messenger, error) {
@@ -164,6 +167,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		downloadsDir: downloadsDir,
 
 		pendingFileDownloads: make(map[string]*pendingFileDownload),
+		processingMsg:       make(map[string]bool),
 	}
 
 	if !o.iceSet {
@@ -1206,7 +1210,28 @@ func (m *Messenger) checkPendingMessages() {
 	}
 }
 
+func (m *Messenger) tryProcessMsg(msgID string) bool {
+	m.processingMu.Lock()
+	if m.processingMsg[msgID] {
+		m.processingMu.Unlock()
+		return false
+	}
+	m.processingMsg[msgID] = true
+	m.processingMu.Unlock()
+	return true
+}
+
+func (m *Messenger) releaseProcessMsg(msgID string) {
+	m.processingMu.Lock()
+	delete(m.processingMsg, msgID)
+	m.processingMu.Unlock()
+}
+
 func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.ChunkRecord) {
+	if !m.tryProcessMsg(msgID) {
+		return
+	}
+	defer m.releaseProcessMsg(msgID)
 	log.Printf("collecting %s (%d chunk records, persist=%v)", msgID, len(records), len(records) > 0 && records[0].Persist)
 
 	seen := make(map[int]bool)
@@ -1323,6 +1348,10 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 }
 
 func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {
+	if !m.tryProcessMsg("file:" + f.FileID) {
+		return
+	}
+	defer m.releaseProcessMsg("file:" + f.FileID)
 	chunkMap, err := m.store.ListChunks(f.FileID)
 	if err != nil {
 		log.Printf("list chunks for file %s: %v", f.FileID, err)
