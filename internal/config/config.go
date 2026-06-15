@@ -15,6 +15,7 @@ type Config struct {
 	UIPort     int    `json:"ui_port"`
 	DBPath     string `json:"-"`
 	ChunkTTL   string `json:"chunk_ttl"`
+	PeerFlag   string `json:"peer_flag"`
 }
 
 const configPath = "config.conf"
@@ -24,6 +25,7 @@ func Parse() *Config {
 		MuninnAddr: "http://localhost:8080",
 		DBPath:     "huginn.db",
 		ChunkTTL:   "1w",
+		PeerFlag:   "thin",
 	}
 
 	if data, err := os.ReadFile(configPath); err == nil {
@@ -37,6 +39,7 @@ func Parse() *Config {
 	flag.IntVar(&c.UIPort, "ui-port", c.UIPort, "web UI port (default: random)")
 	flag.StringVar(&c.DBPath, "db", c.DBPath, "path to SQLite database")
 	flag.StringVar(&c.ChunkTTL, "chunk-ttl", c.ChunkTTL, "chunk TTL (1d, 1w, 1m)")
+	flag.StringVar(&c.PeerFlag, "peer-flag", c.PeerFlag, "peer flag: thin, thick, very_thick")
 	flag.Parse()
 
 	if c.Username == "" {

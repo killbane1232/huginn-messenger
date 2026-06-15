@@ -18,10 +18,14 @@ type ChatMessage struct {
 }
 
 type ChunkStoreRequest struct {
-	FileID     string `json:"file_id"`
-	ChunkIndex int    `json:"chunk_index"`
-	Data       []byte `json:"data"`
-	TTLSeconds int    `json:"ttl_seconds,omitempty"`
+	FileID      string `json:"file_id"`
+	ChunkIndex  int    `json:"chunk_index"`
+	Data        []byte `json:"data"`
+	SenderID    string `json:"sender_id,omitempty"`
+	RecipientID string `json:"recipient_id,omitempty"`
+	Hash        string `json:"hash,omitempty"`
+	Signature   string `json:"signature,omitempty"`
+	TTLSeconds  int    `json:"ttl_seconds,omitempty"`
 }
 
 type ChunkStoreBatchRequest struct {
@@ -60,7 +64,8 @@ type Manager struct {
 
 func NewManager(localID string, chatMsgChan chan ChatMessage,
 	chunkStore func(peerID string, req ChunkStoreRequest),
-	chunkGet func(peerID string, req ChunkGetRequest) ([]byte, bool)) *Manager {
+	chunkGet func(peerID string, req ChunkGetRequest) ([]byte, bool),
+	iceServers []pion.ICEServer) *Manager {
 
 	return &Manager{
 		connections: make(map[string]*pion.PeerConnection),
@@ -70,9 +75,7 @@ func NewManager(localID string, chatMsgChan chan ChatMessage,
 		chunkGet:    chunkGet,
 		localID:     localID,
 		config: pion.Configuration{
-			ICEServers: []pion.ICEServer{
-				{URLs: []string{"stun:stun.l.google.com:19302"}},
-			},
+			ICEServers: iceServers,
 		},
 	}
 }

@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -47,6 +50,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/messages/{peer}", s.handleMessages)
 	mux.HandleFunc("POST /api/send", s.handleSend)
 	mux.HandleFunc("GET /api/events", s.handleSSE)
+	mux.HandleFunc("POST /api/send-file", s.handleSendFile)
+	mux.HandleFunc("GET /api/files/{fileID}", s.handleGetFile)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("POST /api/config", s.handleSaveConfig)
 
@@ -178,6 +183,66 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleSendFile(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(100 << 20); err != nil {
+		http.Error(w, "failed to parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	toPeer := r.FormValue("to")
+	text := r.FormValue("text")
+	ttlStr := r.FormValue("ttl")
+	ttl := 0
+	if ttlStr != "" {
+		fmt.Sscanf(ttlStr, "%d", &ttl)
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "missing file: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	tmpDir := filepath.Join(os.TempDir(), "huginn-uploads")
+	os.MkdirAll(tmpDir, 0755)
+	tmpPath := filepath.Join(tmpDir, header.Filename)
+	dst, err := os.Create(tmpPath)
+	if err != nil {
+		http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := io.Copy(dst, file); err != nil {
+		dst.Close()
+		os.Remove(tmpPath)
+		http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	dst.Close()
+	defer os.Remove(tmpPath)
+
+	if ttl <= 0 {
+		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
+	}
+
+	if err := s.messenger.SendMessageWithFiles(toPeer, text, []string{tmpPath}, ttl); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
+	fileID := r.PathValue("fileName")
+	if fileID == nil || fileID == "" {
+		fileID = r.PathValue("fileId")
+	}
+	fp := filepath.Join(s.messenger.DownloadsDir(), fileID)
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+fileID+"\"")
+	http.ServeFile(w, r, fp)
+}
+
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -246,6 +311,11 @@ var indexHTML = `<!DOCTYPE html>
     <div id="messages"></div>
     <div id="input-area">
       <input type="text" id="msg-input" placeholder="Type a message..." autofocus>
+      <label id="file-btn-label" title="Attach file">
+        <input type="file" id="file-input" hidden>
+        &#128206;
+      </label>
+      <span id="file-name"></span>
       <select id="ttl-select">
         <option value="0">Default TTL</option>
         <option value="86400">1 day</option>

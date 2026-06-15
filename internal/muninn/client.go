@@ -10,6 +10,19 @@ import (
 	"time"
 )
 
+type PeerFlag string
+
+const (
+	PeerFlagThin      PeerFlag = "thin"
+	PeerFlagThick     PeerFlag = "thick"
+	PeerFlagVeryThick PeerFlag = "very_thick"
+)
+
+type QualityStats struct {
+	ValidReports   int `json:"valid_reports"`
+	InvalidReports int `json:"invalid_reports"`
+}
+
 type Signal struct {
 	From string `json:"from"`
 	Type string `json:"type"`
@@ -45,6 +58,8 @@ type Peer struct {
 	LastSeen      time.Time         `json:"last_seen"`
 	TTLSeconds    int               `json:"ttl_seconds"`
 	QualityScore  int               `json:"quality_score"`
+	Quality       QualityStats      `json:"quality"`
+	PeerFlag      PeerFlag          `json:"peer_flag,omitempty"`
 }
 
 type Key struct {
@@ -60,6 +75,7 @@ type RegisterRequest struct {
 	SignatureKey  string            `json:"signature_key,omitempty"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
 	TTLSeconds    int               `json:"ttl_seconds,omitempty"`
+	PeerFlag      PeerFlag          `json:"peer_flag,omitempty"`
 }
 
 type RegisterChunkRequest struct {
@@ -68,6 +84,7 @@ type RegisterChunkRequest struct {
 	Hash        string `json:"hash"`
 	Signature   string `json:"signature"`
 	PeerID      string `json:"peer_id"`
+	Persist     bool   `json:"persist"`
 }
 
 type RegisterChunkBatchEntry struct {
@@ -77,6 +94,7 @@ type RegisterChunkBatchEntry struct {
 	Hash        string `json:"hash"`
 	Signature   string `json:"signature"`
 	PeerID      string `json:"peer_id"`
+	Persist     bool   `json:"persist"`
 }
 
 type RegisterChunkBatchRequest struct {
@@ -98,6 +116,44 @@ type ChunkRecord struct {
 	RecipientID string `json:"recipient_id"`
 	Hash        string `json:"hash"`
 	PeerID      string `json:"peer_id"`
+	Persist     bool   `json:"persist"`
+	Confirmed   bool   `json:"confirmed"`
+}
+
+type ChunkReportResult struct {
+	Valid        bool   `json:"valid"`
+	ExpectedHash string `json:"expected_hash"`
+	ReportedHash string `json:"reported_hash"`
+	Delta        int    `json:"delta"`
+	Peer         Peer   `json:"peer"`
+}
+
+type ConfirmChunkRequest struct {
+	RecipientID string `json:"recipient_id"`
+	FileID      string `json:"file_id"`
+	ChunkIndex  int    `json:"chunk_index"`
+	Hash        string `json:"hash"`
+	Signature   string `json:"signature"`
+}
+
+type ConfirmChunkBatchEntry struct {
+	FileID     string `json:"file_id"`
+	ChunkIndex int    `json:"chunk_index"`
+	Hash       string `json:"hash"`
+	Signature  string `json:"signature"`
+}
+
+type ConfirmChunkBatchRequest struct {
+	RecipientID string                   `json:"recipient_id"`
+	Chunks      []ConfirmChunkBatchEntry `json:"chunks"`
+}
+
+type ConfirmChunkResult struct {
+	Valid         bool   `json:"valid"`
+	ExpectedHash  string `json:"expected_hash"`
+	ConfirmedHash string `json:"confirmed_hash"`
+	Delta         int    `json:"delta"`
+	Peer          Peer   `json:"peer"`
 }
 
 func (c *Client) SendSignal(ctx context.Context, peerID string, sig Signal) error {
@@ -223,6 +279,28 @@ func (c *Client) GetBestPeers(ctx context.Context, n int) ([]Peer, error) {
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("best peers failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	var peers []Peer
+	if err := json.NewDecoder(resp.Body).Decode(&peers); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return peers, nil
+}
+
+func (c *Client) GetBestThickPeers(ctx context.Context, n int) ([]Peer, error) {
+	url := fmt.Sprintf("%s/api/v1/peers/best/thick?n=%d", c.baseURL, n)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("best thick peers failed (status %d): %s", resp.StatusCode, string(b))
 	}
 	var peers []Peer
 	if err := json.NewDecoder(resp.Body).Decode(&peers); err != nil {
@@ -358,6 +436,28 @@ func (c *Client) GetChunksByRecipient(ctx context.Context, recipientID string) (
 	return records, nil
 }
 
+func (c *Client) GetChunksByFileID(ctx context.Context, fileID string) ([]ChunkRecord, error) {
+	url := fmt.Sprintf("%s/api/v1/files/%s/chunks", c.baseURL, fileID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get chunks by fileID failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	var records []ChunkRecord
+	if err := json.NewDecoder(resp.Body).Decode(&records); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return records, nil
+}
+
 func (c *Client) DeleteChunksByRecipient(ctx context.Context, recipientID string, fileID string) error {
 	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks/%s", c.baseURL, recipientID, fileID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
@@ -371,6 +471,76 @@ func (c *Client) DeleteChunksByRecipient(ctx context.Context, recipientID string
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("delete chunks failed (status %d)", resp.StatusCode)
+	}
+	return nil
+}
+
+func (c *Client) GetByKey(ctx context.Context, login, signature string) (*Peer, error) {
+	url := fmt.Sprintf("%s/api/v1/keys/%s?signature=%s", c.baseURL, login, signature)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get by key failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	var peer Peer
+	if err := json.NewDecoder(resp.Body).Decode(&peer); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return &peer, nil
+}
+
+func (c *Client) ConfirmChunk(ctx context.Context, req ConfirmChunkRequest) (*ConfirmChunkResult, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/chunks/confirm", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("confirm chunk failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	var result ConfirmChunkResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return &result, nil
+}
+
+func (c *Client) ConfirmChunkBatch(ctx context.Context, req ConfirmChunkBatchRequest) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/chunks/confirm-batch", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("confirm chunk batch failed (status %d): %s", resp.StatusCode, string(b))
 	}
 	return nil
 }

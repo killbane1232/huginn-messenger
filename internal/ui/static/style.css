@@ -245,6 +245,44 @@ body {
   color: rgba(255,255,255,0.4);
 }
 
+.msg-file {
+  margin-top: 6px;
+  padding: 4px 0;
+}
+.msg-file a {
+  color: #fff;
+  text-decoration: underline;
+  font-size: 13px;
+  opacity: 0.9;
+}
+.msg.received .msg-file a {
+  color: #e0e0e0;
+}
+.msg-file a:hover {
+  opacity: 1;
+}
+
+#file-btn-label {
+  padding: 8px 10px;
+  cursor: pointer;
+  font-size: 18px;
+  border-radius: 8px;
+  transition: background 0.2s;
+  display: flex;
+  align-items: center;
+}
+#file-btn-label:hover {
+  background: #0f3460;
+}
+#file-name {
+  font-size: 12px;
+  color: #888;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 #input-area {
   padding: 12px 20px;
   border-top: 1px solid #0f3460;

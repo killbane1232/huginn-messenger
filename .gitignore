@@ -1,7 +1,11 @@
 # Binaries
 huginn-messenger
+huginn
 *.exe
 *.test
+
+# Test artifacts
+test_dir/
 
 # Go workspace
 go.work

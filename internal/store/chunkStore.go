@@ -74,8 +74,13 @@ func (s *SQLiteStore) ListChunks(fileID string) (map[int][]byte, error) {
 
 func (s *SQLiteStore) DeleteExpiredChunks(now time.Time) error {
 	return retry(func() error {
-		_, err := s.db.Exec(
-			"DELETE FROM chunks WHERE CAST((julianday(?) - julianday(created_at)) * 86400 AS INTEGER) > ttl_seconds",
+		_, err := s.db.Exec(`
+			DELETE FROM chunks 
+			WHERE created_at is not null
+				and ttl_seconds is not null
+				and ttl_seconds <> 0
+				and CAST((julianday(?) - julianday(created_at)) * 86400 AS INTEGER) > ttl_seconds
+			`,
 			now)
 		return err
 	})

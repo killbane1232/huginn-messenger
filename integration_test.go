@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
@@ -271,7 +273,7 @@ func TestChunkLargeMessage(t *testing.T) {
 type testMuninnServer struct {
 	mu      sync.Mutex
 	peers   map[string]*muninn.Peer
-	chunks  map[string][]muninn.ChunkRecord
+	chunks  []muninn.ChunkRecord
 	signals map[string][]muninn.Signal
 	srv     *httptest.Server
 }
@@ -279,7 +281,7 @@ type testMuninnServer struct {
 func newTestMuninnServer() *testMuninnServer {
 	ts := &testMuninnServer{
 		peers:   make(map[string]*muninn.Peer),
-		chunks:  make(map[string][]muninn.ChunkRecord),
+		chunks:  nil,
 		signals: make(map[string][]muninn.Signal),
 	}
 	mux := http.NewServeMux()
@@ -287,10 +289,12 @@ func newTestMuninnServer() *testMuninnServer {
 	mux.HandleFunc("GET /api/v1/peers", ts.handleList)
 	mux.HandleFunc("GET /api/v1/peers/best", ts.handleBestPeers)
 	mux.HandleFunc("GET /api/v1/peers/{id}", ts.handleGet)
+	mux.HandleFunc("GET /api/v1/peers/best/thick", ts.handleBestThickPeers)
 	mux.HandleFunc("DELETE /api/v1/peers/{id}", ts.handleDelete)
 	mux.HandleFunc("POST /api/v1/peers/{id}/heartbeat", ts.handleHeartbeat)
 	mux.HandleFunc("PUT /api/v1/files/{fileID}/chunks/{chunkIndex}", ts.handleRegisterChunk)
 	mux.HandleFunc("POST /api/v1/files/{fileID}/chunks", ts.handleRegisterChunks)
+	mux.HandleFunc("GET /api/v1/files/{fileID}/chunks", ts.handleGetChunksByFileID)
 	mux.HandleFunc("GET /api/v1/recipient/{recipientID}/chunks", ts.handleGetChunks)
 	mux.HandleFunc("POST /api/v1/peers/{sourcePeerID}/chunk-reports", ts.handleReportChunk)
 	mux.HandleFunc("POST /api/v1/peers/{peerID}/signals", ts.handleSendSignal)
@@ -317,6 +321,7 @@ func (ts *testMuninnServer) handleRegister(w http.ResponseWriter, r *http.Reques
 		SignatureKey:  req.SignatureKey,
 		Metadata:      req.Metadata,
 		LastSeen:      time.Now(),
+		TTLSeconds:    req.TTLSeconds,
 		QualityScore:  100,
 	}
 	ts.mu.Unlock()
@@ -376,7 +381,7 @@ func (ts *testMuninnServer) handleRegisterChunk(w http.ResponseWriter, r *http.R
 		return
 	}
 	ts.mu.Lock()
-	ts.chunks[req.RecipientID] = append(ts.chunks[req.RecipientID], muninn.ChunkRecord{
+	ts.chunks = append(ts.chunks, muninn.ChunkRecord{
 		FileID:      fileID,
 		ChunkIndex:  chunkIndex,
 		SenderID:    req.SenderID,
@@ -388,6 +393,16 @@ func (ts *testMuninnServer) handleRegisterChunk(w http.ResponseWriter, r *http.R
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (ts *testMuninnServer) handleBestThickPeers(w http.ResponseWriter, r *http.Request) {
+	ts.mu.Lock()
+	peers := make([]muninn.Peer, 0, len(ts.peers))
+	for _, p := range ts.peers {
+		peers = append(peers, *p)
+	}
+	ts.mu.Unlock()
+	json.NewEncoder(w).Encode(peers)
+}
+
 func (ts *testMuninnServer) handleRegisterChunks(w http.ResponseWriter, r *http.Request) {
 	fileID := r.PathValue("fileID")
 	var req muninn.RegisterChunkBatchRequest
@@ -397,13 +412,14 @@ func (ts *testMuninnServer) handleRegisterChunks(w http.ResponseWriter, r *http.
 	}
 	ts.mu.Lock()
 	for _, entry := range req.Chunks {
-		ts.chunks[entry.RecipientID] = append(ts.chunks[entry.RecipientID], muninn.ChunkRecord{
+		ts.chunks = append(ts.chunks, muninn.ChunkRecord{
 			FileID:      fileID,
 			ChunkIndex:  entry.ChunkIndex,
 			SenderID:    entry.SenderID,
 			RecipientID: entry.RecipientID,
 			Hash:        entry.Hash,
 			PeerID:      entry.PeerID,
+			Persist:     entry.Persist,
 		})
 	}
 	ts.mu.Unlock()
@@ -413,7 +429,28 @@ func (ts *testMuninnServer) handleRegisterChunks(w http.ResponseWriter, r *http.
 func (ts *testMuninnServer) handleGetChunks(w http.ResponseWriter, r *http.Request) {
 	recipientID := r.PathValue("recipientID")
 	ts.mu.Lock()
-	records := ts.chunks[recipientID]
+	var records []muninn.ChunkRecord
+	for _, c := range ts.chunks {
+		if c.RecipientID == recipientID {
+			records = append(records, c)
+		}
+	}
+	ts.mu.Unlock()
+	if records == nil {
+		records = []muninn.ChunkRecord{}
+	}
+	json.NewEncoder(w).Encode(records)
+}
+
+func (ts *testMuninnServer) handleGetChunksByFileID(w http.ResponseWriter, r *http.Request) {
+	fileID := r.PathValue("fileID")
+	ts.mu.Lock()
+	var records []muninn.ChunkRecord
+	for _, c := range ts.chunks {
+		if c.FileID == fileID {
+			records = append(records, c)
+		}
+	}
 	ts.mu.Unlock()
 	if records == nil {
 		records = []muninn.ChunkRecord{}
@@ -429,15 +466,14 @@ func (ts *testMuninnServer) handleDeleteChunksByRecipient(w http.ResponseWriter,
 	recipientID := r.PathValue("recipientID")
 	fileID := r.PathValue("fileID")
 	ts.mu.Lock()
-	records := ts.chunks[recipientID]
 	var kept []muninn.ChunkRecord
-	for _, rec := range records {
-		if rec.FileID == fileID {
+	for _, rec := range ts.chunks {
+		if rec.RecipientID == recipientID && rec.FileID == fileID {
 			continue
 		}
 		kept = append(kept, rec)
 	}
-	ts.chunks[recipientID] = kept
+	ts.chunks = kept
 	ts.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -677,4 +713,275 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 		t.Fatal("message id is empty")
 	}
 	t.Logf("OK: offline message delivered via charley, id=%s", lastMsg.MsgID)
+}
+
+func TestFileSendAndReceive(t *testing.T) {
+	mn := newTestMuninnServer()
+	defer mn.Close()
+
+	mc := muninn.NewClient(mn.URL())
+
+	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alice.Shutdown()
+	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bob.Shutdown()
+	time.Sleep(300 * time.Millisecond)
+
+	for _, m := range []*messenger.Messenger{alice, bob} {
+		if err := m.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	msgCh := bob.SubscribeMessages()
+	defer bob.UnsubscribeMessages(msgCh)
+
+	content := "hello this is a test file from alice"
+	tmpFile := filepath.Join(t.TempDir(), "test.txt")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err = alice.SendMessageWithFiles("bob", "here is a file", []string{tmpFile}, 604800)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	records, err := mc.GetChunksByRecipient(context.Background(), "bob")
+	if err != nil {
+		t.Fatalf("get chunk records: %v", err)
+	}
+	t.Logf("found %d message chunk records", len(records))
+	if len(records) == 0 {
+		t.Fatal("no message chunk records found")
+	}
+
+	for _, rec := range records {
+		data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+		if !ok {
+			t.Fatalf("alice does not have chunk %s/%d", rec.FileID, rec.ChunkIndex)
+		}
+		bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+		t.Logf("injected message chunk %s/%d", rec.FileID, rec.ChunkIndex)
+	}
+
+	mn.mu.Lock()
+	var fileRecords []muninn.ChunkRecord
+	for _, c := range mn.chunks {
+		if c.Persist {
+			fileRecords = append(fileRecords, c)
+		}
+	}
+	mn.mu.Unlock()
+	t.Logf("found %d file chunk records", len(fileRecords))
+	if len(fileRecords) == 0 {
+		t.Fatal("no file chunk records found (persist=true)")
+	}
+
+	for _, rec := range fileRecords {
+		data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+		if !ok {
+			t.Fatalf("alice does not have file chunk %s/%d", rec.FileID, rec.ChunkIndex)
+		}
+		bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+		t.Logf("injected file chunk %s/%d", rec.FileID, rec.ChunkIndex)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	var delivered messenger.ChatMessage
+	gotMsg := false
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-msgCh:
+			delivered = msg
+			gotMsg = true
+		default:
+		}
+		if gotMsg {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !gotMsg {
+		t.Fatal("bob did not receive the message with file")
+	}
+	if delivered.Text != "here is a file" {
+		t.Fatalf("message text mismatch: got %q", delivered.Text)
+	}
+
+	msgs := bob.GetMessages("alice")
+	var foundMsg messenger.ChatMessage
+	for _, m := range msgs {
+		if m.MsgID == delivered.MsgID {
+			foundMsg = m
+			break
+		}
+	}
+	if foundMsg.MsgID == "" {
+		t.Fatal("delivered message not found in stored messages")
+	}
+
+	time.Sleep(2 * time.Second)
+
+	entries, err := os.ReadDir(bob.DownloadsDir())
+	if err != nil {
+		t.Fatalf("read downloads dir: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("no files in downloads directory")
+	}
+	downloadedPath := filepath.Join(bob.DownloadsDir(), entries[0].Name())
+	downloaded, err := os.ReadFile(downloadedPath)
+	if err != nil {
+		t.Fatalf("read downloaded file: %v", err)
+	}
+	if string(downloaded) != content {
+		t.Fatalf("file content mismatch: got %q, want %q", string(downloaded), content)
+	}
+	t.Logf("OK: file sent and received, msgID=%s, file=%s, content=%q", delivered.MsgID, entries[0].Name(), content)
+}
+
+func TestWebRTCOfflineFallback(t *testing.T) {
+	mn := newTestMuninnServer()
+	defer mn.Close()
+
+	mc := muninn.NewClient(mn.URL())
+
+	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db",
+		messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alice.Shutdown()
+	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db",
+		messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bob.Shutdown()
+	time.Sleep(300 * time.Millisecond)
+
+	for _, m := range []*messenger.Messenger{alice, bob} {
+		if err := m.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	alice.SearchPeers("bob")
+	bob.SearchPeers("alice")
+	time.Sleep(100 * time.Millisecond)
+
+	msgCh := bob.SubscribeMessages()
+	defer bob.UnsubscribeMessages(msgCh)
+
+	alice.ConnectPeer("bob")
+
+	deadline := time.Now().Add(5 * time.Second)
+	connected := false
+	for time.Now().Before(deadline) {
+		if alice.IsPeerConnected("bob") && bob.IsPeerConnected("alice") {
+			connected = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !connected {
+		t.Fatal("WebRTC connection not established between alice and bob within 5s")
+	}
+	t.Log("WebRTC connection established, waiting for data channel to open...")
+	time.Sleep(2 * time.Second)
+
+	err = alice.SendMessage("bob", "hello via webrtc", 604800)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline = time.Now().Add(10 * time.Second)
+	var delivered messenger.ChatMessage
+	gotViaWebRTC := false
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-msgCh:
+			delivered = msg
+			gotViaWebRTC = true
+		default:
+		}
+		if gotViaWebRTC {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if !gotViaWebRTC {
+		t.Log("message not received via WebRTC instantly, checking offline fallback...")
+		time.Sleep(2 * time.Second)
+
+		records, err := mc.GetChunksByRecipient(context.Background(), "bob")
+		if err == nil && len(records) > 0 {
+			t.Logf("found %d chunk records, injecting...", len(records))
+			for _, rec := range records {
+				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+				if !ok {
+					t.Fatalf("alice does not have chunk %s/%d", rec.FileID, rec.ChunkIndex)
+				}
+				bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+			}
+
+			deadline = time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				select {
+				case msg := <-msgCh:
+					delivered = msg
+					gotViaWebRTC = true
+				default:
+				}
+				if gotViaWebRTC {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}
+
+	if !gotViaWebRTC {
+		t.Fatal("bob did not receive the message via either WebRTC or offline fallback")
+	}
+
+	if delivered.From != "alice" {
+		t.Fatalf("message from wrong sender: got %q, want alice", delivered.From)
+	}
+	if delivered.Text != "hello via webrtc" {
+		t.Fatalf("message text mismatch: got %q", delivered.Text)
+	}
+	if delivered.MsgID == "" {
+		t.Fatal("message id is empty")
+	}
+
+	msgs := bob.GetMessages("alice")
+	found := false
+	for _, m := range msgs {
+		if m.MsgID == delivered.MsgID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("delivered message not found in bob.GetMessages(\"alice\")")
+	}
+
+	via := "WebRTC"
+	if !alice.IsPeerConnected("bob") {
+		via = "offline fallback"
+	}
+	t.Logf("OK: message delivered via %s, id=%s", via, delivered.MsgID)
 }

@@ -59,6 +59,13 @@ async function selectPeer(peerID) {
   document.getElementById('msg-input').focus();
 }
 
+function renderFileLinks(files) {
+  if (!files || files.length === 0) return '';
+  return files.map(f =>
+    '<div class="msg-file"><a href="/api/files/' + f.file_id + '" download target="_blank">&#128196; File (' + f.file_id.slice(0,8) + '...)</a></div>'
+  ).join('');
+}
+
 function renderMessages(msgs, peerID) {
   const container = document.getElementById('messages');
   container.innerHTML = '';
@@ -68,7 +75,8 @@ function renderMessages(msgs, peerID) {
     div.className = 'msg ' + (isSent ? 'sent' : 'received');
     const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const senderLabel = isSent ? '' : '<div class="msg-sender">' + msg.from + '</div>';
-    div.innerHTML = senderLabel + msg.text + '<div class="msg-time">' + time + '</div>';
+    const fileLinks = msg.files ? renderFileLinks(msg.files) : '';
+    div.innerHTML = senderLabel + msg.text + fileLinks + '<div class="msg-time">' + time + '</div>';
     container.appendChild(div);
   });
   container.scrollTop = container.scrollHeight;
@@ -82,17 +90,43 @@ async function sendMessage() {
   const ttlSelect = document.getElementById('ttl-select');
   const ttl = parseInt(ttlSelect.value) || 0;
 
-  input.value = '';
-  const r = await fetch('/api/send', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ to: activePeer, text, ttl })
-  });
-  if (!r.ok) {
-    const err = await r.text();
-    alert('Send failed: ' + err);
-    return;
+  const fileInput = document.getElementById('file-input');
+  const file = fileInput.files[0];
+
+  if (file) {
+    const formData = new FormData();
+    formData.append('to', activePeer);
+    formData.append('text', text);
+    formData.append('ttl', ttl);
+    formData.append('file', file);
+
+    input.value = '';
+    fileInput.value = '';
+    document.getElementById('file-name').textContent = '';
+
+    const r = await fetch('/api/send-file', {
+      method: 'POST',
+      body: formData
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      alert('Send failed: ' + err);
+      return;
+    }
+  } else {
+    input.value = '';
+    const r = await fetch('/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: activePeer, text, ttl })
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      alert('Send failed: ' + err);
+      return;
+    }
   }
+
   const msgs = await fetchMessages(activePeer);
   renderMessages(msgs, activePeer);
 }
@@ -185,6 +219,10 @@ document.addEventListener('DOMContentLoaded', async function() {
   document.getElementById('send-btn').addEventListener('click', sendMessage);
   document.getElementById('msg-input').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') sendMessage();
+  });
+  document.getElementById('file-input').addEventListener('change', function(e) {
+    const name = e.target.files[0] ? e.target.files[0].name : '';
+    document.getElementById('file-name').textContent = name;
   });
   document.getElementById('peer-search').addEventListener('input', function() {
     clearTimeout(searchTimeout);

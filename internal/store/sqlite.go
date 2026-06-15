@@ -37,62 +37,12 @@ func New(path string) (*SQLiteStore, error) {
 	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS chunks (
-			file_id TEXT NOT NULL,
-			chunk_index INTEGER NOT NULL,
-			data BLOB NOT NULL,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			ttl_seconds INTEGER NOT NULL DEFAULT 604800,
-			PRIMARY KEY (file_id, chunk_index)
-		);
-		CREATE TABLE IF NOT EXISTS stored_peers (
-			login TEXT NOT NULL,
-			peer_id TEXT NOT NULL,
-			encryption_key TEXT NOT NULL DEFAULT '',
-			signature_key TEXT NOT NULL DEFAULT '',
-			last_seen DATETIME NOT NULL,
-			PRIMARY KEY (login, peer_id)
-		);
-		CREATE TABLE IF NOT EXISTS messages (
-			message_uid TEXT PRIMARY KEY,
-			login TEXT NOT NULL,
-			sender_login TEXT NOT NULL,
-			chat_id TEXT NOT NULL,
-			data BLOB NOT NULL,
-			created_at DATETIME NOT NULL
-		);
-		CREATE TABLE IF NOT EXISTS pending_chunks (
-			file_id TEXT NOT NULL,
-			chunk_index INTEGER NOT NULL,
-			recipient_id TEXT NOT NULL,
-			sender_id TEXT NOT NULL,
-			data BLOB NOT NULL,
-			hash TEXT NOT NULL,
-			signature TEXT NOT NULL,
-			created_at DATETIME NOT NULL,
-			placed BOOLEAN NOT NULL DEFAULT 0,
-			ttl_seconds INTEGER NOT NULL DEFAULT 604800,
-			PRIMARY KEY (file_id, chunk_index)
-		);
-	`); err != nil {
-		return nil, err
+
+	if err := runMigrations(db); err != nil {
+		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
-	s := &SQLiteStore{db: db}
-	s.migrate()
-	return s, nil
-}
-
-func (s *SQLiteStore) migrate() {
-	migrations := []string{
-		"ALTER TABLE chunks ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
-		"ALTER TABLE chunks ADD COLUMN ttl_seconds INTEGER NOT NULL DEFAULT 604800",
-		"ALTER TABLE pending_chunks ADD COLUMN ttl_seconds INTEGER NOT NULL DEFAULT 604800",
-	}
-	for _, m := range migrations {
-		s.db.Exec(m)
-	}
+	return &SQLiteStore{db: db}, nil
 }
 
 func (s *SQLiteStore) Close() error {
