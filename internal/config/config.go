@@ -7,15 +7,20 @@ import (
 	"net"
 	"os"
 	"strings"
+	"github.com/google/uuid"
 )
 
 type Config struct {
-	MuninnAddr string `json:"muninn"`
-	Username   string `json:"username"`
-	UIPort     int    `json:"ui_port"`
-	DBPath     string `json:"-"`
-	ChunkTTL   string `json:"chunk_ttl"`
-	PeerFlag   string `json:"peer_flag"`
+	MuninnAddr   string `json:"muninn"`
+	Username     string `json:"username"`
+	UIPort       int    `json:"ui_port"`
+	DBPath       string `json:"-"`
+	ChunkTTL     string `json:"chunk_ttl"`
+	PeerFlag     string `json:"peer_flag"`
+	TurnAddr     string `json:"turn_addr"`
+	TurnUsername string `json:"turn_user"`
+	TurnPassword string `json:"turn_pass"`
+	StartServer  bool   `json:"start_server"`
 }
 
 const configPath = "config.conf"
@@ -43,12 +48,11 @@ func Parse() *Config {
 	flag.Parse()
 
 	if c.Username == "" {
-		fmt.Println("Error: --username is required")
-		flag.Usage()
-		return nil
+		c.Username = uuid.New().String()
 	}
+	c.StartServer = true
 	if c.UIPort == 0 {
-		c.UIPort = findFreePort()
+		c.StartServer = false
 	}
 	return c
 }

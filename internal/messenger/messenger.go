@@ -59,6 +59,9 @@ type messengerOpts struct {
 	iceServers []pion.ICEServer
 	iceSet     bool
 	peerFlag   muninn.PeerFlag
+	turnAddr   string
+	turnUser   string
+	turnPass   string
 }
 
 func WithICEServers(servers []pion.ICEServer) MessengerOption {
@@ -71,6 +74,14 @@ func WithICEServers(servers []pion.ICEServer) MessengerOption {
 func WithPeerFlag(flag muninn.PeerFlag) MessengerOption {
 	return func(o *messengerOpts) {
 		o.peerFlag = flag
+	}
+}
+
+func WithTURN(addr, user, pass string) MessengerOption {
+	return func(o *messengerOpts) {
+		o.turnAddr = addr
+		o.turnUser = user
+		o.turnPass = pass
 	}
 }
 
@@ -172,12 +183,24 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 
 	if !o.iceSet {
 		o.iceServers = []pion.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}}, // TODO: Развернуть свой
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
 		}
+	}
+	if o.turnAddr != "" {
+		o.iceServers = append(o.iceServers,
+			pion.ICEServer{
+				URLs:       []string{"turn:" + o.turnAddr},
+				Username:   o.turnUser,
+				Credential: o.turnPass,
+			},
+			pion.ICEServer{
+				URLs: []string{"stun:" + o.turnAddr},
+			},
+		)
 	}
 	m.rtcManager = webrtc.NewManager(username, rtcMsgChan, m.handleChunkStore, m.handleChunkGet, o.iceServers)
 
-	m.rtcClient = muninn.NewRTCClient(muninnClient.BaseURL(), username)
+	m.rtcClient = muninn.NewRTCClient(muninnClient.BaseURL(), username, o.iceServers)
 	m.rtcClient.SetOnSignal(func(sig muninn.Signal) {
 		select {
 		case m.signalChan <- sig:

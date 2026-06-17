@@ -20,7 +20,6 @@ func main() {
 	}
 
 	mc := muninn.NewClient(cfg.MuninnAddr)
-
 	m, err := messenger.New(cfg.Username, mc, cfg.DBPath, messenger.WithPeerFlag(muninn.PeerFlag(cfg.PeerFlag)))
 	if err != nil {
 		log.Fatalf("failed to create messenger: %v", err)
@@ -29,24 +28,30 @@ func main() {
 	if err := m.Register(); err != nil {
 		log.Printf("warning: register failed: %v", err)
 	}
+	var uiSrv *ui.Server
 
-	uiSrv := ui.NewServer(cfg, m)
+	if (cfg.StartServer) {
+		uiSrv = ui.NewServer(cfg, m)
+		go func() {
+			log.Printf("web UI started at http://localhost:%d", cfg.UIPort)
+			log.Printf("connect to muninn: %s", cfg.MuninnAddr)
+			if err := uiSrv.Start(); err != nil {
+				log.Fatalf("UI server error: %v", err)
+			}
+		}()
 
-	go func() {
-		log.Printf("web UI started at http://localhost:%d", cfg.UIPort)
-		log.Printf("connect to muninn: %s", cfg.MuninnAddr)
-		if err := uiSrv.Start(); err != nil {
-			log.Fatalf("UI server error: %v", err)
-		}
-	}()
+		fmt.Printf("\n  Open http://localhost:%d in your browser\n\n", cfg.UIPort)
+	}
 
-	fmt.Printf("\n  Open http://localhost:%d in your browser\n\n", cfg.UIPort)
+	log.Printf("started: username=%s muninn=%s db=%s", cfg.Username, cfg.MuninnAddr, cfg.DBPath)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
 	log.Println("shutting down...")
-	uiSrv.Shutdown()
+	if (cfg.StartServer) {
+		uiSrv.Shutdown()
+	}
 	m.Shutdown()
 }

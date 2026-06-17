@@ -67,9 +67,10 @@ type RTCClient struct {
 	baseURL string
 	localID string
 
-	pc        *pion.PeerConnection
-	dc        *pion.DataChannel
-	connected bool
+	pc         *pion.PeerConnection
+	dc         *pion.DataChannel
+	connected  bool
+	iceServers []pion.ICEServer
 
 	pending   map[string]chan<- rpcResponse
 	pendingMu sync.Mutex
@@ -84,14 +85,15 @@ type RTCClient struct {
 	closeOnce  sync.Once
 }
 
-func NewRTCClient(baseURL, localID string) *RTCClient {
+func NewRTCClient(baseURL, localID string, iceServers []pion.ICEServer) *RTCClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &RTCClient{
-		baseURL:  baseURL,
-		localID:  localID,
-		pending:  make(map[string]chan<- rpcResponse),
-		ctx:      ctx,
-		cancel:   cancel,
+		baseURL:    baseURL,
+		localID:    localID,
+		iceServers: iceServers,
+		pending:    make(map[string]chan<- rpcResponse),
+		ctx:        ctx,
+		cancel:     cancel,
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -110,9 +112,7 @@ func (c *RTCClient) SetOnDisconnect(fn OnDisconnectFunc) {
 
 func (c *RTCClient) Connect(ctx context.Context) error {
 	config := pion.Configuration{
-		ICEServers: []pion.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
+		ICEServers: c.iceServers,
 	}
 
 	pc, err := pion.NewPeerConnection(config)
