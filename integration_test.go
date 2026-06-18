@@ -850,6 +850,177 @@ func TestFileSendAndReceive(t *testing.T) {
 	t.Logf("OK: file sent and received, msgID=%s, file=%s, content=%q", delivered.MsgID, entries[0].Name(), content)
 }
 
+func TestGroupChatFlow(t *testing.T) {
+	mn := newTestMuninnServer()
+	defer mn.Close()
+
+	mc := muninn.NewClient(mn.URL())
+
+	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db",
+		messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alice.Shutdown()
+	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db",
+		messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bob.Shutdown()
+	time.Sleep(300 * time.Millisecond)
+
+	for _, m := range []*messenger.Messenger{alice, bob} {
+		if err := m.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	alice.SearchPeers("bob")
+	bob.SearchPeers("alice")
+	time.Sleep(100 * time.Millisecond)
+
+	alice.ConnectPeer("bob")
+	deadline := time.Now().Add(5 * time.Second)
+	connected := false
+	for time.Now().Before(deadline) {
+		if alice.IsPeerConnected("bob") && bob.IsPeerConnected("alice") {
+			connected = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !connected {
+		t.Fatal("WebRTC not established")
+	}
+	time.Sleep(2 * time.Second)
+
+	gc, err := alice.CreateGroupChat("test-room")
+	if err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if gc.Name != "test-room" {
+		t.Fatalf("group name: got %q, want test-room", gc.Name)
+	}
+	t.Logf("group created: %s (%s)", gc.Name, gc.UID)
+
+	bobMsgCh := bob.SubscribeMessages()
+	defer bob.UnsubscribeMessages(bobMsgCh)
+
+	if err := alice.InviteToGroupChat(gc.UID, "bob"); err != nil {
+		t.Fatalf("invite bob: %v", err)
+	}
+
+	deadline = time.Now().Add(15 * time.Second)
+	var inviteMsg messenger.ChatMessage
+	gotInvite := false
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-bobMsgCh:
+			inviteMsg = msg
+			gotInvite = true
+		default:
+		}
+		if gotInvite {
+			break
+		}
+
+		records, err := mc.GetChunksByRecipient(context.Background(), "bob")
+		if err == nil && len(records) > 0 {
+			for _, rec := range records {
+				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+				if !ok {
+					continue
+				}
+				bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if !gotInvite {
+		t.Fatal("bob did not receive the group invite")
+	}
+	t.Logf("bob received invite: %s", inviteMsg.Text)
+
+	bobGroups, err := bob.GetGroupChats()
+	if err != nil {
+		t.Fatalf("bob get groups: %v", err)
+	}
+	if len(bobGroups) == 0 {
+		t.Fatal("bob has no groups after invite")
+	}
+	if bobGroups[0].UID != gc.UID {
+		t.Fatalf("bob group uid mismatch: got %s, want %s", bobGroups[0].UID, gc.UID)
+	}
+	t.Logf("bob joined group: %s", bobGroups[0].Name)
+
+	aliceMsgCh := alice.SubscribeMessages()
+	defer alice.UnsubscribeMessages(aliceMsgCh)
+
+	if err := alice.SendGroupMessage(gc.UID, "hello from alice in group"); err != nil {
+		t.Fatalf("alice send group msg: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	records, err := mc.GetChunksByRecipient(context.Background(), gc.UID)
+	if err != nil {
+		t.Fatalf("get group chunks: %v", err)
+	}
+	t.Logf("found %d group chunk records", len(records))
+	if len(records) == 0 {
+		t.Fatal("no group chunk records found")
+	}
+
+	for _, rec := range records {
+		data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+		if !ok {
+			continue
+		}
+		bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+	}
+
+	deadline = time.Now().Add(15 * time.Second)
+	var groupMsg messenger.ChatMessage
+	gotGroupMsg := false
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-bobMsgCh:
+			if msg.MsgID != inviteMsg.MsgID {
+				groupMsg = msg
+				gotGroupMsg = true
+			}
+		default:
+		}
+		if gotGroupMsg {
+			break
+		}
+
+		records2, err := mc.GetChunksByRecipient(context.Background(), gc.UID)
+		if err == nil && len(records2) > 0 {
+			for _, rec := range records2 {
+				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+				if !ok {
+					continue
+				}
+				bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if !gotGroupMsg {
+		t.Fatal("bob did not receive the group message")
+	}
+	if groupMsg.Text != "hello from alice in group" {
+		t.Fatalf("group message text: got %q, want 'hello from alice in group'", groupMsg.Text)
+	}
+	if groupMsg.From != "alice" {
+		t.Fatalf("group message from: got %q, want 'alice'", groupMsg.From)
+	}
+	t.Logf("OK: group message delivered, id=%s", groupMsg.MsgID)
+}
+
 func TestWebRTCOfflineFallback(t *testing.T) {
 	mn := newTestMuninnServer()
 	defer mn.Close()

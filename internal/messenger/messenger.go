@@ -224,6 +224,16 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	go m.pendingChunkLoop()
 	go m.fileDownloadLoop()
 	go m.chunkCleanupLoop()
+	go m.groupHeartbeatLoop()
+
+	go func() {
+		groups, err := m.store.GetGroupChats()
+		if err == nil {
+			for _, g := range groups {
+				m.registerGroupPeer(g)
+			}
+		}
+	}()
 
 	return m, nil
 }
@@ -272,9 +282,10 @@ func (m *Messenger) processRTCMessages() {
 	for {
 		select {
 		case msg := <-m.rtcMsgChan:
+			displayText := m.checkInviteText(msg.Text)
 			cm := ChatMessage{
 				From:      msg.From,
-				Text:      msg.Text,
+				Text:      displayText,
 				Timestamp: msg.Timestamp,
 				MsgID:     msg.MsgID,
 			}
@@ -814,16 +825,40 @@ func (m *Messenger) SendMessageWithFiles(toPeerID, text string, filePaths []stri
 		if err := m.rtcManager.SendMessage(toPeerID, text, now, msgID); err != nil {
 			return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 		}
-		cm := ChatMessage{From: m.ID, Text: text, Timestamp: now, MsgID: msgID, Files: files}
-		jsonData, _ := json.Marshal(cm)
-		if err := m.store.SaveMessage(msgID, toPeerID, m.ID, toPeerID, jsonData, cm.Timestamp); err != nil {
-			log.Printf("save message: %v", err)
-		}
 		m.upsertPeer(toPeerID, peer.EncryptionKey, peer.SignatureKey, now)
 		return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 	}
 
 	return m.sendOffline(msgID, text, peer, ttlSeconds, files)
+}
+
+func (m *Messenger) SendMessage(toPeerID, text string, ttlSeconds int) error {
+	msgID := uuid.New().String()
+	peer := m.findPeerByID(toPeerID)
+	if peer == nil {
+		return fmt.Errorf("peer %s not found", toPeerID)
+	}
+
+	if ttlSeconds <= 0 {
+		ttlSeconds = config.ChunkTTLSeconds("1w")
+	}
+
+	if m.IsPeerOnline(toPeerID) {
+		if !m.IsPeerConnected(toPeerID) {
+			m.ConnectPeer(toPeerID)
+		}
+	}
+
+	if m.IsPeerConnected(toPeerID) {
+		now := time.Now()
+		if err := m.rtcManager.SendMessage(toPeerID, text, now, msgID); err != nil {
+			return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
+		}
+		m.upsertPeer(toPeerID, peer.EncryptionKey, peer.SignatureKey, now)
+		return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
+	}
+
+	return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
 }
 
 func (m *Messenger) replicatePendingChunks() {
@@ -986,40 +1021,6 @@ func (m *Messenger) sendFileChunks(recipientID, filePath string, ttlSeconds int)
 
 	log.Printf("file %s sent as %s (%d chunks)", filename, fileID, len(chunks))
 	return &FileMeta{FileID: fileID, FileHash: fileHashB64, DecryptionKey: crypto.EncodeKey(aesKey), TotalChunks: len(chunks), Filename: filename}, nil
-}
-
-func (m *Messenger) SendMessage(toPeerID, text string, ttlSeconds int) error {
-	msgID := uuid.New().String()
-	peer := m.findPeerByID(toPeerID)
-	if peer == nil {
-		return fmt.Errorf("peer %s not found", toPeerID)
-	}
-
-	if ttlSeconds <= 0 {
-		ttlSeconds = config.ChunkTTLSeconds("1w")
-	}
-
-	if m.IsPeerOnline(toPeerID) {
-		if !m.IsPeerConnected(toPeerID) {
-			m.ConnectPeer(toPeerID)
-		}
-	}
-
-	if m.IsPeerConnected(toPeerID) {
-		now := time.Now()
-		if err := m.rtcManager.SendMessage(toPeerID, text, now, msgID); err != nil {
-			return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
-		}
-		cm := ChatMessage{From: m.ID, Text: text, Timestamp: now, MsgID: msgID}
-		jsonData, _ := json.Marshal(cm)
-		if err := m.store.SaveMessage(msgID, toPeerID, m.ID, toPeerID, jsonData, cm.Timestamp); err != nil {
-			log.Printf("save message: %v", err)
-		}
-		m.upsertPeer(toPeerID, peer.EncryptionKey, peer.SignatureKey, now)
-		return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
-	}
-
-	return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
 }
 
 func (m *Messenger) ConnectPeer(toPeerID string) error {
@@ -1216,7 +1217,19 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 }
 
 func (m *Messenger) checkPendingMessages() {
-	chunks, err := m.muninnClient.GetChunksByRecipient(m.ctx, m.ID)
+	m.checkRecipientMessages(m.ID)
+
+	groups, err := m.store.GetGroupChats()
+	if err != nil {
+		return
+	}
+	for _, g := range groups {
+		m.checkRecipientMessages(g.UID)
+	}
+}
+
+func (m *Messenger) checkRecipientMessages(recipientID string) {
+	chunks, err := m.muninnClient.GetChunksByRecipient(m.ctx, recipientID)
 	if err != nil {
 		return
 	}
@@ -1322,7 +1335,21 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 		return
 	}
 
-	plaintext, err := chunk.AssembleAndDecrypt(envelopes, m.encPrivate, m.encPublic, senderSignKey)
+	encPrivate := m.encPrivate
+	encPublic := m.encPublic
+	recipientID := records[0].RecipientID
+	if recipientID != "" && recipientID != m.ID {
+		if gc, err := m.store.GetGroupChat(recipientID); err == nil {
+			if priv, err := crypto.DecodeKey(gc.EncPrivate); err == nil {
+				encPrivate = priv
+			}
+			if pub, err := crypto.DecodeKey(gc.EncPublic); err == nil {
+				encPublic = pub
+			}
+		}
+	}
+
+	plaintext, err := chunk.AssembleAndDecrypt(envelopes, encPrivate, encPublic, senderSignKey)
 	if err != nil {
 		log.Printf("assemble/decrypt message %s: %v", msgID, err)
 		return
@@ -1336,20 +1363,27 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 		payload.Timestamp = time.Now()
 	}
 
+	chatID := records[0].SenderID
+	if recipientID != "" && recipientID != m.ID {
+		chatID = recipientID
+	}
+
+	displayText := m.checkInviteText(payload.Text)
+
 	for _, f := range payload.Files {
 		m.processReceivedFile(f, records[0].SenderID)
 	}
 
 	decryptedMsg := ChatMessage{
 		From:      records[0].SenderID,
-		Text:      payload.Text,
+		Text:      displayText,
 		Timestamp: payload.Timestamp,
 		MsgID:     msgID,
 		Files:     payload.Files,
-	}					
+	}
 
 	jsonData, _ := json.Marshal(decryptedMsg)
-	if err := m.store.SaveMessage(msgID, records[0].SenderID, decryptedMsg.From, decryptedMsg.From, jsonData, decryptedMsg.Timestamp); err != nil {
+	if err := m.store.SaveMessage(msgID, chatID, decryptedMsg.From, chatID, jsonData, decryptedMsg.Timestamp); err != nil {
 		log.Printf("save message: %v", err)
 	}
 	m.upsertPeer(decryptedMsg.From, senderPeer.EncryptionKey, senderPeer.SignatureKey, decryptedMsg.Timestamp)
@@ -1363,11 +1397,188 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 	}
 	m.msgSubsMu.Unlock()
 
+	log.Printf("message %s delivered from %s", msgID, records[0].SenderID)
+}
+
+func (m *Messenger) deleteChunksAndReturn(msgID string) {
 	if err := m.store.DeleteChunks(msgID); err != nil {
 		log.Printf("delete chunks for %s: %v", msgID, err)
 	}
+}
 
-	log.Printf("message %s delivered from %s", msgID, records[0].SenderID)
+const invitePrefix = "__group_invite__:"
+
+type groupInvitePayload struct {
+	UID         string `json:"uid"`
+	Name        string `json:"name"`
+	EncPrivate  string `json:"enc_private"`
+	EncPublic   string `json:"enc_public"`
+	SignPrivate string `json:"sign_private"`
+	SignPublic  string `json:"sign_public"`
+}
+
+func parseInvitePayload(text string) (*groupInvitePayload, error) {
+	raw := strings.TrimPrefix(text, invitePrefix)
+	var inv groupInvitePayload
+	if err := json.Unmarshal([]byte(raw), &inv); err != nil {
+		return nil, err
+	}
+	return &inv, nil
+}
+
+func (m *Messenger) checkInviteText(text string) string {
+	if !strings.HasPrefix(text, invitePrefix) {
+		return text
+	}
+	inv, err := parseInvitePayload(text)
+	if err != nil {
+		log.Printf("parse invite: %v", err)
+		return text
+	}
+	existing, _ := m.store.GetGroupChat(inv.UID)
+	if existing == nil {
+		gc := &store.GroupChat{
+			UID:         inv.UID,
+			Name:        inv.Name,
+			EncPrivate:  inv.EncPrivate,
+			EncPublic:   inv.EncPublic,
+			SignPrivate: inv.SignPrivate,
+			SignPublic:  inv.SignPublic,
+			CreatedAt:   time.Now(),
+		}
+		if err := m.store.CreateGroupChat(gc); err != nil {
+			log.Printf("save group invite: %v", err)
+		} else {
+			log.Printf("joined group %s (%s) via invite", inv.Name, inv.UID)
+		}
+	}
+	return fmt.Sprintf("You were invited to group chat: %s", inv.Name)
+}
+
+func (m *Messenger) CreateGroupChat(name string) (*store.GroupChat, error) {
+	signPub, signPriv, err := crypto.GenerateSigningKey()
+	if err != nil {
+		return nil, fmt.Errorf("generate group signing key: %w", err)
+	}
+	encPriv, encPub, err := crypto.GenerateEncryptionKey()
+	if err != nil {
+		return nil, fmt.Errorf("generate group enc key: %w", err)
+	}
+
+	uid := uuid.New().String()
+	gc := &store.GroupChat{
+		UID:         uid,
+		Name:        name,
+		EncPrivate:  crypto.EncodeKey(encPriv),
+		EncPublic:   crypto.EncodeKey(encPub),
+		SignPrivate: crypto.EncodeKey(signPriv),
+		SignPublic:  crypto.EncodeKey(signPub),
+		CreatedAt:   time.Now(),
+	}
+
+	if err := m.store.CreateGroupChat(gc); err != nil {
+		return nil, fmt.Errorf("save group chat: %w", err)
+	}
+
+	req := &muninn.RegisterRequest{
+		ID:            uid,
+		Keys:          []muninn.Key{{Login: name, Signature: "huginn-v1"}},
+		Addresses:     []string{""},
+		EncryptionKey: gc.EncPublic,
+		SignatureKey:  gc.SignPublic,
+		Metadata: map[string]string{
+			"username": name,
+			"type":     "huginn-group",
+		},
+		TTLSeconds: 86400,
+		PeerFlag:   muninn.PeerFlag("very_thick"),
+	}
+	if err := m.muninnClient.Register(m.ctx, req); err != nil {
+		log.Printf("register group peer %s (%s): %v", name, uid, err)
+	}
+
+	m.upsertPeer(uid, gc.EncPublic, gc.SignPublic, time.Now())
+
+	log.Printf("group chat %s created with uid %s", name, uid)
+	return gc, nil
+}
+
+func (m *Messenger) GetGroupChats() ([]store.GroupChat, error) {
+	return m.store.GetGroupChats()
+}
+
+func (m *Messenger) registerGroupPeer(gc store.GroupChat) {
+	req := &muninn.RegisterRequest{
+		ID:            gc.UID,
+		Keys:          []muninn.Key{{Login: gc.Name, Signature: "huginn-v1"}},
+		Addresses:     []string{""},
+		EncryptionKey: gc.EncPublic,
+		SignatureKey:  gc.SignPublic,
+		Metadata: map[string]string{
+			"username": gc.Name,
+			"type":     "huginn-group",
+		},
+		TTLSeconds: 120,
+		PeerFlag:   muninn.PeerFlag("very_thick"),
+	}
+	if err := m.muninnClient.Register(m.ctx, req); err != nil {
+		log.Printf("register group peer %s (%s): %v", gc.Name, gc.UID, err)
+	}
+}
+
+func (m *Messenger) groupHeartbeatLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			groups, err := m.store.GetGroupChats()
+			if err != nil {
+				continue
+			}
+			for _, g := range groups {
+				m.registerGroupPeer(g)
+			}
+		case <-m.ctx.Done():
+			return
+		}
+	}
+}
+
+func (m *Messenger) InviteToGroupChat(groupUID, memberID string) error {
+	gc, err := m.store.GetGroupChat(groupUID)
+	if err != nil {
+		return fmt.Errorf("group not found: %w", err)
+	}
+
+	inv := groupInvitePayload{
+		UID:         gc.UID,
+		Name:        gc.Name,
+		EncPrivate:  gc.EncPrivate,
+		EncPublic:   gc.EncPublic,
+		SignPrivate: gc.SignPrivate,
+		SignPublic:  gc.SignPublic,
+	}
+	invData, _ := json.Marshal(inv)
+	inviteText := invitePrefix + string(invData)
+
+	return m.SendMessage(memberID, inviteText, 604800)
+}
+
+func (m *Messenger) SendGroupMessage(groupUID, text string) error {
+	gc, err := m.store.GetGroupChat(groupUID)
+	if err != nil {
+		return fmt.Errorf("group not found: %w", err)
+	}
+
+	peer := &muninn.Peer{
+		ID:            gc.UID,
+		EncryptionKey: gc.EncPublic,
+		SignatureKey:  gc.SignPublic,
+	}
+
+	msgID := uuid.New().String()
+	return m.sendOffline(msgID, text, peer, 604800, nil)
 }
 
 func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {

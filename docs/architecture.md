@@ -422,3 +422,266 @@ Response: pion.SessionDescription (SDP answer)
 | Репликация чанков | WebRTC DataChannel (batch) | Каждые 15s | ~1KB × N |
 | SSE события | HTTP Server-Sent Events | Постоянно | ~1-5KB |
 | Поиск пользователей | HTTP REST (local API) | При вводе | ~100-500 bytes |
+
+---
+
+## 12. Групповые чаты (Group Chats)
+
+### 12.1. Модель группы
+
+Групповой чат — это виртуальный пир на Muninn. Каждая группа имеет:
+
+- **UID** — UUID, используется как `peer_id` на сервере
+- **Name** — человекочитаемое имя группы
+- **Encryption keys** — пара X25519 (EncPrivate/EncPublic) для шифрования сообщений группы
+- **Signing keys** — пара Ed25519 (SignPrivate/SignPublic) для подписи сообщений группы
+
+Группа регистрируется на Muninn с флагом `PeerFlag = "very_thick"` и TTL 86400s (24h). В отличие от обычных пиров, группа **не отправляет heartbeat** — её регистрация обновляется только явным вызовом `groupHeartbeatLoop`.
+
+```go
+// internal/messenger/messenger.go:1484-1496
+req := &muninn.RegisterRequest{
+    ID:            uid,
+    Keys:          []muninn.Key{{Login: name, Signature: "huginn-v1"}},
+    EncryptionKey: gc.EncPublic,
+    SignatureKey:  gc.SignPublic,
+    Metadata:      map[string]string{"username": name, "type": "huginn-group"},
+    TTLSeconds:    86400,
+    PeerFlag:      muninn.PeerFlag("very_thick"),
+}
+```
+
+### 12.2. Создание группы
+
+```mermaid
+sequenceDiagram
+    participant UI as Browser
+    participant API as Go HTTP Server
+    participant M as Messenger
+    participant DB as SQLite
+    participant Mu as Muninn
+
+    UI->>API: POST /api/groups/create {name:"team"}
+    API->>M: CreateGroupChat("team")
+    M->>M: GenerateEncryptionKey() → X25519 keypair
+    M->>M: GenerateSigningKey() → Ed25519 keypair
+    M->>DB: CreateGroupChat(gc) — сохраняет ключи
+    M->>Mu: POST /api/v1/peers (Register как very_thick)
+    M->>M: upsertPeer(uid, encPublic, signPublic)
+    API-->>UI: {uid, name, created_at}
+```
+
+Ключи группы генерируются на стороне создателя. Закрытые ключи хранятся **только на клиенте создателя** и никуда не отправляются. Чтобы добавить участника, создатель отправляет инвайт (см. 12.3).
+
+### 12.3. Приглашение в группу (Invite)
+
+```mermaid
+sequenceDiagram
+    participant A as Alice (creator)
+    participant A_DB as Alice SQLite
+    participant B as Bob
+    participant B_DB as Bob SQLite
+
+    A->>A: InviteToGroup(groupUID, bobID)
+    Note over A: формирует invitePayload с ключами группы
+    Note over A: text = "__group_invite__:" + json(payload)
+    A->>A: SendMessage(bobID, inviteText) — обычное DM
+    Note over A: сообщение проходит через sendOffline или RTC
+    B->>B: получает сообщение
+    B->>B: checkInviteText(text) — detects "__group_invite__:" prefix
+    B->>B: ParseInvitePayload → groupInvitePayload
+    B->>B_DB: CreateGroupChat(gc) — сохраняет ключи группы
+    B->>B: registerGroupPeer(gc) — регистрируется как storage peer
+    B->>B_DB: DeleteChunks(msgID) — удаляет чанки инвайта
+    Note over B: в UI показывается "You were invited to group chat: team"
+```
+
+Механизм инвайта работает через обычное DM-сообщение с префиксом `__group_invite__:`. Отправитель сериализует все ключи группы (включая закрытые) в JSON и отправляет их как обычный текст. Получатель детектит префикс в `checkInviteText()`, парсит payload и сохраняет группу в свою БД. После этого он регистрируется как storage peer для этой группы (см. 12.5).
+
+**Payload инвайта:**
+```json
+{
+  "uid": "group-uuid",
+  "name": "team",
+  "enc_private": "base64...",
+  "enc_public": "base64...",
+  "sign_private": "base64...",
+  "sign_public": "base64..."
+}
+```
+
+### 12.4. Отправка сообщения в группу
+
+```mermaid
+sequenceDiagram
+    participant A as Alice (member)
+    participant A_DB as Alice SQLite
+    participant M as Muninn
+    participant SP as Storage Peers
+    participant B as Bob (member)
+
+    Note over A: Alice отправляет сообщение в группу
+    A->>A_DB: GetGroupChat(groupUID) → gc (ключи группы)
+    A->>A: SplitAndEncrypt(msg, groupUID, gc.EncPublic)
+    Note over A: шифруется групповым публичным ключом
+
+    loop For each envelope
+        A->>A_DB: StoreChunk(msgID, index, data)
+    end
+
+    A->>M: GET /api/v1/peers/best?n=10
+    A->>M: POST .../chunks (RegisterChunks batch)
+    Note over A: RecipientID = groupUID, PeerID = Alice
+
+    A->>SP: SendChunkStoreBatch (WebRTC)
+    A->>M: RegisterChunks(PеерID = storage_peer)
+
+    A->>A_DB: StorePendingChunk(RecipientID=groupUID)
+    A->>A_DB: SaveMessage(chat_id=groupUID)
+```
+
+Ключевое отличие от DM:
+- **RecipientID** = groupUID (не ID пользователя)
+- **Encryption** = групповым публичным ключом (любой участник может расшифровать своим закрытым)
+- **TTL** = 604800 (1 неделя), фиксированный
+- Файлы не поддерживаются (files=nil)
+
+### 12.5. Получение сообщения из группы
+
+Каждый участник группы регистрируется как storage peer для этой группы:
+
+```go
+// registerGroupPeer — вызывается при старте и после получения инвайта
+func (m *Messenger) registerGroupPeer(gc *store.GroupChat) {
+    // регистрирует себя (m.ID) как storage peer для groupUID на Muninn
+    m.muninnClient.RegisterAsPeer(m.ctx, groupUID, m.ID)
+}
+```
+
+Это гарантирует, что при опросе чанков для группы Muninn вернёт и этого участника как владельца чанков.
+
+Получение:
+
+```mermaid
+sequenceDiagram
+    participant B as Bob (member)
+    participant B_DB as Bob SQLite
+    participant M as Muninn
+    participant A as Alice (sender)
+
+    Note over B: peerRefreshLoop (15s)
+    B->>B: checkPendingMessages()
+    B->>B: checkRecipientMessages(groupUID)
+    B->>M: GET /api/v1/recipient/{groupUID}/chunks
+    M-->>B: [ChunkRecord{fileID, chunkIndex, PeerID, ...}]
+
+    Note over B: перебор записей
+    loop For each unique chunk_index
+        B->>B_DB: GetChunk(fileID, index) — локально?
+        alt Найдено локально
+            Note over B: чанк уже есть в БД
+        else Не найдено
+            B->>A: SendChunkGet(WebRTC) — запрос к владельцу
+            A-->>B: ChunkData
+            B->>B_DB: InjectChunk → StoreChunk
+        end
+    end
+
+    Note over B: все чанки собраны
+    B->>B: AssembleAndDecrypt(envelopes, gc.EncPrivate, ...)
+    Note over B: расшифровка групповым закрытым ключом
+    B->>B_DB: SaveMessage(chat_id=groupUID, ...)
+    Note over B: чанки НЕ удаляются (нужны другим участникам)
+```
+
+Критическое отличие от DM: чанки **не удаляются** после успешной расшифровки (см. `collectAndProcessMessage`, строка 1400), так как они нужны другим участникам группы, которые ещё не получили сообщение.
+
+### 12.6. Жизненный цикл группового сообщения
+
+```mermaid
+stateDiagram-v2
+    [*] --> Sent: SendGroupMessage
+    Sent --> Registered: RegisterChunks на Muninn
+    Registered --> Distributed: SendChunkStoreBatch на storage peers
+    Distributed --> Received: первый участник расшифровал
+    Received --> Available: чанки остаются у отправителя и storage peers
+    Available --> Received: следующий участник расшифровал
+    Available --> Expired: TTL истёк (>5min chunkCleanupLoop)
+
+    note right of Available
+        Пока хотя бы один пир хранит чанки,
+        любой участник группы может их получить
+    end note
+
+    note right of Expired
+        DeleteChunksWithMessage() раз в 5 минут
+        удаляет чанки, для которых уже есть
+        запись в messages
+    end note
+```
+
+Отправитель и storage peers хранят чанки до истечения TTL или до очистки `chunkCleanupLoop` (каждые 5 минут, `DeleteChunksWithMessage` удаляет чанки, уже сохранённые в `messages`). Это создаёт окно доставки: если участник группы не зайдёт онлайн в течение ~5 минут, он может не успеть скачать чанки.
+
+### 12.7. Group Heartbeat Loop
+
+Группы не отправляют heartbeat сами по себе (нет своей горутины heartbeat). Вместо этого каждый участник в `groupHeartbeatLoop` обновляет регистрацию групп, участником которых он является:
+
+```go
+func (m *Messenger) groupHeartbeatLoop() {
+    ticker := time.NewTicker(5 * time.Minute)
+    for {
+        select {
+        case <-ticker.C:
+            groups, _ := m.store.GetGroupChats()
+            for _, g := range groups {
+                m.muninnClient.Register(m.ctx, registerReq)
+            }
+        }
+    }
+}
+```
+
+### 12.8. API (C-bridge)
+
+Для интеграции с UI (C API) доступны четыре функции:
+
+| Функция | Описание |
+|---------|----------|
+| `messenger_create_group` | Создать группу: `(name) → {uid, name}` |
+| `messenger_get_groups` | Получить список групп: `() → [{uid, name}]` |
+| `messenger_invite_to_group` | Пригласить пользователя: `(groupUID, peerID) → error` |
+| `messenger_send_group_message` | Отправить сообщение: `(groupUID, text) → error` |
+
+### 12.9. UI Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant UI as Browser
+    participant API as Go HTTP Server
+
+    Note over U,API: Загрузка групп
+    UI->>API: GET /api/groups
+    API-->>UI: [{uid, name}, ...]
+    UI->>UI: renderGroupList — группы в сайдбаре
+
+    Note over U,API: Создание группы
+    U->>UI: нажал "+" → ввод имени
+    UI->>API: POST /api/groups/create {name}
+    API-->>UI: {uid, name}
+    UI->>UI: fetchGroups() → re-render
+
+    Note over U,API: Приглашение
+    U->>UI: выбрал группу → выбрал peer → "Invite"
+    UI->>API: POST /api/groups/{uid}/invite {peer_id}
+    API-->>UI: {status: "ok"}
+
+    Note over U,API: Отправка сообщения
+    U->>UI: выбрал группу → ввод текста
+    UI->>API: POST /api/groups/{uid}/send {text}
+    API-->>UI: {status: "ok"}
+    Note over UI: сообщение приходит через SSE
+    UI->>UI: если activeGroup == uid → appendMessage
+```
+
+UI отображает группы в отдельной секции сайдбара. При выборе группы открывается окно чата, идентичное DM, но с дополнительной кнопкой "Invite" для приглашения участников.

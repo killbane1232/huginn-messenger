@@ -54,6 +54,10 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/files/{fileID}", s.handleGetFile)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("POST /api/config", s.handleSaveConfig)
+	mux.HandleFunc("GET /api/groups", s.handleListGroups)
+	mux.HandleFunc("POST /api/groups", s.handleCreateGroup)
+	mux.HandleFunc("POST /api/groups/{uid}/invite", s.handleGroupInvite)
+	mux.HandleFunc("POST /api/groups/{uid}/send", s.handleGroupSend)
 
 	s.srv = &http.Server{
 		Addr:         s.addr,
@@ -233,6 +237,68 @@ func (s *Server) handleSendFile(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := s.messenger.GetGroupChats()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(groups)
+}
+
+func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	gc, err := s.messenger.CreateGroupChat(req.Name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(gc)
+}
+
+func (s *Server) handleGroupInvite(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	var req struct {
+		User string `json:"user"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := s.messenger.InviteToGroupChat(uid, req.User); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleGroupSend(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := s.messenger.SendGroupMessage(uid, req.Text); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 	fileID := r.PathValue("fileName")
 	if fileID == "" {
@@ -304,11 +370,23 @@ var indexHTML = `<!DOCTYPE html>
       </div>
     </div>
     <input type="text" id="peer-search" placeholder="Search users..." />
+    <div class="section-header">
+      <span>Groups</span>
+      <button id="create-group-btn" title="Create group">+</button>
+    </div>
+    <div id="group-list"></div>
+    <div class="section-header">
+      <span>Peers</span>
+    </div>
     <div id="peer-list"></div>
   </aside>
   <main id="main">
     <div id="chat-header"></div>
     <div id="messages"></div>
+    <div id="invite-area" style="display:none">
+      <input type="text" id="invite-input" placeholder="Invite user by ID...">
+      <button id="invite-btn">Invite</button>
+    </div>
     <div id="input-area">
       <input type="text" id="msg-input" placeholder="Type a message..." autofocus>
       <label id="file-btn-label" title="Attach file">
@@ -351,9 +429,21 @@ var indexHTML = `<!DOCTYPE html>
       <div id="cfg-status"></div>
     </div>
   </main>
+  <main id="create-group-panel" style="display:none">
+    <div id="config-header">Create Group</div>
+    <div class="config-form">
+      <label for="new-group-name">Group name</label>
+      <input type="text" id="new-group-name" placeholder="Group name...">
+      <div class="config-actions">
+        <button id="create-group-submit" class="btn-primary">Create</button>
+        <button id="create-group-cancel" class="btn-secondary">Cancel</button>
+      </div>
+      <div id="create-group-status"></div>
+    </div>
+  </main>
 </div>
 <div id="no-chat">
-  <p>Select a peer to start chatting</p>
+  <p>Select a peer or group to start chatting</p>
 </div>
 <script src="/static/app.js"></script>
 </body>

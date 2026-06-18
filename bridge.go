@@ -429,6 +429,61 @@ func messenger_get_event(handle C.long, timeoutMs C.int) *C.char {
 	}
 }
 
+//export messenger_create_group
+func messenger_create_group(handle C.long, name *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	gc, err := inst.m.CreateGroupChat(C.GoString(name))
+	if err != nil {
+		return errorJSON(err.Error())
+	}
+	data, _ := json.Marshal(gc)
+	return C.CString(string(data))
+}
+
+//export messenger_get_groups
+func messenger_get_groups(handle C.long) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	groups, err := inst.m.GetGroupChats()
+	if err != nil {
+		return errorJSON(err.Error())
+	}
+	if groups == nil {
+		return C.CString("[]")
+	}
+	data, _ := json.Marshal(groups)
+	return C.CString(string(data))
+}
+
+//export messenger_invite_to_group
+func messenger_invite_to_group(handle C.long, groupUID, userID *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	if err := inst.m.InviteToGroupChat(C.GoString(groupUID), C.GoString(userID)); err != nil {
+		return errorJSON(err.Error())
+	}
+	return okJSON()
+}
+
+//export messenger_send_group_message
+func messenger_send_group_message(handle C.long, groupUID, text *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	if err := inst.m.SendGroupMessage(C.GoString(groupUID), C.GoString(text)); err != nil {
+		return errorJSON(err.Error())
+	}
+	return okJSON()
+}
+
 //export messenger_get_downloads_dir
 func messenger_get_downloads_dir(handle C.long) *C.char {
 	inst := getInstance(int64(handle))

@@ -1,17 +1,37 @@
 let peers = [];
+let groups = [];
 let activePeer = null;
+let activeGroup = null;
 let me = {};
 let searchTimeout = null;
 
 async function fetchMe() {
-  const r = await fetch('/api/me');
-  me = await r.json();
+  try {
+    const r = await fetch('/api/me');
+    if (r.ok) me = await r.json();
+  } catch (e) {}
 }
 
 async function fetchPeers() {
-  const r = await fetch('/api/peers');
-  peers = await r.json();
+  try {
+    const r = await fetch('/api/peers');
+    if (!r.ok) { peers = []; renderPeerList(); return; }
+    peers = await r.json();
+  } catch (e) {
+    peers = [];
+  }
   renderPeerList();
+}
+
+async function fetchGroups() {
+  try {
+    const r = await fetch('/api/groups');
+    if (!r.ok) { groups = []; renderGroupList(); return; }
+    groups = await r.json();
+  } catch (e) {
+    groups = [];
+  }
+  renderGroupList();
 }
 
 async function fetchMessages(peerID) {
@@ -19,10 +39,32 @@ async function fetchMessages(peerID) {
   return await r.json();
 }
 
+function renderGroupList() {
+  const list = document.getElementById('group-list');
+  list.innerHTML = '';
+  if (groups == null) {
+    return
+  }
+  groups.forEach(g => {
+    const div = document.createElement('div');
+    div.className = 'peer-item' + (activeGroup === g.uid ? ' active' : '');
+    div.innerHTML = `
+      <div class="peer-avatar group-avatar">G</div>
+      <div class="peer-info">
+        <div class="peer-name">${g.name}</div>
+        <div class="peer-status">group</div>
+      </div>
+    `;
+    div.addEventListener('click', () => selectGroup(g.uid));
+    list.appendChild(div);
+  });
+}
+
 function renderPeerList() {
   const list = document.getElementById('peer-list');
   list.innerHTML = '';
   peers.forEach(p => {
+    if (p.metadata && p.metadata.type === 'huginn-group') return;
     const name = p.metadata && p.metadata.username ? p.metadata.username : p.id;
     const initials = name.charAt(0).toUpperCase();
 
@@ -40,10 +82,35 @@ function renderPeerList() {
   });
 }
 
+function selectGroup(groupUID) {
+  activeGroup = groupUID;
+  activePeer = null;
+  showChat();
+  renderGroupList();
+  renderPeerList();
+
+  const g = groups.find(g => g.uid === groupUID);
+  const name = g ? g.name : groupUID;
+
+  document.getElementById('no-chat').style.display = 'none';
+  document.getElementById('main').style.display = 'flex';
+  document.getElementById('chat-header').textContent = name + ' (group)';
+  document.getElementById('invite-area').style.display = 'flex';
+
+  fetchMessages(groupUID).then(msgs => {
+    renderMessages(msgs, groupUID);
+  });
+  document.getElementById('msg-input').disabled = false;
+  document.getElementById('send-btn').disabled = false;
+  document.getElementById('msg-input').focus();
+}
+
 async function selectPeer(peerID) {
   activePeer = peerID;
+  activeGroup = null;
   showChat();
   renderPeerList();
+  renderGroupList();
 
   const p = peers.find(p => p.id === peerID);
   const name = p && p.metadata && p.metadata.username ? p.metadata.username : peerID;
@@ -51,6 +118,7 @@ async function selectPeer(peerID) {
   document.getElementById('no-chat').style.display = 'none';
   document.getElementById('main').style.display = 'flex';
   document.getElementById('chat-header').textContent = name;
+  document.getElementById('invite-area').style.display = 'none';
 
   const msgs = await fetchMessages(peerID);
   renderMessages(msgs, peerID);
@@ -71,10 +139,11 @@ function renderMessages(msgs, peerID) {
   container.innerHTML = '';
   msgs.forEach(msg => {
     const isSent = msg.from === me.username;
+    const isGroup = activeGroup !== null;
     const div = document.createElement('div');
     div.className = 'msg ' + (isSent ? 'sent' : 'received');
     const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const senderLabel = isSent ? '' : '<div class="msg-sender">' + msg.from + '</div>';
+    const senderLabel = (isGroup && !isSent) ? '<div class="msg-sender">' + msg.from + '</div>' : '';
     const fileLinks = msg.files ? renderFileLinks(msg.files) : '';
     div.innerHTML = senderLabel + msg.text + fileLinks + '<div class="msg-time">' + time + '</div>';
     container.appendChild(div);
@@ -85,10 +154,29 @@ function renderMessages(msgs, peerID) {
 async function sendMessage() {
   const input = document.getElementById('msg-input');
   const text = input.value.trim();
-  if (!text || !activePeer) return;
+  if (!text) return;
 
   const ttlSelect = document.getElementById('ttl-select');
   const ttl = parseInt(ttlSelect.value) || 0;
+
+  if (activeGroup) {
+    input.value = '';
+    const r = await fetch('/api/groups/' + encodeURIComponent(activeGroup) + '/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, ttl })
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      alert('Send failed: ' + err);
+      return;
+    }
+    const msgs = await fetchMessages(activeGroup);
+    renderMessages(msgs, activeGroup);
+    return;
+  }
+
+  if (!activePeer) return;
 
   const fileInput = document.getElementById('file-input');
   const file = fileInput.files[0];
@@ -133,13 +221,25 @@ async function sendMessage() {
 
 function showChat() {
   document.getElementById('config-panel').style.display = 'none';
+  document.getElementById('create-group-panel').style.display = 'none';
   document.getElementById('main').style.display = 'flex';
 }
 
 function showConfig() {
   document.getElementById('main').style.display = 'none';
   document.getElementById('no-chat').style.display = 'none';
+  document.getElementById('create-group-panel').style.display = 'none';
   document.getElementById('config-panel').style.display = 'flex';
+}
+
+function showCreateGroup() {
+  document.getElementById('main').style.display = 'none';
+  document.getElementById('no-chat').style.display = 'none';
+  document.getElementById('config-panel').style.display = 'none';
+  document.getElementById('create-group-panel').style.display = 'flex';
+  document.getElementById('create-group-status').textContent = '';
+  document.getElementById('new-group-name').value = '';
+  document.getElementById('new-group-name').focus();
 }
 
 async function loadConfig() {
@@ -204,6 +304,10 @@ function setupSSE() {
       const msgs = await fetchMessages(activePeer);
       renderMessages(msgs, activePeer);
     }
+    if (activeGroup && (msg.from === activeGroup || msg.from === me.username)) {
+      const msgs = await fetchMessages(activeGroup);
+      renderMessages(msgs, activeGroup);
+    }
   });
 
   evtSource.onerror = function() {
@@ -211,9 +315,55 @@ function setupSSE() {
   };
 }
 
+async function inviteToGroup() {
+  if (!activeGroup) return;
+  const input = document.getElementById('invite-input');
+  const userID = input.value.trim();
+  if (!userID) return;
+  input.value = '';
+  const r = await fetch('/api/groups/' + encodeURIComponent(activeGroup) + '/invite', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user: userID })
+  });
+  if (!r.ok) {
+    const err = await r.text();
+    alert('Invite failed: ' + err);
+  }
+}
+
+async function createGroup() {
+  const input = document.getElementById('new-group-name');
+  const name = input.value.trim();
+  if (!name) return;
+  const status = document.getElementById('create-group-status');
+  const btn = document.getElementById('create-group-submit');
+  btn.disabled = true;
+  status.textContent = '';
+
+  const r = await fetch('/api/groups', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name })
+  });
+  btn.disabled = false;
+  if (!r.ok) {
+    const err = await r.text();
+    status.textContent = 'Error: ' + err;
+    status.className = 'cfg-err';
+    return;
+  }
+  const gc = await r.json();
+  await fetchGroups();
+  document.getElementById('create-group-panel').style.display = 'none';
+  document.getElementById('main').style.display = 'flex';
+  selectGroup(gc.uid);
+}
+
 document.addEventListener('DOMContentLoaded', async function() {
   await fetchMe();
   await fetchPeers();
+  await fetchGroups();
   setupSSE();
 
   document.getElementById('send-btn').addEventListener('click', sendMessage);
@@ -243,12 +393,32 @@ document.addEventListener('DOMContentLoaded', async function() {
     await loadConfig();
   });
   document.getElementById('cfg-cancel').addEventListener('click', function() {
-    if (activePeer) {
-      selectPeer(activePeer);
+    if (activePeer || activeGroup) {
+      (activePeer ? selectPeer(activePeer) : selectGroup(activeGroup));
     } else {
       showChat();
       document.getElementById('no-chat').style.display = 'flex';
     }
   });
   document.getElementById('cfg-save').addEventListener('click', saveConfig);
+
+  document.getElementById('create-group-btn').addEventListener('click', showCreateGroup);
+  document.getElementById('create-group-submit').addEventListener('click', createGroup);
+  document.getElementById('create-group-cancel').addEventListener('click', function() {
+    if (activePeer || activeGroup) {
+      document.getElementById('create-group-panel').style.display = 'none';
+      document.getElementById('main').style.display = 'flex';
+    } else {
+      document.getElementById('create-group-panel').style.display = 'none';
+      document.getElementById('no-chat').style.display = 'flex';
+    }
+  });
+  document.getElementById('new-group-name').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') createGroup();
+  });
+
+  document.getElementById('invite-btn').addEventListener('click', inviteToGroup);
+  document.getElementById('invite-input').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') inviteToGroup();
+  });
 });
