@@ -13,6 +13,7 @@ import (
 type Config struct {
 	MuninnAddr   string `json:"muninn"`
 	Username     string `json:"username"`
+	PeerID       string `json:"peer_id,omitempty"`
 	UIPort       int    `json:"ui_port"`
 	DBPath       string `json:"-"`
 	ChunkTTL     string `json:"chunk_ttl"`

@@ -159,10 +159,14 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 
 	mc := muninn.NewClient(cfg.MuninnAddr)
 
-	m, err := messenger.New(cfg.Username, mc, cfg.DBPath,
+	mOpts := []messenger.MessengerOption{
 		messenger.WithPeerFlag(muninn.PeerFlag(cfg.PeerFlag)),
 		messenger.WithTURN(cfg.TurnAddr, cfg.TurnUsername, cfg.TurnPassword),
-	)
+	}
+	if cfg.PeerID != "" {
+		mOpts = append(mOpts, messenger.WithPeerID(cfg.PeerID))
+	}
+	m, err := messenger.New(cfg.Username, mc, cfg.DBPath, mOpts...)
 	if err != nil {
 		log.Printf("messenger_create: %v", err)
 		return -2
@@ -249,6 +253,7 @@ func messenger_get_me(handle C.long) *C.char {
 	resp := map[string]string{
 		"id":       inst.m.ID,
 		"username": inst.m.Username,
+		"peer_id":  inst.cfg.PeerID,
 	}
 	data, _ := json.Marshal(resp)
 	return C.CString(string(data))
@@ -350,6 +355,7 @@ func messenger_get_config(handle C.long) *C.char {
 	}
 	resp := map[string]interface{}{
 		"username":  inst.cfg.Username,
+		"peer_id":   inst.cfg.PeerID,
 		"muninn":    inst.cfg.MuninnAddr,
 		"chunk_ttl": inst.cfg.ChunkTTL,
 		"db_path":   inst.cfg.DBPath,
@@ -369,6 +375,7 @@ func messenger_save_config(handle C.long, jsonConfig *C.char) *C.char {
 	}
 	var req struct {
 		Username string `json:"username"`
+		PeerID   string `json:"peer_id"`
 		Muninn   string `json:"muninn"`
 		ChunkTTL string `json:"chunk_ttl"`
 		TurnAddr string `json:"turn_addr"`
@@ -380,6 +387,9 @@ func messenger_save_config(handle C.long, jsonConfig *C.char) *C.char {
 	}
 	if req.Username != "" {
 		inst.cfg.Username = req.Username
+	}
+	if req.PeerID != "" {
+		inst.cfg.PeerID = req.PeerID
 	}
 	if req.Muninn != "" {
 		inst.cfg.MuninnAddr = req.Muninn
@@ -479,6 +489,33 @@ func messenger_send_group_message(handle C.long, groupUID, text *C.char) *C.char
 		return errorJSON("invalid handle")
 	}
 	if err := inst.m.SendGroupMessage(C.GoString(groupUID), C.GoString(text)); err != nil {
+		return errorJSON(err.Error())
+	}
+	return okJSON()
+}
+
+//export messenger_generate_relogin_signature
+func messenger_generate_relogin_signature(handle C.long) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	sig, err := inst.m.GenerateReloginSignature()
+	if err != nil {
+		return errorJSON(err.Error())
+	}
+	resp := map[string]string{"signature": sig}
+	data, _ := json.Marshal(resp)
+	return C.CString(string(data))
+}
+
+//export messenger_apply_relogin_signature
+func messenger_apply_relogin_signature(handle C.long, signature *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	if err := inst.m.ApplyReloginSignature(C.GoString(signature)); err != nil {
 		return errorJSON(err.Error())
 	}
 	return okJSON()

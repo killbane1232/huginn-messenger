@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1155,4 +1156,173 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 		via = "offline fallback"
 	}
 	t.Logf("OK: message delivered via %s, id=%s", via, delivered.MsgID)
+}
+
+func TestReloginFlow(t *testing.T) {
+	mn := newTestMuninnServer()
+	defer mn.Close()
+
+	mc := muninn.NewClient(mn.URL())
+
+	aliceDB := t.TempDir() + "/alice.db"
+	bobDB := t.TempDir() + "/bob.db"
+
+	alice, err := messenger.New("alice", mc, aliceDB, messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alice.Shutdown()
+	bob, err := messenger.New("bob", mc, bobDB, messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bob.Shutdown()
+	time.Sleep(300 * time.Millisecond)
+
+	for _, m := range []*messenger.Messenger{alice, bob} {
+		if err := m.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	alice.SearchPeers("bob")
+	bob.SearchPeers("alice")
+	time.Sleep(100 * time.Millisecond)
+
+	alice.ConnectPeer("bob")
+	deadline := time.Now().Add(5 * time.Second)
+	connected := false
+	for time.Now().Before(deadline) {
+		if alice.IsPeerConnected("bob") && bob.IsPeerConnected("alice") {
+			connected = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !connected {
+		t.Fatal("WebRTC not established between alice and bob for relogin")
+	}
+	time.Sleep(2 * time.Second)
+
+	aliceKeysPath := filepath.Join(filepath.Dir(aliceDB), "keys.conf")
+	bobKeysPath := filepath.Join(filepath.Dir(bobDB), "keys.conf")
+
+	aliceKeysBefore, err := os.ReadFile(aliceKeysPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobKeysBefore, err := os.ReadFile(bobKeysPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(aliceKeysBefore) == string(bobKeysBefore) {
+		t.Fatal("alice and bob have identical keys before relogin — test setup issue")
+	}
+	t.Log("OK: alice and bob have different keys before relogin")
+
+	t.Run("failure_invalid_signature_format", func(t *testing.T) {
+		err := bob.ApplyReloginSignature("not-a-valid-signature")
+		if err == nil {
+			t.Fatal("expected error for invalid signature format")
+		}
+		t.Logf("correctly rejected: %v", err)
+	})
+
+	t.Run("failure_tampered_signature", func(t *testing.T) {
+		sig, err := alice.GenerateReloginSignature()
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = bob.ApplyReloginSignature(sig + "tampered")
+		if err == nil {
+			t.Fatal("expected error for tampered signature")
+		}
+		t.Logf("correctly rejected: %v", err)
+	})
+
+	t.Run("failure_wrong_peer", func(t *testing.T) {
+		sig, err := alice.GenerateReloginSignature()
+		if err != nil {
+			t.Fatal(err)
+		}
+		parts := splitReloginSignature(sig)
+		if parts == nil {
+			t.Fatal("failed to parse signature for tampering")
+		}
+		fakeSig := "nonexistent:" + parts[1]
+		err = bob.ApplyReloginSignature(fakeSig)
+		if err == nil {
+			t.Fatal("expected error for nonexistent peer")
+		}
+		t.Logf("correctly rejected: %v", err)
+	})
+
+	bobKeysAfterFail, err := os.ReadFile(bobKeysPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(bobKeysAfterFail) != string(bobKeysBefore) {
+		t.Fatal("bob's keys changed after failed relogin attempts")
+	}
+	t.Log("OK: bob's keys unchanged after all failure cases")
+
+	t.Run("successful_relogin", func(t *testing.T) {
+		sig, err := alice.GenerateReloginSignature()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sig == "" {
+			t.Fatal("empty signature generated")
+		}
+		t.Logf("generated signature: %s", sig)
+
+		err = bob.ApplyReloginSignature(sig)
+		if err != nil {
+			t.Fatalf("relogin failed: %v", err)
+		}
+
+		bobKeysAfter, err := os.ReadFile(bobKeysPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		aliceKeysAfter, err := os.ReadFile(aliceKeysPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if string(bobKeysAfter) != string(aliceKeysAfter) {
+			t.Fatal("bob's keys do not match alice's after successful relogin")
+		}
+
+		var ak, bk crypto.KeyFile
+		if err := json.Unmarshal(aliceKeysAfter, &ak); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(bobKeysAfter, &bk); err != nil {
+			t.Fatal(err)
+		}
+		if ak.SignPublic != bk.SignPublic {
+			t.Fatal("signing public keys do not match")
+		}
+		if ak.SignPrivate != bk.SignPrivate {
+			t.Fatal("signing private keys do not match")
+		}
+		if ak.EncPublic != bk.EncPublic {
+			t.Fatal("encryption public keys do not match")
+		}
+		if ak.EncPrivate != bk.EncPrivate {
+			t.Fatal("encryption private keys do not match")
+		}
+		t.Log("OK: all four keys match between alice and bob")
+	})
+}
+
+func splitReloginSignature(sig string) []string {
+	parts := strings.SplitN(sig, ":", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	return parts
 }

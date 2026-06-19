@@ -20,7 +20,11 @@ func main() {
 	}
 
 	mc := muninn.NewClient(cfg.MuninnAddr)
-	m, err := messenger.New(cfg.Username, mc, cfg.DBPath, messenger.WithPeerFlag(muninn.PeerFlag(cfg.PeerFlag)))
+	opts := []messenger.MessengerOption{messenger.WithPeerFlag(muninn.PeerFlag(cfg.PeerFlag))}
+	if cfg.PeerID != "" {
+		opts = append(opts, messenger.WithPeerID(cfg.PeerID))
+	}
+	m, err := messenger.New(cfg.Username, mc, cfg.DBPath, opts...)
 	if err != nil {
 		log.Fatalf("failed to create messenger: %v", err)
 	}

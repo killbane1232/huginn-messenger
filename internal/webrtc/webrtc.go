@@ -37,6 +37,14 @@ type ChunkGetRequest struct {
 	ChunkIndex int    `json:"chunk_index"`
 }
 
+type ReloginRequest struct {
+	Signature string `json:"signature"`
+}
+
+type ReloginResponse struct {
+	KeysData string `json:"keys_data"`
+}
+
 type envelope struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data"`
@@ -48,6 +56,8 @@ const (
 	MsgTypeChunkStoreBatch = "chunk_store_batch"
 	MsgTypeChunkGet        = "chunk_get"
 	MsgTypeChunkData       = "chunk_data"
+	MsgTypeReloginRequest  = "relogin_request"
+	MsgTypeReloginResponse = "relogin_response"
 )
 
 type Manager struct {
@@ -57,6 +67,8 @@ type Manager struct {
 	chatMsgChan chan ChatMessage
 	chunkStore  func(peerID string, req ChunkStoreRequest)
 	chunkGet    func(peerID string, req ChunkGetRequest) ([]byte, bool)
+	reloginReq  func(peerID string, req ReloginRequest)
+	reloginResp func(peerID string, resp ReloginResponse)
 	localID     string
 
 	config pion.Configuration
@@ -65,6 +77,8 @@ type Manager struct {
 func NewManager(localID string, chatMsgChan chan ChatMessage,
 	chunkStore func(peerID string, req ChunkStoreRequest),
 	chunkGet func(peerID string, req ChunkGetRequest) ([]byte, bool),
+	reloginReq func(peerID string, req ReloginRequest),
+	reloginResp func(peerID string, resp ReloginResponse),
 	iceServers []pion.ICEServer) *Manager {
 
 	return &Manager{
@@ -73,6 +87,8 @@ func NewManager(localID string, chatMsgChan chan ChatMessage,
 		chatMsgChan: chatMsgChan,
 		chunkStore:  chunkStore,
 		chunkGet:    chunkGet,
+		reloginReq:  reloginReq,
+		reloginResp: reloginResp,
 		localID:     localID,
 		config: pion.Configuration{
 			ICEServers: iceServers,
@@ -135,6 +151,22 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		var msg ChunkStoreRequest
 		if json.Unmarshal(env.Data, &msg) == nil {
 			m.chunkStore(remoteID, msg)
+		}
+	case MsgTypeReloginRequest:
+		if m.reloginReq == nil {
+			return
+		}
+		var req ReloginRequest
+		if json.Unmarshal(env.Data, &req) == nil {
+			m.reloginReq(remoteID, req)
+		}
+	case MsgTypeReloginResponse:
+		if m.reloginResp == nil {
+			return
+		}
+		var resp ReloginResponse
+		if json.Unmarshal(env.Data, &resp) == nil {
+			m.reloginResp(remoteID, resp)
 		}
 	}
 }
@@ -325,6 +357,14 @@ func (m *Manager) SendChunkGet(remoteID string, req ChunkGetRequest) error {
 	env := envelope{Type: MsgTypeChunkGet, Data: reqData}
 	raw, _ := json.Marshal(env)
 	return dc.Send(raw)
+}
+
+func (m *Manager) SendReloginRequest(remoteID string, req ReloginRequest) {
+	m.sendEnvelope(remoteID, MsgTypeReloginRequest, req)
+}
+
+func (m *Manager) SendReloginResponse(remoteID string, resp ReloginResponse) {
+	m.sendEnvelope(remoteID, MsgTypeReloginResponse, resp)
 }
 
 func (m *Manager) IsConnected(remoteID string) bool {

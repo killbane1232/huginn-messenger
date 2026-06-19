@@ -685,3 +685,92 @@ sequenceDiagram
 ```
 
 UI отображает группы в отдельной секции сайдбара. При выборе группы открывается окно чата, идентичное DM, но с дополнительной кнопкой "Invite" для приглашения участников.
+
+---
+
+## 13. Relogin (перенос идентичности)
+
+### 13.1. Назначение
+
+Relogin позволяет скопировать ключи (`keys.conf`) с одного пира на другой. После relogin целевой пир получает те же ключи шифрования и подписи, что и пир-источник, и может выступать от его имени.
+
+### 13.2. Схема работы
+
+```mermaid
+sequenceDiagram
+    participant A as Alice (source)
+    participant B as Bob (target)
+    participant M as Muninn
+
+    Note over A: GenerateReloginSignature()
+    A->>A: Generate 32-byte challenge
+    A->>A: Sign challenge with Ed25519 private key
+    Note over A: Output: "alice:base64(challenge).base64(sig)"
+
+    Note over A: Copy signature (out-of-band)
+
+    Note over B: ApplyReloginSignature(signature)
+    B->>B: Parse "alice:base64(challenge).base64(sig)"
+    B->>B: Verify signature with Alice's public key
+    B->>B: If valid → connect to Alice via WebRTC
+    B->>A: WebRTC connect + send relogin_request
+
+    A->>A: Verify signature against own public key
+    Note over A: Proves Alice herself created the challenge
+    A->>A: Read keys.conf
+    A->>B: WebRTC relogin_response {keys_data}
+
+    B->>B: Write keys.conf (overwrite)
+    Note over B: Now Bob has Alice's identity
+```
+
+### 13.3. Формат подписи
+
+```
+peerID:base64(challenge).base64(signature)
+```
+
+- `peerID` — ID пира, к которому нужно подключиться (Alice)
+- `challenge` — 32 случайных байта
+- `signature` — Ed25519-подпись `challenge`, созданная приватным ключом Alice
+
+### 13.4. Проверка подписи
+
+При получении `relogin_request` сторона-источник (Alice) извлекает challenge из подписи и верифицирует его своим собственным публичным ключом:
+
+```go
+crypto.Verify(m.signPublic, challenge, sig) // true только если подпись создана m.signPrivate
+```
+
+Поскольку только Alice знает свой приватный ключ, только она могла создать данную подпись. Если подпись валидна — значит, Alice сама сгенерировала этот challenge, и Bob действует с её разрешения.
+
+Сторона-цель (Bob) также верифицирует подпись перед подключением к Alice — это подтверждает, что signature была создана именно Alice.
+
+### 13.5. Передача ключей
+
+После верификации подписи Alice читает `keys.conf` и отправляет его содержимое Bob'у через WebRTC DataChannel. Канал уже защищён DTLS-шифрованием, дополнительное шифрование не требуется.
+
+Bob перезаписывает свой `keys.conf` полученными данными. После этого Bob может перезапустить мессенджер — он будет использовать ключи Alice.
+
+### 13.6. Протокол WebRTC
+
+Два новых типа сообщений в `internal/webrtc/webrtc.go`:
+
+| Тип | Направление | Структура |
+|-----|-------------|-----------|
+| `relogin_request` | Bob → Alice | `{signature: "alice:challenge.sig"}` |
+| `relogin_response` | Alice → Bob | `{keys_data: "json-content-of-keys.conf"}` |
+
+### 13.7. C-bridge API
+
+| Функция | Описание |
+|---------|----------|
+| `messenger_generate_relogin_signature` | Сгенерировать подпись: `() → {signature}` |
+| `messenger_apply_relogin_signature` | Применить подпись: `(signature) → {status}` |
+
+### 13.8. Важные замечания
+
+- **Relogin не требует хранения состояния.** Alice не запоминает созданные challenge'и — верификация подписи доказывает, что она сама её создала.
+- **После relogin старые ключи Bob'а теряются.** Если Bob не сохранил их отдельно, он не сможет восстановить свою старую идентичность.
+- **Peer ID (username) не меняется.** Relogin меняет только криптографические ключи. Чтобы сменить username, нужно пересоздать аккаунт.
+- **После relogin требуется перерегистрация на Muninn.** Мессенджер нужно перезапустить, чтобы новые ключи вступили в силу.

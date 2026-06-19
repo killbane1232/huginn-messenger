@@ -76,6 +76,7 @@ type RegisterRequest struct {
 	Metadata      map[string]string `json:"metadata,omitempty"`
 	TTLSeconds    int               `json:"ttl_seconds,omitempty"`
 	PeerFlag      PeerFlag          `json:"peer_flag,omitempty"`
+	Fake          *bool             `json:"fake,omitempty"`
 }
 
 type RegisterChunkRequest struct {

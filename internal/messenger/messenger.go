@@ -62,6 +62,7 @@ type messengerOpts struct {
 	turnAddr   string
 	turnUser   string
 	turnPass   string
+	peerID     string
 }
 
 func WithICEServers(servers []pion.ICEServer) MessengerOption {
@@ -82,6 +83,12 @@ func WithTURN(addr, user, pass string) MessengerOption {
 		o.turnAddr = addr
 		o.turnUser = user
 		o.turnPass = pass
+	}
+}
+
+func WithPeerID(id string) MessengerOption {
+	return func(o *messengerOpts) {
+		o.peerID = id
 	}
 }
 
@@ -120,6 +127,11 @@ type Messenger struct {
 
 	processingMsg map[string]bool
 	processingMu  sync.Mutex
+
+	keysPath    string
+	configPath  string
+	reloginMu   sync.Mutex
+	reloginKeys string
 }
 
 func New(username string, muninnClient *muninn.Client, dbPath string, opts ...MessengerOption) (*Messenger, error) {
@@ -129,6 +141,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	}
 
 	keysPath := filepath.Join(filepath.Dir(dbPath), "keys.conf")
+	configPath := filepath.Join(filepath.Dir(dbPath), "config.conf")
 	signPub, signPriv, encPriv, encPub, err := crypto.LoadKeys(keysPath)
 	if err != nil {
 		signPub, signPriv, err = crypto.GenerateSigningKey()
@@ -139,7 +152,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		if err != nil {
 			return nil, fmt.Errorf("generate encryption key: %w", err)
 		}
-		if err := crypto.SaveKeys(keysPath, signPub, signPriv, encPriv, encPub); err != nil {
+			if err := crypto.SaveKeys(keysPath, signPub, signPriv, encPriv, encPub); err != nil {
 			log.Printf("save keys to %s: %v", keysPath, err)
 		}
 	}
@@ -158,8 +171,12 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	signalChan := make(chan muninn.Signal, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 
+	peerID := o.peerID
+	if peerID == "" {
+		peerID = username
+	}
 	m := &Messenger{
-		ID:       username,
+		ID:       peerID,
 		Username: username,
 
 		signPublic:  signPub,
@@ -179,6 +196,8 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 
 		pendingFileDownloads: make(map[string]*pendingFileDownload),
 		processingMsg:       make(map[string]bool),
+		keysPath:            keysPath,
+		configPath:          configPath,
 	}
 
 	if !o.iceSet {
@@ -198,7 +217,8 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 			},
 		)
 	}
-	m.rtcManager = webrtc.NewManager(username, rtcMsgChan, m.handleChunkStore, m.handleChunkGet, o.iceServers)
+	m.rtcManager = webrtc.NewManager(username, rtcMsgChan, m.handleChunkStore, m.handleChunkGet,
+		m.handleReloginRequest, m.handleReloginResponse, o.iceServers)
 
 	m.rtcClient = muninn.NewRTCClient(muninnClient.BaseURL(), username, o.iceServers)
 	m.rtcClient.SetOnSignal(func(sig muninn.Signal) {
@@ -1051,6 +1071,141 @@ func (m *Messenger) DisconnectPeer(toPeerID string) {
 	log.Printf("disconnected peer %s", toPeerID)
 }
 
+func (m *Messenger) GenerateReloginSignature() (string, error) {
+	challenge := make([]byte, 32)
+	if _, err := rand.Read(challenge); err != nil {
+		return "", fmt.Errorf("generate challenge: %w", err)
+	}
+	sig := crypto.Sign(m.signPrivate, challenge)
+	challengeB64 := base64.StdEncoding.EncodeToString(challenge)
+	sigB64 := base64.StdEncoding.EncodeToString(sig)
+	return fmt.Sprintf("%s:%s.%s", m.ID, challengeB64, sigB64), nil
+}
+
+func (m *Messenger) ApplyReloginSignature(signature string) error {
+	parts := strings.SplitN(signature, ":", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid signature: missing peer ID")
+	}
+	peerID := parts[0]
+
+	dataParts := strings.SplitN(parts[1], ".", 2)
+	if len(dataParts) != 2 {
+		return fmt.Errorf("invalid signature: missing challenge or signature")
+	}
+	challengeB64, sigB64 := dataParts[0], dataParts[1]
+
+	challenge, err := base64.StdEncoding.DecodeString(challengeB64)
+	if err != nil {
+		return fmt.Errorf("decode challenge: %w", err)
+	}
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return fmt.Errorf("decode signature: %w", err)
+	}
+
+	peer := m.findPeerByID(peerID)
+	if peer == nil {
+		return fmt.Errorf("peer %s not found", peerID)
+	}
+	peerSignKey, err := crypto.DecodeKey(peer.SignatureKey)
+	if err != nil {
+		return fmt.Errorf("decode peer sign key: %w", err)
+	}
+	if !crypto.Verify(ed25519.PublicKey(peerSignKey), challenge, sig) {
+		return fmt.Errorf("invalid signature: not authorized")
+	}
+
+	if !m.rtcManager.IsConnected(peerID) {
+		if err := m.ConnectPeer(peerID); err != nil {
+			return fmt.Errorf("connect to %s: %w", peerID, err)
+		}
+	}
+
+	for i := 0; i < 50; i++ {
+		if m.rtcManager.IsConnected(peerID) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !m.rtcManager.IsConnected(peerID) {
+		return fmt.Errorf("timed out waiting for WebRTC connection to %s", peerID)
+	}
+
+	m.reloginMu.Lock()
+	m.reloginKeys = ""
+	m.reloginMu.Unlock()
+
+	m.rtcManager.SendReloginRequest(peerID, webrtc.ReloginRequest{Signature: signature})
+
+	for i := 0; i < 300; i++ {
+		m.reloginMu.Lock()
+		data := m.reloginKeys
+		m.reloginMu.Unlock()
+		if data != "" {
+			if err := os.WriteFile(m.keysPath, []byte(data), 0600); err != nil {
+				return fmt.Errorf("save keys: %w", err)
+			}
+			m.ID = peer.ID
+			peerUsername := peer.ID
+			if len(peer.Keys) > 0 && peer.Keys[0].Login != "" {
+				peerUsername = peer.Keys[0].Login
+			}
+			m.Username = peerUsername
+
+			cfg := &config.Config{Username: peerUsername, PeerID: peer.ID}
+			if existing, err := os.ReadFile(m.configPath); err == nil {
+				json.Unmarshal(existing, cfg)
+				cfg.Username = peerUsername
+				cfg.PeerID = peer.ID
+				cfg.Save()
+			}
+			if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+				os.WriteFile(m.configPath, data, 0644)
+			}
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("relogin: timed out waiting for response from %s", peerID)
+}
+
+func (m *Messenger) handleReloginRequest(peerID string, req webrtc.ReloginRequest) {
+	parts := strings.SplitN(req.Signature, ":", 2)
+	log.Printf("relogin: handle")
+	if len(parts) != 2 {
+		return
+	}
+	dataParts := strings.SplitN(parts[1], ".", 2)
+	if len(dataParts) != 2 {
+		return
+	}
+	challenge, err := base64.StdEncoding.DecodeString(dataParts[0])
+	if err != nil {
+		return
+	}
+	sig, err := base64.StdEncoding.DecodeString(dataParts[1])
+	if err != nil {
+		return
+	}
+	if !crypto.Verify(m.signPublic, challenge, sig) {
+		log.Printf("relogin: invalid signature from %s", peerID)
+		return
+	}
+	keysData, err := os.ReadFile(m.keysPath)
+	if err != nil {
+		log.Printf("relogin: read keys.conf: %v", err)
+		return
+	}
+	m.rtcManager.SendReloginResponse(peerID, webrtc.ReloginResponse{KeysData: string(keysData)})
+}
+
+func (m *Messenger) handleReloginResponse(peerID string, resp webrtc.ReloginResponse) {
+	m.reloginMu.Lock()
+	m.reloginKeys = resp.KeysData
+	m.reloginMu.Unlock()
+}
+
 func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSeconds int, files []FileMeta) error {
 	log.Printf("sending offline message %s to %s via chunks", msgID, peer.ID)
 
@@ -1480,6 +1635,7 @@ func (m *Messenger) CreateGroupChat(name string) (*store.GroupChat, error) {
 		return nil, fmt.Errorf("save group chat: %w", err)
 	}
 
+	fake := true
 	req := &muninn.RegisterRequest{
 		ID:            uid,
 		Keys:          []muninn.Key{{Login: name, Signature: "huginn-v1"}},
@@ -1492,6 +1648,7 @@ func (m *Messenger) CreateGroupChat(name string) (*store.GroupChat, error) {
 		},
 		TTLSeconds: 86400,
 		PeerFlag:   muninn.PeerFlag("very_thick"),
+		Fake:       &fake,
 	}
 	if err := m.muninnClient.Register(m.ctx, req); err != nil {
 		log.Printf("register group peer %s (%s): %v", name, uid, err)
@@ -1508,6 +1665,7 @@ func (m *Messenger) GetGroupChats() ([]store.GroupChat, error) {
 }
 
 func (m *Messenger) registerGroupPeer(gc store.GroupChat) {
+	fake := true
 	req := &muninn.RegisterRequest{
 		ID:            gc.UID,
 		Keys:          []muninn.Key{{Login: gc.Name, Signature: "huginn-v1"}},
@@ -1520,6 +1678,7 @@ func (m *Messenger) registerGroupPeer(gc store.GroupChat) {
 		},
 		TTLSeconds: 120,
 		PeerFlag:   muninn.PeerFlag("very_thick"),
+		Fake:       &fake,
 	}
 	if err := m.muninnClient.Register(m.ctx, req); err != nil {
 		log.Printf("register group peer %s (%s): %v", gc.Name, gc.UID, err)
