@@ -58,6 +58,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("POST /api/groups", s.handleCreateGroup)
 	mux.HandleFunc("POST /api/groups/{uid}/invite", s.handleGroupInvite)
 	mux.HandleFunc("POST /api/groups/{uid}/send", s.handleGroupSend)
+	mux.HandleFunc("POST /api/groups/{uid}/send-file", s.handleGroupSendFile)
 
 	s.srv = &http.Server{
 		Addr:         s.addr,
@@ -88,6 +89,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"id":       s.messenger.ID,
 		"username": s.messenger.Username,
+		"peer_id":  s.cfg.PeerID,
 	})
 }
 
@@ -97,6 +99,10 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		"muninn":    s.cfg.MuninnAddr,
 		"ui_port":   s.cfg.UIPort,
 		"chunk_ttl": s.cfg.ChunkTTL,
+		"peer_id":   s.cfg.PeerID,
+		"turn_addr": s.cfg.TurnAddr,
+		"turn_user": s.cfg.TurnUsername,
+		"turn_pass": s.cfg.TurnPassword,
 	})
 }
 
@@ -106,6 +112,10 @@ func (s *Server) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 		Muninn   string `json:"muninn"`
 		UIPort   int    `json:"ui_port"`
 		ChunkTTL string `json:"chunk_ttl"`
+		PeerID   string `json:"peer_id"`
+		TurnAddr string `json:"turn_addr"`
+		TurnUser string `json:"turn_user"`
+		TurnPass string `json:"turn_pass"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -117,6 +127,18 @@ func (s *Server) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 	s.cfg.UIPort = req.UIPort
 	if req.ChunkTTL != "" {
 		s.cfg.ChunkTTL = req.ChunkTTL
+	}
+	if req.PeerID != "" {
+		s.cfg.PeerID = req.PeerID
+	}
+	if req.TurnAddr != "" {
+		s.cfg.TurnAddr = req.TurnAddr
+	}
+	if req.TurnUser != "" {
+		s.cfg.TurnUsername = req.TurnUser
+	}
+	if req.TurnPass != "" {
+		s.cfg.TurnPassword = req.TurnPass
 	}
 
 	if err := s.cfg.Save(); err != nil {
@@ -130,6 +152,14 @@ func (s *Server) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 type peerResponse struct {
 	muninn.Peer
 	Online bool `json:"online"`
+}
+
+type groupChatResponse struct {
+	UID       string    `json:"uid"`
+	Name      string    `json:"name"`
+	EncPublic string    `json:"enc_public"`
+	SignPublic string   `json:"sign_public"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func (s *Server) handlePeerSearch(w http.ResponseWriter, r *http.Request) {
@@ -201,35 +231,46 @@ func (s *Server) handleSendFile(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(ttlStr, "%d", &ttl)
 	}
 
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, "missing file: "+err.Error(), http.StatusBadRequest)
+	fileHeaders := r.MultipartForm.File["file"]
+	if len(fileHeaders) == 0 {
+		http.Error(w, "missing file", http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
 
 	tmpDir := filepath.Join(os.TempDir(), "huginn-uploads")
 	os.MkdirAll(tmpDir, 0755)
-	tmpPath := filepath.Join(tmpDir, header.Filename)
-	dst, err := os.Create(tmpPath)
-	if err != nil {
-		http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if _, err := io.Copy(dst, file); err != nil {
+	var tmpPaths []string
+	for _, fh := range fileHeaders {
+		file, err := fh.Open()
+		if err != nil {
+			http.Error(w, "failed to read upload: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		tmpPath := filepath.Join(tmpDir, fh.Filename)
+		dst, err := os.Create(tmpPath)
+		if err != nil {
+			file.Close()
+			http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := io.Copy(dst, file); err != nil {
+			dst.Close()
+			file.Close()
+			os.Remove(tmpPath)
+			http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		dst.Close()
-		os.Remove(tmpPath)
-		http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
-		return
+		file.Close()
+		defer os.Remove(tmpPath)
+		tmpPaths = append(tmpPaths, tmpPath)
 	}
-	dst.Close()
-	defer os.Remove(tmpPath)
 
 	if ttl <= 0 {
 		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
 	}
 
-	if err := s.messenger.SendMessageWithFiles(toPeer, text, []string{tmpPath}, ttl); err != nil {
+	if err := s.messenger.SendMessageWithFiles(toPeer, text, tmpPaths, ttl); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -243,7 +284,17 @@ func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	json.NewEncoder(w).Encode(groups)
+	resp := make([]groupChatResponse, len(groups))
+	for i, g := range groups {
+		resp[i] = groupChatResponse{
+			UID:        g.UID,
+			Name:       g.Name,
+			EncPublic:  g.EncPublic,
+			SignPublic: g.SignPublic,
+			CreatedAt:  g.CreatedAt,
+		}
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
@@ -264,7 +315,13 @@ func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(gc)
+	json.NewEncoder(w).Encode(groupChatResponse{
+		UID:        gc.UID,
+		Name:       gc.Name,
+		EncPublic:  gc.EncPublic,
+		SignPublic: gc.SignPublic,
+		CreatedAt:  gc.CreatedAt,
+	})
 }
 
 func (s *Server) handleGroupInvite(w http.ResponseWriter, r *http.Request) {
@@ -287,23 +344,87 @@ func (s *Server) handleGroupSend(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	var req struct {
 		Text string `json:"text"`
+		TTL  int    `json:"ttl"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if err := s.messenger.SendGroupMessage(uid, req.Text); err != nil {
+	ttl := req.TTL
+	if ttl <= 0 {
+		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
+	}
+	if err := s.messenger.SendGroupMessage(uid, req.Text, ttl); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
-	fileID := r.PathValue("fileName")
-	if fileID == "" {
-		fileID = r.PathValue("fileId")
+func (s *Server) handleGroupSendFile(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+
+	if err := r.ParseMultipartForm(100 << 20); err != nil {
+		http.Error(w, "failed to parse form: "+err.Error(), http.StatusBadRequest)
+		return
 	}
+
+	text := r.FormValue("text")
+	ttlStr := r.FormValue("ttl")
+	ttl := 0
+	if ttlStr != "" {
+		fmt.Sscanf(ttlStr, "%d", &ttl)
+	}
+
+	fileHeaders := r.MultipartForm.File["file"]
+	if len(fileHeaders) == 0 {
+		http.Error(w, "missing file", http.StatusBadRequest)
+		return
+	}
+
+	tmpDir := filepath.Join(os.TempDir(), "huginn-uploads")
+	os.MkdirAll(tmpDir, 0755)
+	var tmpPaths []string
+	for _, fh := range fileHeaders {
+		file, err := fh.Open()
+		if err != nil {
+			http.Error(w, "failed to read upload: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		tmpPath := filepath.Join(tmpDir, fh.Filename)
+		dst, err := os.Create(tmpPath)
+		if err != nil {
+			file.Close()
+			http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := io.Copy(dst, file); err != nil {
+			dst.Close()
+			file.Close()
+			os.Remove(tmpPath)
+			http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		dst.Close()
+		file.Close()
+		defer os.Remove(tmpPath)
+		tmpPaths = append(tmpPaths, tmpPath)
+	}
+
+	if ttl <= 0 {
+		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
+	}
+
+	if err := s.messenger.SendGroupMessageWithFiles(uid, text, tmpPaths, ttl); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
+	fileID := r.PathValue("fileID")
 	fp := filepath.Join(s.messenger.DownloadsDir(), fileID)
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+fileID+"\"")
 	http.ServeFile(w, r, fp)
@@ -387,20 +508,20 @@ var indexHTML = `<!DOCTYPE html>
       <input type="text" id="invite-input" placeholder="Invite user by ID...">
       <button id="invite-btn">Invite</button>
     </div>
+    <div id="file-preview"></div>
     <div id="input-area">
       <input type="text" id="msg-input" placeholder="Type a message..." autofocus>
       <label id="file-btn-label" title="Attach file">
-        <input type="file" id="file-input" hidden>
+        <input type="file" id="file-input" hidden multiple>
         &#128206;
       </label>
-      <span id="file-name"></span>
       <select id="ttl-select">
         <option value="0">Default TTL</option>
         <option value="86400">1 day</option>
         <option value="604800" selected>1 week</option>
         <option value="2592000">1 month</option>
       </select>
-      <button id="send-btn">Send</button>
+      <button id="send-btn" type="button">Send</button>
     </div>
   </main>
   <main id="config-panel" style="display:none">
@@ -421,6 +542,18 @@ var indexHTML = `<!DOCTYPE html>
         <option value="1w">1 week</option>
         <option value="1m">1 month</option>
       </select>
+
+      <label for="cfg-peer-id">Peer ID (auto if empty)</label>
+      <input type="text" id="cfg-peer-id" placeholder="">
+
+      <label for="cfg-turn-addr">TURN address</label>
+      <input type="text" id="cfg-turn-addr" placeholder="turn.example.com:3478">
+
+      <label for="cfg-turn-user">TURN username</label>
+      <input type="text" id="cfg-turn-user" placeholder="">
+
+      <label for="cfg-turn-pass">TURN password</label>
+      <input type="password" id="cfg-turn-pass" placeholder="">
 
       <div class="config-actions">
         <button id="cfg-save" class="btn-primary">Save</button>

@@ -191,6 +191,13 @@ func (m *Manager) sendEnvelope(remoteID, msgType string, v any) {
 }
 
 func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, error) {
+	m.mu.Lock()
+	if existing, ok := m.connections[remoteID]; ok {
+		existing.Close()
+		delete(m.dataChans, remoteID)
+	}
+	m.mu.Unlock()
+
 	pc, err := pion.NewPeerConnection(m.config)
 	if err != nil {
 		return nil, fmt.Errorf("new pc: %w", err)
@@ -259,7 +266,7 @@ func (m *Manager) CreateOffer(remoteID string) (pion.SessionDescription, error) 
 }
 
 func (m *Manager) HandleOffer(remoteID string, offer pion.SessionDescription) (pion.SessionDescription, error) {
-	log.Printf("hadke offer: %s", remoteID)
+	log.Printf("handle offer: %s", remoteID)
 	pc, err := m.NewPeerConnection(remoteID)
 	if err != nil {
 		return pion.SessionDescription{}, err

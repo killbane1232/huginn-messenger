@@ -108,6 +108,7 @@ type ChunkReportRequest struct {
 	ChunkIndex int    `json:"chunk_index"`
 	Hash       string `json:"hash"`
 	Signature  string `json:"signature"`
+	TTL        int    `json:"ttl,omitempty"`
 }
 
 type ChunkRecord struct {
@@ -119,6 +120,15 @@ type ChunkRecord struct {
 	PeerID      string `json:"peer_id"`
 	Persist     bool   `json:"persist"`
 	Confirmed   bool   `json:"confirmed"`
+	Readed      bool   `json:"readed,omitempty"`
+	CreatedAt   int64  `json:"created_at"`
+	TTL         int    `json:"ttl"`
+}
+
+type ReadChunkRequest struct {
+	RecipientID string `json:"recipient_id"`
+	FileID      string `json:"file_id"`
+	Signature   string `json:"signature"`
 }
 
 type ChunkReportResult struct {
@@ -415,8 +425,8 @@ func (c *Client) ReportChunk(ctx context.Context, sourcePeerID string, req Chunk
 	return nil
 }
 
-func (c *Client) GetChunksByRecipient(ctx context.Context, recipientID string) ([]ChunkRecord, error) {
-	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks", c.baseURL, recipientID)
+func (c *Client) GetChunksByRecipient(ctx context.Context, recipientID string, dateFrom int64) ([]ChunkRecord, error) {
+	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks?date_from=%d", c.baseURL, recipientID, dateFrom)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
@@ -472,6 +482,29 @@ func (c *Client) DeleteChunksByRecipient(ctx context.Context, recipientID string
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("delete chunks failed (status %d)", resp.StatusCode)
+	}
+	return nil
+}
+
+func (c *Client) ReadChunk(ctx context.Context, req ReadChunkRequest) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	url := fmt.Sprintf("%s/api/v1/chunks/read", c.baseURL)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("read chunk failed (status %d): %s", resp.StatusCode, string(b))
 	}
 	return nil
 }

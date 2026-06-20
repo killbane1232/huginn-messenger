@@ -44,6 +44,17 @@ func (s *SQLiteStore) GetGroupChats() ([]GroupChat, error) {
 	})
 }
 
+func (s *SQLiteStore) GetGroupChatByName(name string) (*GroupChat, error) {
+	return retryWith(func() (*GroupChat, error) {
+		row := s.db.QueryRow(`SELECT uid, name, enc_private, enc_public, sign_private, sign_public, created_at FROM group_chats WHERE name = $1`, name)
+		var gc GroupChat
+		if err := row.Scan(&gc.UID, &gc.Name, &gc.EncPrivate, &gc.EncPublic, &gc.SignPrivate, &gc.SignPublic, &gc.CreatedAt); err != nil {
+			return nil, err
+		}
+		return &gc, nil
+	})
+}
+
 func (s *SQLiteStore) GetGroupChat(uid string) (*GroupChat, error) {
 	return retryWith(func() (*GroupChat, error) {
 		row := s.db.QueryRow(`SELECT uid, name, enc_private, enc_public, sign_private, sign_public, created_at FROM group_chats WHERE uid = $1`, uid)

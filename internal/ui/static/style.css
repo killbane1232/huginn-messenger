@@ -373,6 +373,56 @@ body {
   white-space: nowrap;
 }
 
+#file-preview {
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 20px;
+  background: #1a1a3e;
+  border-top: 1px solid #0f3460;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.pending-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: #0f3460;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.pending-file-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-file-size {
+  color: #888;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.pending-file-remove {
+  background: none;
+  border: none;
+  color: #e94560;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+.pending-file-remove:hover {
+  background: rgba(233, 69, 96, 0.2);
+}
+
 #input-area {
   padding: 12px 20px;
   border-top: 1px solid #0f3460;

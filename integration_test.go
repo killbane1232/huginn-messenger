@@ -57,7 +57,7 @@ func TestOfflineMessageWithoutWebRTC(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), "bob")
+	records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -300,6 +300,7 @@ func newTestMuninnServer() *testMuninnServer {
 	mux.HandleFunc("POST /api/v1/peers/{sourcePeerID}/chunk-reports", ts.handleReportChunk)
 	mux.HandleFunc("POST /api/v1/peers/{peerID}/signals", ts.handleSendSignal)
 	mux.HandleFunc("GET /api/v1/peers/{peerID}/signals", ts.handlePollSignals)
+	mux.HandleFunc("POST /api/v1/chunks/read", ts.handleReadChunk)
 	mux.HandleFunc("DELETE /api/v1/recipient/{recipientID}/chunks/{fileID}", ts.handleDeleteChunksByRecipient)
 	ts.srv = httptest.NewServer(mux)
 	return ts
@@ -381,6 +382,7 @@ func (ts *testMuninnServer) handleRegisterChunk(w http.ResponseWriter, r *http.R
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	now := time.Now().Unix()
 	ts.mu.Lock()
 	ts.chunks = append(ts.chunks, muninn.ChunkRecord{
 		FileID:      fileID,
@@ -389,6 +391,9 @@ func (ts *testMuninnServer) handleRegisterChunk(w http.ResponseWriter, r *http.R
 		RecipientID: req.RecipientID,
 		Hash:        req.Hash,
 		PeerID:      req.PeerID,
+		Persist:     req.Persist,
+		CreatedAt:   now,
+		TTL:         604800,
 	})
 	ts.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
@@ -411,6 +416,7 @@ func (ts *testMuninnServer) handleRegisterChunks(w http.ResponseWriter, r *http.
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	now := time.Now().Unix()
 	ts.mu.Lock()
 	for _, entry := range req.Chunks {
 		ts.chunks = append(ts.chunks, muninn.ChunkRecord{
@@ -421,6 +427,8 @@ func (ts *testMuninnServer) handleRegisterChunks(w http.ResponseWriter, r *http.
 			Hash:        entry.Hash,
 			PeerID:      entry.PeerID,
 			Persist:     entry.Persist,
+			CreatedAt:   now,
+			TTL:         604800,
 		})
 	}
 	ts.mu.Unlock()
@@ -429,10 +437,16 @@ func (ts *testMuninnServer) handleRegisterChunks(w http.ResponseWriter, r *http.
 
 func (ts *testMuninnServer) handleGetChunks(w http.ResponseWriter, r *http.Request) {
 	recipientID := r.PathValue("recipientID")
+	dateFrom := int64(0)
+	if df := r.URL.Query().Get("date_from"); df != "" {
+		if parsed, err := strconv.ParseInt(df, 10, 64); err == nil {
+			dateFrom = parsed
+		}
+	}
 	ts.mu.Lock()
 	var records []muninn.ChunkRecord
 	for _, c := range ts.chunks {
-		if c.RecipientID == recipientID {
+		if c.RecipientID == recipientID && c.CreatedAt >= dateFrom {
 			records = append(records, c)
 		}
 	}
@@ -461,6 +475,11 @@ func (ts *testMuninnServer) handleGetChunksByFileID(w http.ResponseWriter, r *ht
 
 func (ts *testMuninnServer) handleReportChunk(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
+}
+
+func (ts *testMuninnServer) handleReadChunk(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]bool{"valid": true})
 }
 
 func (ts *testMuninnServer) handleDeleteChunksByRecipient(w http.ResponseWriter, r *http.Request) {
@@ -540,7 +559,7 @@ func TestMessengerOfflineFlow(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), "bob")
+	records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -629,7 +648,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), "bob")
+	records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -663,7 +682,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 		t.Logf("registered charley as storage peer for chunk %s/%d", rec.FileID, rec.ChunkIndex)
 	}
 
-	records2, err := mc.GetChunksByRecipient(context.Background(), "bob")
+	records2, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -757,7 +776,7 @@ func TestFileSendAndReceive(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), "bob")
+	records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -927,7 +946,7 @@ func TestGroupChatFlow(t *testing.T) {
 			break
 		}
 
-		records, err := mc.GetChunksByRecipient(context.Background(), "bob")
+		records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
 		if err == nil && len(records) > 0 {
 			for _, rec := range records {
 				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
@@ -959,13 +978,13 @@ func TestGroupChatFlow(t *testing.T) {
 	aliceMsgCh := alice.SubscribeMessages()
 	defer alice.UnsubscribeMessages(aliceMsgCh)
 
-	if err := alice.SendGroupMessage(gc.UID, "hello from alice in group"); err != nil {
+	if err := alice.SendGroupMessage(gc.UID, "hello from alice in group", 604800); err != nil {
 		t.Fatalf("alice send group msg: %v", err)
 	}
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), gc.UID)
+	records, err := mc.GetChunksByRecipient(context.Background(), gc.UID, 0)
 	if err != nil {
 		t.Fatalf("get group chunks: %v", err)
 	}
@@ -998,7 +1017,7 @@ func TestGroupChatFlow(t *testing.T) {
 			break
 		}
 
-		records2, err := mc.GetChunksByRecipient(context.Background(), gc.UID)
+		records2, err := mc.GetChunksByRecipient(context.Background(), gc.UID, 0)
 		if err == nil && len(records2) > 0 {
 			for _, rec := range records2 {
 				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
@@ -1020,6 +1039,218 @@ func TestGroupChatFlow(t *testing.T) {
 		t.Fatalf("group message from: got %q, want 'alice'", groupMsg.From)
 	}
 	t.Logf("OK: group message delivered, id=%s", groupMsg.MsgID)
+}
+
+func TestGroupFileSendAndReceive(t *testing.T) {
+	mn := newTestMuninnServer()
+	defer mn.Close()
+
+	mc := muninn.NewClient(mn.URL())
+
+	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db",
+		messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alice.Shutdown()
+	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db",
+		messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bob.Shutdown()
+	time.Sleep(300 * time.Millisecond)
+
+	for _, m := range []*messenger.Messenger{alice, bob} {
+		if err := m.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	alice.SearchPeers("bob")
+	bob.SearchPeers("alice")
+	time.Sleep(100 * time.Millisecond)
+
+	gc, err := alice.CreateGroupChat("test-group-files")
+	if err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	t.Logf("group created: %s (%s)", gc.Name, gc.UID)
+
+	bobMsgCh := bob.SubscribeMessages()
+	defer bob.UnsubscribeMessages(bobMsgCh)
+
+	if err := alice.InviteToGroupChat(gc.UID, "bob"); err != nil {
+		t.Fatalf("invite bob: %v", err)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	var inviteMsg messenger.ChatMessage
+	gotInvite := false
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-bobMsgCh:
+			inviteMsg = msg
+			gotInvite = true
+		default:
+		}
+		if gotInvite {
+			break
+		}
+		records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
+		if err == nil && len(records) > 0 {
+			for _, rec := range records {
+				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+				if !ok {
+					continue
+				}
+				bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if !gotInvite {
+		t.Fatal("bob did not receive the group invite")
+	}
+	t.Logf("bob received invite: %s", inviteMsg.Text)
+
+	bobGroups, err := bob.GetGroupChats()
+	if err != nil {
+		t.Fatalf("bob get groups: %v", err)
+	}
+	if len(bobGroups) == 0 {
+		t.Fatal("bob has no groups after invite")
+	}
+	if bobGroups[0].UID != gc.UID {
+		t.Fatalf("bob group uid mismatch: got %s, want %s", bobGroups[0].UID, gc.UID)
+	}
+	t.Logf("bob joined group: %s", bobGroups[0].Name)
+
+	content := "hello this is a group test file from alice"
+	tmpFile := filepath.Join(t.TempDir(), "group-test.txt")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err = alice.SendGroupMessageWithFiles(gc.UID, "here is a file in group chat", []string{tmpFile}, 604800)
+	if err != nil {
+		t.Fatalf("alice send group file msg: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	records, err := mc.GetChunksByRecipient(context.Background(), gc.UID, 0)
+	if err != nil {
+		t.Fatalf("get group chunks: %v", err)
+	}
+	t.Logf("found %d message chunk records for group", len(records))
+	if len(records) == 0 {
+		t.Fatal("no group message chunk records found")
+	}
+
+	for _, rec := range records {
+		data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+		if !ok {
+			continue
+		}
+		bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+		t.Logf("injected message chunk %s/%d", rec.FileID, rec.ChunkIndex)
+	}
+
+	mn.mu.Lock()
+	var fileRecords []muninn.ChunkRecord
+	for _, c := range mn.chunks {
+		if c.Persist {
+			fileRecords = append(fileRecords, c)
+		}
+	}
+	mn.mu.Unlock()
+	t.Logf("found %d file chunk records", len(fileRecords))
+	if len(fileRecords) == 0 {
+		t.Fatal("no file chunk records found (persist=true)")
+	}
+
+	for _, rec := range fileRecords {
+		data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+		if !ok {
+			t.Fatalf("alice does not have file chunk %s/%d", rec.FileID, rec.ChunkIndex)
+		}
+		bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+		t.Logf("injected file chunk %s/%d", rec.FileID, rec.ChunkIndex)
+	}
+
+	deadline = time.Now().Add(15 * time.Second)
+	var delivered messenger.ChatMessage
+	gotMsg := false
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-bobMsgCh:
+			if msg.MsgID != inviteMsg.MsgID {
+				delivered = msg
+				gotMsg = true
+			}
+		default:
+		}
+		if gotMsg {
+			break
+		}
+
+		records2, err := mc.GetChunksByRecipient(context.Background(), gc.UID, 0)
+		if err == nil && len(records2) > 0 {
+			for _, rec := range records2 {
+				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+				if !ok {
+					continue
+				}
+				bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if !gotMsg {
+		t.Fatal("bob did not receive the group file message")
+	}
+	if delivered.Text != "here is a file in group chat" {
+		t.Fatalf("group file message text: got %q, want 'here is a file in group chat'", delivered.Text)
+	}
+	if delivered.From != "alice" {
+		t.Fatalf("group file message from: got %q, want 'alice'", delivered.From)
+	}
+	if len(delivered.Files) == 0 {
+		t.Fatal("group file message has no files in metadata")
+	}
+	if delivered.Files[0].Filename != "group-test.txt" {
+		t.Fatalf("file name mismatch: got %q, want 'group-test.txt'", delivered.Files[0].Filename)
+	}
+	t.Logf("OK: group file message delivered, id=%s, file=%s", delivered.MsgID, delivered.Files[0].Filename)
+
+	time.Sleep(2 * time.Second)
+
+	entries, err := os.ReadDir(bob.DownloadsDir())
+	if err != nil {
+		t.Fatalf("read downloads dir: %v", err)
+	}
+	var found bool
+	for _, entry := range entries {
+		if entry.Name() == delivered.Files[0].Filename {
+			found = true
+			downloadedPath := filepath.Join(bob.DownloadsDir(), entry.Name())
+			downloaded, err := os.ReadFile(downloadedPath)
+			if err != nil {
+				t.Fatalf("read downloaded file: %v", err)
+			}
+			if string(downloaded) != content {
+				t.Fatalf("file content mismatch: got %q, want %q", string(downloaded), content)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("downloaded file %q not found in %s", delivered.Files[0].Filename, bob.DownloadsDir())
+	}
+
+	t.Logf("OK: group file sent and received, msgID=%s, file=%s, content=%q", delivered.MsgID, delivered.Files[0].Filename, content)
 }
 
 func TestWebRTCOfflineFallback(t *testing.T) {
@@ -1098,7 +1329,7 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 		t.Log("message not received via WebRTC instantly, checking offline fallback...")
 		time.Sleep(2 * time.Second)
 
-		records, err := mc.GetChunksByRecipient(context.Background(), "bob")
+		records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
 		if err == nil && len(records) > 0 {
 			t.Logf("found %d chunk records, injecting...", len(records))
 			for _, rec := range records {
@@ -1317,6 +1548,110 @@ func TestReloginFlow(t *testing.T) {
 		}
 		t.Log("OK: all four keys match between alice and bob")
 	})
+}
+
+func TestFailedChunkRetry(t *testing.T) {
+	mn := newTestMuninnServer()
+	defer mn.Close()
+
+	mc := muninn.NewClient(mn.URL())
+
+	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db", messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer alice.Shutdown()
+	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db", messenger.WithICEServers(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bob.Shutdown()
+	time.Sleep(300 * time.Millisecond)
+
+	for _, m := range []*messenger.Messenger{alice, bob} {
+		if err := m.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	err = alice.SendMessage("bob", "test retry failed chunks", 604800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log("message sent")
+
+	var records []muninn.ChunkRecord
+	for i := 0; i < 20; i++ {
+		records, err = mc.GetChunksByRecipient(context.Background(), "bob", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) > 0 {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if len(records) == 0 {
+		t.Fatal("no chunk records found on server")
+	}
+	t.Logf("found %d chunk records on server", len(records))
+
+	bob.InjectChunk("_trigger_", 0, []byte{})
+	time.Sleep(100 * time.Millisecond)
+
+	msgs := bob.GetMessages("alice")
+	if len(msgs) > 0 {
+		t.Logf("message delivered via WebRTC before retry, id=%s", msgs[len(msgs)-1].MsgID)
+		return
+	}
+
+	for i := 0; i < 15; i++ {
+		bob.InjectChunk("_trigger_", i, []byte{})
+		time.Sleep(150 * time.Millisecond)
+		msgs = bob.GetMessages("alice")
+		if len(msgs) > 0 {
+			t.Logf("message delivered via WebRTC async, id=%s", msgs[len(msgs)-1].MsgID)
+			return
+		}
+	}
+
+	failed, err := bob.ListFailedChunks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failed) == 0 {
+		t.Fatal("chunks not in failed_chunks and message not delivered")
+	}
+	t.Logf("found %d failed chunks, injecting real data...", len(failed))
+
+	for _, rec := range records {
+		data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
+		if !ok {
+			t.Fatalf("alice does not have chunk %s/%d locally", rec.FileID, rec.ChunkIndex)
+		}
+		bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var msg messenger.ChatMessage
+	found := false
+	for time.Now().Before(deadline) {
+		msgs = bob.GetMessages("alice")
+		if len(msgs) > 0 {
+			msg = msgs[len(msgs)-1]
+			found = true
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if !found {
+		t.Fatal("message not delivered after injecting chunk data")
+	}
+	if msg.Text != "test retry failed chunks" {
+		t.Fatalf("wrong text: got %q", msg.Text)
+	}
+	t.Logf("OK: message delivered via retryFailedChunks, id=%s", msg.MsgID)
 }
 
 func splitReloginSignature(sig string) []string {

@@ -488,7 +488,52 @@ func messenger_send_group_message(handle C.long, groupUID, text *C.char) *C.char
 	if inst == nil {
 		return errorJSON("invalid handle")
 	}
-	if err := inst.m.SendGroupMessage(C.GoString(groupUID), C.GoString(text)); err != nil {
+	ttlSeconds := config.ChunkTTLSeconds(inst.cfg.ChunkTTL)
+	if err := inst.m.SendGroupMessage(C.GoString(groupUID), C.GoString(text), ttlSeconds); err != nil {
+		return errorJSON(err.Error())
+	}
+	return okJSON()
+}
+
+//export messenger_send_group_message_with_ttl
+func messenger_send_group_message_with_ttl(handle C.long, groupUID, text *C.char, ttl C.int) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	ttlSeconds := int(ttl)
+	if ttlSeconds <= 0 {
+		ttlSeconds = config.ChunkTTLSeconds(inst.cfg.ChunkTTL)
+	}
+	if err := inst.m.SendGroupMessage(C.GoString(groupUID), C.GoString(text), ttlSeconds); err != nil {
+		return errorJSON(err.Error())
+	}
+	return okJSON()
+}
+
+//export messenger_send_group_file
+func messenger_send_group_file(handle C.long, groupUID, text, filePath *C.char, ttl C.int) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	ttlSeconds := int(ttl)
+	if ttlSeconds <= 0 {
+		ttlSeconds = config.ChunkTTLSeconds(inst.cfg.ChunkTTL)
+	}
+	if err := inst.m.SendGroupMessageWithFiles(C.GoString(groupUID), C.GoString(text), []string{C.GoString(filePath)}, ttlSeconds); err != nil {
+		return errorJSON(err.Error())
+	}
+	return okJSON()
+}
+
+//export messenger_mark_read
+func messenger_mark_read(handle C.long, msgID *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	if err := inst.m.MarkMessageRead(C.GoString(msgID)); err != nil {
 		return errorJSON(err.Error())
 	}
 	return okJSON()

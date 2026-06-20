@@ -4,6 +4,8 @@ let activePeer = null;
 let activeGroup = null;
 let me = {};
 let searchTimeout = null;
+let pendingFiles = [];
+let lastFileAddTime = 0;
 
 async function fetchMe() {
   try {
@@ -130,7 +132,7 @@ async function selectPeer(peerID) {
 function renderFileLinks(files) {
   if (!files || files.length === 0) return '';
   return files.map(f =>
-    '<div class="msg-file"><a href="/api/files/' + f.file_id + '" download target="_blank">&#128196; File (' + f.file_id.slice(0,8) + '...)</a></div>'
+    '<div class="msg-file"><a href="/api/files/' + f.file_id + '" download target="_blank">&#128196; ' + (f.filename || f.file_id.slice(0,8) + '...') + '</a></div>'
   ).join('');
 }
 
@@ -151,26 +153,68 @@ function renderMessages(msgs, peerID) {
   container.scrollTop = container.scrollHeight;
 }
 
+function renderPendingFiles() {
+  const container = document.getElementById('file-preview');
+  if (pendingFiles.length === 0) {
+    container.style.display = 'none';
+    container.innerHTML = '';
+    return;
+  }
+  container.style.display = 'flex';
+  container.innerHTML = pendingFiles.map((f, i) =>
+    '<div class="pending-file">' +
+      '<span class="pending-file-name">' + f.name + '</span>' +
+      '<span class="pending-file-size">' + (f.size / 1024).toFixed(1) + ' KB</span>' +
+      '<button class="pending-file-remove" data-index="' + i + '">&times;</button>' +
+    '</div>'
+  ).join('');
+  container.querySelectorAll('.pending-file-remove').forEach(btn => {
+    btn.addEventListener('click', function() {
+      const idx = parseInt(this.dataset.index);
+      pendingFiles.splice(idx, 1);
+      renderPendingFiles();
+    });
+  });
+}
+
+function clearPendingFiles() {
+  pendingFiles = [];
+  document.getElementById('file-input').value = '';
+  renderPendingFiles();
+}
+
 async function sendMessage() {
   const input = document.getElementById('msg-input');
   const text = input.value.trim();
-  if (!text) return;
+  if (!text && pendingFiles.length === 0) return;
 
-  const ttlSelect = document.getElementById('ttl-select');
-  const ttl = parseInt(ttlSelect.value) || 0;
+  if (!text && pendingFiles.length > 0 && Date.now() - lastFileAddTime < 500) return;
+
+  const ttl = parseInt(document.getElementById('ttl-select').value) || 0;
 
   if (activeGroup) {
-    input.value = '';
-    const r = await fetch('/api/groups/' + encodeURIComponent(activeGroup) + '/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, ttl })
-    });
+    const formData = new FormData();
+    formData.append('text', text);
+    formData.append('ttl', ttl);
+    pendingFiles.forEach(f => formData.append('file', f.file));
+
+    const r = await fetch(
+      pendingFiles.length > 0
+        ? '/api/groups/' + encodeURIComponent(activeGroup) + '/send-file'
+        : '/api/groups/' + encodeURIComponent(activeGroup) + '/send',
+      {
+        method: 'POST',
+        body: pendingFiles.length > 0 ? formData : JSON.stringify({ text, ttl }),
+        headers: pendingFiles.length > 0 ? {} : { 'Content-Type': 'application/json' }
+      }
+    );
     if (!r.ok) {
       const err = await r.text();
       alert('Send failed: ' + err);
       return;
     }
+    input.value = '';
+    clearPendingFiles();
     const msgs = await fetchMessages(activeGroup);
     renderMessages(msgs, activeGroup);
     return;
@@ -178,43 +222,30 @@ async function sendMessage() {
 
   if (!activePeer) return;
 
-  const fileInput = document.getElementById('file-input');
-  const file = fileInput.files[0];
+  const formData = new FormData();
+  formData.append('to', activePeer);
+  formData.append('text', text);
+  formData.append('ttl', ttl);
+  pendingFiles.forEach(f => formData.append('file', f.file));
 
-  if (file) {
-    const formData = new FormData();
-    formData.append('to', activePeer);
-    formData.append('text', text);
-    formData.append('ttl', ttl);
-    formData.append('file', file);
-
-    input.value = '';
-    fileInput.value = '';
-    document.getElementById('file-name').textContent = '';
-
-    const r = await fetch('/api/send-file', {
+  const r = await fetch(
+    pendingFiles.length > 0
+      ? '/api/send-file'
+      : '/api/send',
+    {
       method: 'POST',
-      body: formData
-    });
-    if (!r.ok) {
-      const err = await r.text();
-      alert('Send failed: ' + err);
-      return;
+      body: pendingFiles.length > 0 ? formData : JSON.stringify({ to: activePeer, text, ttl }),
+      headers: pendingFiles.length > 0 ? {} : { 'Content-Type': 'application/json' }
     }
-  } else {
-    input.value = '';
-    const r = await fetch('/api/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ to: activePeer, text, ttl })
-    });
-    if (!r.ok) {
-      const err = await r.text();
-      alert('Send failed: ' + err);
-      return;
-    }
+  );
+  if (!r.ok) {
+    const err = await r.text();
+    alert('Send failed: ' + err);
+    return;
   }
 
+  input.value = '';
+  clearPendingFiles();
   const msgs = await fetchMessages(activePeer);
   renderMessages(msgs, activePeer);
 }
@@ -251,6 +282,10 @@ async function loadConfig() {
   if (cfg.chunk_ttl) {
     document.getElementById('cfg-chunk-ttl').value = cfg.chunk_ttl;
   }
+  document.getElementById('cfg-peer-id').value = cfg.peer_id || '';
+  document.getElementById('cfg-turn-addr').value = cfg.turn_addr || '';
+  document.getElementById('cfg-turn-user').value = cfg.turn_user || '';
+  document.getElementById('cfg-turn-pass').value = cfg.turn_pass || '';
 }
 
 async function saveConfig() {
@@ -266,7 +301,11 @@ async function saveConfig() {
       username: document.getElementById('cfg-username').value.trim(),
       muninn: document.getElementById('cfg-muninn').value.trim(),
       ui_port: parseInt(document.getElementById('cfg-ui-port').value) || 0,
-      chunk_ttl: document.getElementById('cfg-chunk-ttl').value
+      chunk_ttl: document.getElementById('cfg-chunk-ttl').value,
+      peer_id: document.getElementById('cfg-peer-id').value.trim(),
+      turn_addr: document.getElementById('cfg-turn-addr').value.trim(),
+      turn_user: document.getElementById('cfg-turn-user').value.trim(),
+      turn_pass: document.getElementById('cfg-turn-pass').value.trim()
     })
   });
 
@@ -300,13 +339,12 @@ function setupSSE() {
 
   evtSource.addEventListener('message', async function(e) {
     const msg = JSON.parse(e.data);
-    if (activePeer && (msg.from === activePeer || msg.from === me.username)) {
-      const msgs = await fetchMessages(activePeer);
-      renderMessages(msgs, activePeer);
-    }
-    if (activeGroup && (msg.from === activeGroup || msg.from === me.username)) {
+    if (activeGroup) {
       const msgs = await fetchMessages(activeGroup);
       renderMessages(msgs, activeGroup);
+    } else if (activePeer && (msg.from === activePeer || msg.from === me.username)) {
+      const msgs = await fetchMessages(activePeer);
+      renderMessages(msgs, activePeer);
     }
   });
 
@@ -368,11 +406,19 @@ document.addEventListener('DOMContentLoaded', async function() {
 
   document.getElementById('send-btn').addEventListener('click', sendMessage);
   document.getElementById('msg-input').addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') sendMessage();
+    if (e.key === 'Enter') {
+      const text = document.getElementById('msg-input').value.trim();
+      if (!text && pendingFiles.length > 0) return;
+      sendMessage();
+    }
   });
   document.getElementById('file-input').addEventListener('change', function(e) {
-    const name = e.target.files[0] ? e.target.files[0].name : '';
-    document.getElementById('file-name').textContent = name;
+    for (const f of e.target.files) {
+      pendingFiles.push({ file: f, name: f.name, size: f.size });
+    }
+    lastFileAddTime = Date.now();
+    e.target.value = '';
+    renderPendingFiles();
   });
   document.getElementById('peer-search').addEventListener('input', function() {
     clearTimeout(searchTimeout);

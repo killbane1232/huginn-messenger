@@ -109,8 +109,9 @@ type Messenger struct {
 
 	store *store.SQLiteStore
 
-	peers    []muninn.Peer
-	mu       sync.RWMutex
+	peers            []muninn.Peer
+	peersConnecting  map[string]struct{}
+	mu               sync.RWMutex
 
 	peerSubs   map[string]chan struct{}
 	subsMu     sync.Mutex
@@ -187,8 +188,9 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		muninnClient: muninnClient,
 		rtcMsgChan:   rtcMsgChan,
 		signalChan:   signalChan,
-		store:        st,
-		peerSubs:     make(map[string]chan struct{}),
+		store:            st,
+		peersConnecting:  make(map[string]struct{}),
+		peerSubs:         make(map[string]chan struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
 		peerFlag:     o.peerFlag,
@@ -244,16 +246,6 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	go m.pendingChunkLoop()
 	go m.fileDownloadLoop()
 	go m.chunkCleanupLoop()
-	go m.groupHeartbeatLoop()
-
-	go func() {
-		groups, err := m.store.GetGroupChats()
-		if err == nil {
-			for _, g := range groups {
-				m.registerGroupPeer(g)
-			}
-		}
-	}()
 
 	return m, nil
 }
@@ -436,6 +428,13 @@ func (m *Messenger) heartbeatLoop() {
 					if err := m.Register(); err != nil {
 						log.Printf("register peer error: %v", err)
 					}
+					groups, err := m.store.GetGroupChats()
+					if err != nil {
+						continue
+					}
+					for _, g := range groups {
+						m.registerGroupPeer(g)
+					}
 				} else {
 					log.Printf("heartbeat error: %v", err)
 				}
@@ -489,6 +488,9 @@ func (m *Messenger) chunkCleanupLoop() {
 			}
 			if err := m.store.DeleteChunksWithMessage(); err != nil {
 				log.Printf("cleanup message chunks: %v", err)
+			}
+			if err := m.store.DeleteExpiredFailedChunks(time.Now().Unix()); err != nil {
+				log.Printf("cleanup expired failed chunks: %v", err)
 			}
 		case <-m.ctx.Done():
 			return
@@ -1044,6 +1046,20 @@ func (m *Messenger) sendFileChunks(recipientID, filePath string, ttlSeconds int)
 }
 
 func (m *Messenger) ConnectPeer(toPeerID string) error {
+	m.mu.Lock()
+	if _, ok := m.peersConnecting[toPeerID]; ok {
+		m.mu.Unlock()
+		return nil
+	}
+	m.peersConnecting[toPeerID] = struct{}{}
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		delete(m.peersConnecting, toPeerID)
+		m.mu.Unlock()
+	}()
+
 	offer, err := m.rtcManager.CreateOffer(toPeerID)
 	if err != nil {
 		return fmt.Errorf("create offer: %w", err)
@@ -1384,20 +1400,71 @@ func (m *Messenger) checkPendingMessages() {
 }
 
 func (m *Messenger) checkRecipientMessages(recipientID string) {
-	chunks, err := m.muninnClient.GetChunksByRecipient(m.ctx, recipientID)
+	lastCheck := m.store.GetLastChunkCheck(recipientID)
+	chunks, err := m.muninnClient.GetChunksByRecipient(m.ctx, recipientID, lastCheck)
 	if err != nil {
 		return
 	}
-	if len(chunks) == 0 {
+	m.store.SetLastChunkCheck(recipientID, time.Now().Unix())
+	if len(chunks) > 0 {
+		byMsg := make(map[string][]muninn.ChunkRecord)
+		for _, c := range chunks {
+			if m.store.IsChunkFailed(c.FileID, c.ChunkIndex) {
+				continue
+			}
+			byMsg[c.FileID] = append(byMsg[c.FileID], c)
+		}
+		for msgID, msgChunks := range byMsg {
+			m.collectAndProcessMessage(msgID, msgChunks)
+		}
+	}
+
+	m.retryFailedChunks(recipientID)
+}
+
+func (m *Messenger) retryFailedChunks(recipientID string) {
+	failed, err := m.store.ListFailedChunks(recipientID)
+	if err != nil || len(failed) == 0 {
 		return
 	}
 
-	byMsg := make(map[string][]muninn.ChunkRecord)
-	for _, c := range chunks {
-		byMsg[c.FileID] = append(byMsg[c.FileID], c)
-	}
-	for msgID, msgChunks := range byMsg {
-		m.collectAndProcessMessage(msgID, msgChunks)
+	now := time.Now().Unix()
+	seenFile := make(map[string]bool)
+
+	for _, fc := range failed {
+		if fc.CreatedAt+int64(fc.TTLSeconds) <= now {
+			m.store.DeleteFailedChunk(fc.FileID, fc.ChunkIndex)
+			continue
+		}
+		if seenFile[fc.FileID] {
+			continue
+		}
+		seenFile[fc.FileID] = true
+
+		records, err := m.muninnClient.GetChunksByFileID(m.ctx, fc.FileID)
+		if err != nil || len(records) == 0 {
+			continue
+		}
+
+		allOk := true
+		for _, rec := range records {
+			if !m.store.IsChunkFailed(rec.FileID, rec.ChunkIndex) {
+				continue
+			}
+			data, ok := m.getChunkData(rec)
+			if !ok {
+				allOk = false
+				continue
+			}
+			if rec.Hash != "" && chunk.RegisteredHash(data) != rec.Hash {
+				allOk = false
+				continue
+			}
+			m.store.DeleteFailedChunk(rec.FileID, rec.ChunkIndex)
+		}
+		if allOk {
+			m.collectAndProcessMessage(fc.FileID, records)
+		}
 	}
 }
 
@@ -1436,8 +1503,14 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 		data, ok := m.getChunkData(rec)
 		if !ok {
 			log.Printf("not collected any data: %s/%d", rec.FileID, rec.ChunkIndex)
+			ttl := rec.TTL
+			if ttl <= 0 {
+				ttl = 604800
+			}
+			m.store.StoreFailedChunk(rec.FileID, rec.ChunkIndex, rec.RecipientID, ttl)
 			continue
 		}
+		m.store.DeleteFailedChunk(rec.FileID, rec.ChunkIndex)
 		if rec.Hash != "" && chunk.RegisteredHash(data) != rec.Hash {
 			log.Printf("hash mismatch for chunk %s/%d: got %s, expected %s",
 				rec.FileID, rec.ChunkIndex, chunk.RegisteredHash(data), rec.Hash)
@@ -1561,6 +1634,17 @@ func (m *Messenger) deleteChunksAndReturn(msgID string) {
 	}
 }
 
+func (m *Messenger) MarkMessageRead(msgID string) error {
+	payload := fmt.Sprintf("muninn/read/v1\n%s", msgID)
+	sig := crypto.Sign(m.signPrivate, []byte(payload))
+	req := muninn.ReadChunkRequest{
+		RecipientID: m.ID,
+		FileID:      msgID,
+		Signature:    base64.StdEncoding.EncodeToString(sig),
+	}
+	return m.muninnClient.ReadChunk(m.ctx, req)
+}
+
 const invitePrefix = "__group_invite__:"
 
 type groupInvitePayload struct {
@@ -1611,6 +1695,10 @@ func (m *Messenger) checkInviteText(text string) string {
 }
 
 func (m *Messenger) CreateGroupChat(name string) (*store.GroupChat, error) {
+	if existing, _ := m.store.GetGroupChatByName(name); existing != nil {
+		return nil, fmt.Errorf("group chat %q already exists", name)
+	}
+
 	signPub, signPriv, err := crypto.GenerateSigningKey()
 	if err != nil {
 		return nil, fmt.Errorf("generate group signing key: %w", err)
@@ -1685,25 +1773,6 @@ func (m *Messenger) registerGroupPeer(gc store.GroupChat) {
 	}
 }
 
-func (m *Messenger) groupHeartbeatLoop() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			groups, err := m.store.GetGroupChats()
-			if err != nil {
-				continue
-			}
-			for _, g := range groups {
-				m.registerGroupPeer(g)
-			}
-		case <-m.ctx.Done():
-			return
-		}
-	}
-}
-
 func (m *Messenger) InviteToGroupChat(groupUID, memberID string) error {
 	gc, err := m.store.GetGroupChat(groupUID)
 	if err != nil {
@@ -1724,7 +1793,7 @@ func (m *Messenger) InviteToGroupChat(groupUID, memberID string) error {
 	return m.SendMessage(memberID, inviteText, 604800)
 }
 
-func (m *Messenger) SendGroupMessage(groupUID, text string) error {
+func (m *Messenger) SendGroupMessage(groupUID, text string, ttlSeconds int) error {
 	gc, err := m.store.GetGroupChat(groupUID)
 	if err != nil {
 		return fmt.Errorf("group not found: %w", err)
@@ -1737,7 +1806,36 @@ func (m *Messenger) SendGroupMessage(groupUID, text string) error {
 	}
 
 	msgID := uuid.New().String()
-	return m.sendOffline(msgID, text, peer, 604800, nil)
+	return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
+}
+
+func (m *Messenger) SendGroupMessageWithFiles(groupUID, text string, filePaths []string, ttlSeconds int) error {
+	gc, err := m.store.GetGroupChat(groupUID)
+	if err != nil {
+		return fmt.Errorf("group not found: %w", err)
+	}
+
+	var files []FileMeta
+	for _, fp := range filePaths {
+		meta, err := m.sendFileChunks(groupUID, fp, ttlSeconds)
+		if err != nil {
+			return fmt.Errorf("send file %s: %w", fp, err)
+		}
+		files = append(files, *meta)
+	}
+
+	if ttlSeconds <= 0 {
+		ttlSeconds = config.ChunkTTLSeconds("1w")
+	}
+
+	peer := &muninn.Peer{
+		ID:            gc.UID,
+		EncryptionKey: gc.EncPublic,
+		SignatureKey:  gc.SignPublic,
+	}
+
+	msgID := uuid.New().String()
+	return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 }
 
 func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {
@@ -2011,6 +2109,14 @@ func (m *Messenger) InjectChunk(fileID string, chunkIndex int, data []byte) {
 	}
 	go m.checkPendingMessages()
 	go m.checkPendingFileDownloads()
+}
+
+func (m *Messenger) ListFailedChunks() ([]store.FailedChunk, error) {
+	return m.store.ListFailedChunks(m.ID)
+}
+
+func (m *Messenger) IsChunkFailed(fileID string, chunkIndex int) bool {
+	return m.store.IsChunkFailed(fileID, chunkIndex)
 }
 
 func (m *Messenger) Shutdown() {
