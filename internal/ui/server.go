@@ -210,7 +210,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if ttl <= 0 {
 		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
 	}
-	if err := s.messenger.SendMessage(req.To, req.Text, ttl); err != nil {
+	if err := s.messenger.SendMessage(req.To, req.Text, nil, ttl); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -218,12 +218,41 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSendFile(w http.ResponseWriter, r *http.Request) {
+	to := r.FormValue("to")
+	s.sendFileTo(to, w, r)
+}
+
+func (s *Server) handleGroupSend(w http.ResponseWriter, r *http.Request) {
+	to := r.PathValue("uid")
+	var req struct {
+		Text string `json:"text"`
+		TTL  int    `json:"ttl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	ttl := req.TTL
+	if ttl <= 0 {
+		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
+	}
+	if err := s.messenger.SendMessage(to, req.Text, nil, ttl); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleGroupSendFile(w http.ResponseWriter, r *http.Request) {
+	s.sendFileTo(r.PathValue("uid"), w, r)
+}
+
+func (s *Server) sendFileTo(to string, w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(100 << 20); err != nil {
 		http.Error(w, "failed to parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	toPeer := r.FormValue("to")
 	text := r.FormValue("text")
 	ttlStr := r.FormValue("ttl")
 	ttl := 0
@@ -270,7 +299,7 @@ func (s *Server) handleSendFile(w http.ResponseWriter, r *http.Request) {
 		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
 	}
 
-	if err := s.messenger.SendMessageWithFiles(toPeer, text, tmpPaths, ttl); err != nil {
+	if err := s.messenger.SendMessage(to, text, tmpPaths, ttl); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -337,89 +366,6 @@ func (s *Server) handleGroupInvite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-func (s *Server) handleGroupSend(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	var req struct {
-		Text string `json:"text"`
-		TTL  int    `json:"ttl"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	ttl := req.TTL
-	if ttl <= 0 {
-		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
-	}
-	if err := s.messenger.SendGroupMessage(uid, req.Text, ttl); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-func (s *Server) handleGroupSendFile(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-
-	if err := r.ParseMultipartForm(100 << 20); err != nil {
-		http.Error(w, "failed to parse form: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	text := r.FormValue("text")
-	ttlStr := r.FormValue("ttl")
-	ttl := 0
-	if ttlStr != "" {
-		fmt.Sscanf(ttlStr, "%d", &ttl)
-	}
-
-	fileHeaders := r.MultipartForm.File["file"]
-	if len(fileHeaders) == 0 {
-		http.Error(w, "missing file", http.StatusBadRequest)
-		return
-	}
-
-	tmpDir := filepath.Join(os.TempDir(), "huginn-uploads")
-	os.MkdirAll(tmpDir, 0755)
-	var tmpPaths []string
-	for _, fh := range fileHeaders {
-		file, err := fh.Open()
-		if err != nil {
-			http.Error(w, "failed to read upload: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		tmpPath := filepath.Join(tmpDir, fh.Filename)
-		dst, err := os.Create(tmpPath)
-		if err != nil {
-			file.Close()
-			http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if _, err := io.Copy(dst, file); err != nil {
-			dst.Close()
-			file.Close()
-			os.Remove(tmpPath)
-			http.Error(w, "failed to save upload: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		dst.Close()
-		file.Close()
-		defer os.Remove(tmpPath)
-		tmpPaths = append(tmpPaths, tmpPath)
-	}
-
-	if ttl <= 0 {
-		ttl = config.ChunkTTLSeconds(s.cfg.ChunkTTL)
-	}
-
-	if err := s.messenger.SendGroupMessageWithFiles(uid, text, tmpPaths, ttl); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 

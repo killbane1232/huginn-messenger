@@ -205,6 +205,35 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	if !o.iceSet {
 		o.iceServers = []pion.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
+			{URLs: []string{"stun:stun1.l.google.com:19302"}},
+			{URLs: []string{"stun:stun2.l.google.com:19302"}},
+			{URLs: []string{"stun:stun3.l.google.com:19302"}},
+			{URLs: []string{"stun:stun4.l.google.com:19302"}},
+			{URLs: []string{"stun:stun.ekiga.net"}},
+			{URLs: []string{"stun:stun.fwdnet.net"}},
+			{URLs: []string{"stun:stun01.sipphone.com"}},
+			{URLs: []string{"stun:stun.ideasip.com"}},
+			{URLs: []string{"stun:stun.iptel.org"}},
+			{URLs: []string{"stun:stun.rixtelecom.se"}},
+			{URLs: []string{"stun:stun.schlund.de"}},
+			{URLs: []string{"stun:stun.fwdnet.net"}},
+			{URLs: []string{"stun:stun.fwdnet.net"}},
+			{URLs: []string{"stun:stun.fwdnet.net"}},
+			{URLs: []string{"stun:stun.fwdnet.net"}},
+			{URLs: []string{"stun:stun.fwdnet.net"}},
+			{URLs: []string{"stunserver.org"}},
+			{URLs: []string{"stun.softjoys.com"}},
+			{URLs: []string{"stun.voiparound.com"}},
+			{URLs: []string{"stun.voipbuster.com"}},
+			{URLs: []string{"stun.voipstunt.com"}},
+			{URLs: []string{"stun.voxgratia.org"}},
+			{URLs: []string{"stun.xten.com"}},
+			{URLs: []string{"stun.rtc.yandex.net"}},
+			{
+				URLs:       []string{"turn.webrtc.yandex.net"},
+				Username:   o.turnUser,
+				Credential: o.turnPass,
+			},
 		}
 	}
 	if o.turnAddr != "" {
@@ -815,15 +844,37 @@ func (m *Messenger) findPeerByID(id string) *muninn.Peer {
 	return nil
 }
 
-func (m *Messenger) SendMessageWithFiles(toPeerID, text string, filePaths []string, ttlSeconds int) error {
-	peer := m.findPeerByID(toPeerID)
+func (m *Messenger) SendMessage(to, text string, filePaths []string, ttlSeconds int) error {
+	if ttlSeconds <= 0 {
+		ttlSeconds = config.ChunkTTLSeconds("1w")
+	}
+
+	if gc, err := m.store.GetGroupChat(to); err == nil {
+		var files []FileMeta
+		for _, fp := range filePaths {
+			meta, err := m.sendFileChunks(to, fp, ttlSeconds)
+			if err != nil {
+				return fmt.Errorf("send file %s: %w", fp, err)
+			}
+			files = append(files, *meta)
+		}
+		peer := &muninn.Peer{
+			ID:            gc.UID,
+			EncryptionKey: gc.EncPublic,
+			SignatureKey:  gc.SignPublic,
+		}
+		msgID := uuid.New().String()
+		return m.sendOffline(msgID, text, peer, ttlSeconds, files)
+	}
+
+	peer := m.findPeerByID(to)
 	if peer == nil {
-		return fmt.Errorf("peer %s not found", toPeerID)
+		return fmt.Errorf("peer %s not found", to)
 	}
 
 	var files []FileMeta
 	for _, fp := range filePaths {
-		meta, err := m.sendFileChunks(toPeerID, fp, ttlSeconds)
+		meta, err := m.sendFileChunks(to, fp, ttlSeconds)
 		if err != nil {
 			return fmt.Errorf("send file %s: %w", fp, err)
 		}
@@ -832,55 +883,22 @@ func (m *Messenger) SendMessageWithFiles(toPeerID, text string, filePaths []stri
 
 	msgID := uuid.New().String()
 
-	if ttlSeconds <= 0 {
-		ttlSeconds = config.ChunkTTLSeconds("1w")
-	}
-
-	if m.IsPeerOnline(toPeerID) {
-		if !m.IsPeerConnected(toPeerID) {
-			m.ConnectPeer(toPeerID)
+	if m.IsPeerOnline(to) {
+		if !m.IsPeerConnected(to) {
+			m.ConnectPeer(to)
 		}
 	}
 
-	if m.IsPeerConnected(toPeerID) {
+	if m.IsPeerConnected(to) {
 		now := time.Now()
-		if err := m.rtcManager.SendMessage(toPeerID, text, now, msgID); err != nil {
+		if err := m.rtcManager.SendMessage(to, text, now, msgID); err != nil {
 			return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 		}
-		m.upsertPeer(toPeerID, peer.EncryptionKey, peer.SignatureKey, now)
+		m.upsertPeer(to, peer.EncryptionKey, peer.SignatureKey, now)
 		return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 	}
 
 	return m.sendOffline(msgID, text, peer, ttlSeconds, files)
-}
-
-func (m *Messenger) SendMessage(toPeerID, text string, ttlSeconds int) error {
-	msgID := uuid.New().String()
-	peer := m.findPeerByID(toPeerID)
-	if peer == nil {
-		return fmt.Errorf("peer %s not found", toPeerID)
-	}
-
-	if ttlSeconds <= 0 {
-		ttlSeconds = config.ChunkTTLSeconds("1w")
-	}
-
-	if m.IsPeerOnline(toPeerID) {
-		if !m.IsPeerConnected(toPeerID) {
-			m.ConnectPeer(toPeerID)
-		}
-	}
-
-	if m.IsPeerConnected(toPeerID) {
-		now := time.Now()
-		if err := m.rtcManager.SendMessage(toPeerID, text, now, msgID); err != nil {
-			return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
-		}
-		m.upsertPeer(toPeerID, peer.EncryptionKey, peer.SignatureKey, now)
-		return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
-	}
-
-	return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
 }
 
 func (m *Messenger) replicatePendingChunks() {
@@ -1790,52 +1808,7 @@ func (m *Messenger) InviteToGroupChat(groupUID, memberID string) error {
 	invData, _ := json.Marshal(inv)
 	inviteText := invitePrefix + string(invData)
 
-	return m.SendMessage(memberID, inviteText, 604800)
-}
-
-func (m *Messenger) SendGroupMessage(groupUID, text string, ttlSeconds int) error {
-	gc, err := m.store.GetGroupChat(groupUID)
-	if err != nil {
-		return fmt.Errorf("group not found: %w", err)
-	}
-
-	peer := &muninn.Peer{
-		ID:            gc.UID,
-		EncryptionKey: gc.EncPublic,
-		SignatureKey:  gc.SignPublic,
-	}
-
-	msgID := uuid.New().String()
-	return m.sendOffline(msgID, text, peer, ttlSeconds, nil)
-}
-
-func (m *Messenger) SendGroupMessageWithFiles(groupUID, text string, filePaths []string, ttlSeconds int) error {
-	gc, err := m.store.GetGroupChat(groupUID)
-	if err != nil {
-		return fmt.Errorf("group not found: %w", err)
-	}
-
-	var files []FileMeta
-	for _, fp := range filePaths {
-		meta, err := m.sendFileChunks(groupUID, fp, ttlSeconds)
-		if err != nil {
-			return fmt.Errorf("send file %s: %w", fp, err)
-		}
-		files = append(files, *meta)
-	}
-
-	if ttlSeconds <= 0 {
-		ttlSeconds = config.ChunkTTLSeconds("1w")
-	}
-
-	peer := &muninn.Peer{
-		ID:            gc.UID,
-		EncryptionKey: gc.EncPublic,
-		SignatureKey:  gc.SignPublic,
-	}
-
-	msgID := uuid.New().String()
-	return m.sendOffline(msgID, text, peer, ttlSeconds, files)
+	return m.SendMessage(memberID, inviteText, nil, 604800)
 }
 
 func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {

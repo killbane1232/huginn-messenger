@@ -325,7 +325,7 @@ func messenger_send_message(handle C.long, to, text *C.char, ttl C.int) *C.char 
 	if ttlSeconds <= 0 {
 		ttlSeconds = config.ChunkTTLSeconds(inst.cfg.ChunkTTL)
 	}
-	if err := inst.m.SendMessage(C.GoString(to), C.GoString(text), ttlSeconds); err != nil {
+	if err := inst.m.SendMessage(C.GoString(to), C.GoString(text), nil, ttlSeconds); err != nil {
 		return errorJSON(err.Error())
 	}
 	return okJSON()
@@ -341,7 +341,7 @@ func messenger_send_file(handle C.long, to, text, filePath *C.char, ttl C.int) *
 	if ttlSeconds <= 0 {
 		ttlSeconds = config.ChunkTTLSeconds(inst.cfg.ChunkTTL)
 	}
-	if err := inst.m.SendMessageWithFiles(C.GoString(to), C.GoString(text), []string{C.GoString(filePath)}, ttlSeconds); err != nil {
+	if err := inst.m.SendMessage(C.GoString(to), C.GoString(text), []string{C.GoString(filePath)}, ttlSeconds); err != nil {
 		return errorJSON(err.Error())
 	}
 	return okJSON()
@@ -477,51 +477,6 @@ func messenger_invite_to_group(handle C.long, groupUID, userID *C.char) *C.char 
 		return errorJSON("invalid handle")
 	}
 	if err := inst.m.InviteToGroupChat(C.GoString(groupUID), C.GoString(userID)); err != nil {
-		return errorJSON(err.Error())
-	}
-	return okJSON()
-}
-
-//export messenger_send_group_message
-func messenger_send_group_message(handle C.long, groupUID, text *C.char) *C.char {
-	inst := getInstance(int64(handle))
-	if inst == nil {
-		return errorJSON("invalid handle")
-	}
-	ttlSeconds := config.ChunkTTLSeconds(inst.cfg.ChunkTTL)
-	if err := inst.m.SendGroupMessage(C.GoString(groupUID), C.GoString(text), ttlSeconds); err != nil {
-		return errorJSON(err.Error())
-	}
-	return okJSON()
-}
-
-//export messenger_send_group_message_with_ttl
-func messenger_send_group_message_with_ttl(handle C.long, groupUID, text *C.char, ttl C.int) *C.char {
-	inst := getInstance(int64(handle))
-	if inst == nil {
-		return errorJSON("invalid handle")
-	}
-	ttlSeconds := int(ttl)
-	if ttlSeconds <= 0 {
-		ttlSeconds = config.ChunkTTLSeconds(inst.cfg.ChunkTTL)
-	}
-	if err := inst.m.SendGroupMessage(C.GoString(groupUID), C.GoString(text), ttlSeconds); err != nil {
-		return errorJSON(err.Error())
-	}
-	return okJSON()
-}
-
-//export messenger_send_group_file
-func messenger_send_group_file(handle C.long, groupUID, text, filePath *C.char, ttl C.int) *C.char {
-	inst := getInstance(int64(handle))
-	if inst == nil {
-		return errorJSON("invalid handle")
-	}
-	ttlSeconds := int(ttl)
-	if ttlSeconds <= 0 {
-		ttlSeconds = config.ChunkTTLSeconds(inst.cfg.ChunkTTL)
-	}
-	if err := inst.m.SendGroupMessageWithFiles(C.GoString(groupUID), C.GoString(text), []string{C.GoString(filePath)}, ttlSeconds); err != nil {
 		return errorJSON(err.Error())
 	}
 	return okJSON()

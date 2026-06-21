@@ -50,7 +50,7 @@ func TestOfflineMessageWithoutWebRTC(t *testing.T) {
 	msgCh := bob.SubscribeMessages()
 	defer bob.UnsubscribeMessages(msgCh)
 
-	err = alice.SendMessage("bob", "hello from alice without webrtc", 604800)
+	err = alice.SendMessage("bob", "hello from alice without webrtc", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +551,7 @@ func TestMessengerOfflineFlow(t *testing.T) {
 
 	t.Logf("alice peers: %d, bob peers: %d", len(alice.GetPeers()), len(bob.GetPeers()))
 
-	err = alice.SendMessage("bob", "hello from alice via offline chunks", 604800)
+	err = alice.SendMessage("bob", "hello from alice via offline chunks", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -640,7 +640,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 	t.Logf("alice peers: %d, bob peers: %d, charley peers: %d",
 		len(alice.GetPeers()), len(bob.GetPeers()), len(charley.GetPeers()))
 
-	err = alice.SendMessage("bob", "hello from alice via charley storage", 604800)
+	err = alice.SendMessage("bob", "hello from alice via charley storage", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -769,7 +769,7 @@ func TestFileSendAndReceive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = alice.SendMessageWithFiles("bob", "here is a file", []string{tmpFile}, 604800)
+	err = alice.SendMessage("bob", "here is a file", []string{tmpFile}, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -978,7 +978,7 @@ func TestGroupChatFlow(t *testing.T) {
 	aliceMsgCh := alice.SubscribeMessages()
 	defer alice.UnsubscribeMessages(aliceMsgCh)
 
-	if err := alice.SendGroupMessage(gc.UID, "hello from alice in group", 604800); err != nil {
+	if err := alice.SendMessage(gc.UID, "hello from alice in group", nil, 604800); err != nil {
 		t.Fatalf("alice send group msg: %v", err)
 	}
 
@@ -1133,7 +1133,7 @@ func TestGroupFileSendAndReceive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = alice.SendGroupMessageWithFiles(gc.UID, "here is a file in group chat", []string{tmpFile}, 604800)
+	err = alice.SendMessage(gc.UID, "here is a file in group chat", []string{tmpFile}, 604800)
 	if err != nil {
 		t.Fatalf("alice send group file msg: %v", err)
 	}
@@ -1304,7 +1304,7 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 	t.Log("WebRTC connection established, waiting for data channel to open...")
 	time.Sleep(2 * time.Second)
 
-	err = alice.SendMessage("bob", "hello via webrtc", 604800)
+	err = alice.SendMessage("bob", "hello via webrtc", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1575,7 +1575,7 @@ func TestFailedChunkRetry(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	err = alice.SendMessage("bob", "test retry failed chunks", 604800)
+	err = alice.SendMessage("bob", "test retry failed chunks", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
