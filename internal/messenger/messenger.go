@@ -204,35 +204,10 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 
 	if !o.iceSet {
 		o.iceServers = []pion.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-			{URLs: []string{"stun:stun1.l.google.com:19302"}},
-			{URLs: []string{"stun:stun2.l.google.com:19302"}},
-			{URLs: []string{"stun:stun3.l.google.com:19302"}},
-			{URLs: []string{"stun:stun4.l.google.com:19302"}},
-			{URLs: []string{"stun:stun.ekiga.net"}},
-			{URLs: []string{"stun:stun.fwdnet.net"}},
-			{URLs: []string{"stun:stun01.sipphone.com"}},
-			{URLs: []string{"stun:stun.ideasip.com"}},
-			{URLs: []string{"stun:stun.iptel.org"}},
-			{URLs: []string{"stun:stun.rixtelecom.se"}},
-			{URLs: []string{"stun:stun.schlund.de"}},
-			{URLs: []string{"stun:stun.fwdnet.net"}},
-			{URLs: []string{"stun:stun.fwdnet.net"}},
-			{URLs: []string{"stun:stun.fwdnet.net"}},
-			{URLs: []string{"stun:stun.fwdnet.net"}},
-			{URLs: []string{"stun:stun.fwdnet.net"}},
-			{URLs: []string{"stunserver.org"}},
-			{URLs: []string{"stun.softjoys.com"}},
-			{URLs: []string{"stun.voiparound.com"}},
-			{URLs: []string{"stun.voipbuster.com"}},
-			{URLs: []string{"stun.voipstunt.com"}},
-			{URLs: []string{"stun.voxgratia.org"}},
-			{URLs: []string{"stun.xten.com"}},
-			{URLs: []string{"stun.rtc.yandex.net"}},
 			{
-				URLs:       []string{"turn.webrtc.yandex.net"},
-				Username:   o.turnUser,
-				Credential: o.turnPass,
+				URLs:       []string{"turn:158.160.123.117:3478"},
+				Username:   "turnuser",
+				Credential: "turnpass",
 			},
 		}
 	}
