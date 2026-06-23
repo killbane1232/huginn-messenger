@@ -141,7 +141,7 @@ func (s *Server) handleSaveConfig(w http.ResponseWriter, r *http.Request) {
 		s.cfg.TurnPassword = req.TurnPass
 	}
 
-	if err := s.cfg.Save(); err != nil {
+	if err := s.messenger.SaveConfig(s.cfg); err != nil {
 		http.Error(w, "failed to save config: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -477,7 +477,7 @@ var indexHTML = `<!DOCTYPE html>
       <input type="text" id="cfg-username" placeholder="your username">
 
       <label for="cfg-muninn">Muninn address</label>
-      <input type="text" id="cfg-muninn" placeholder="http://localhost:8080">
+      <input type="text" id="cfg-muninn" placeholder="http://158.160.123.117:3080">
 
       <label for="cfg-ui-port">UI port (0 = random)</label>
       <input type="number" id="cfg-ui-port" placeholder="0">

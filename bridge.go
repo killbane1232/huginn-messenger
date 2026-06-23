@@ -19,11 +19,10 @@ import (
 )
 
 type instance struct {
-	m          *messenger.Messenger
-	cfg        *config.Config
-	configPath string
-	events     chan Event
-	done       chan struct{}
+	m      *messenger.Messenger
+	cfg    *config.Config
+	events chan Event
+	done   chan struct{}
 }
 
 type Event struct {
@@ -72,7 +71,7 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 		return -1
 	}
 	if goMuninn == "" {
-		goMuninn = "http://localhost:8080"
+		goMuninn = "http://158.160.123.117:3080"
 	}
 	if goDB == "" {
 		goDB = "huginn.db"
@@ -85,8 +84,6 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 	if err == nil {
 		goDB = absDB
 	}
-	dbDir := filepath.Dir(goDB)
-	configPath := filepath.Join(dbDir, "config.conf")
 
 	cfg := &config.Config{
 		Username:     goUser,
@@ -99,78 +96,59 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 		TurnPassword: goTurnPass,
 	}
 
-	mergeConfig := func(saved *config.Config) {
-		if saved.Username != "" {
-			cfg.Username = saved.Username
-		}
-		if saved.MuninnAddr != "" {
-			cfg.MuninnAddr = saved.MuninnAddr
-		}
-		if saved.DBPath != "" {
-			cfg.DBPath = saved.DBPath
-		}
-		if saved.ChunkTTL != "" {
-			cfg.ChunkTTL = saved.ChunkTTL
-		}
-		if saved.PeerFlag != "" {
-			cfg.PeerFlag = saved.PeerFlag
-		}
-		if saved.TurnAddr != "" {
-			cfg.TurnAddr = saved.TurnAddr
-		}
-		if saved.TurnUsername != "" {
-			cfg.TurnUsername = saved.TurnUsername
-		}
-		if saved.TurnPassword != "" {
-			cfg.TurnPassword = saved.TurnPassword
-		}
-	}
-
-	home, _ := os.UserHomeDir()
-	exe, _ := os.Executable()
-
-	searchPaths := []string{configPath, "config.conf"}
-	if exe != "" {
-		searchPaths = append(searchPaths, filepath.Join(filepath.Dir(exe), "config.conf"))
-	}
-	if home != "" {
-		searchPaths = append(searchPaths, filepath.Join(home, ".config", "huginn", "config.conf"))
-	}
-
-	found := false
-	for _, p := range searchPaths {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		var saved config.Config
-		if err := json.Unmarshal(data, &saved); err != nil {
-			continue
-		}
-		mergeConfig(&saved)
-		configPath = p
-		found = true
-		log.Printf("config loaded from %s, username=%s", configPath, cfg.Username)
-		break
-	}
-	if !found {
-		log.Printf("config.conf not found in any of %v, using defaults", searchPaths)
-	}
-
 	mc := muninn.NewClient(cfg.MuninnAddr)
 
 	mOpts := []messenger.MessengerOption{
 		messenger.WithPeerFlag(muninn.PeerFlag(cfg.PeerFlag)),
 		messenger.WithTURN(cfg.TurnAddr, cfg.TurnUsername, cfg.TurnPassword),
 	}
-	if cfg.PeerID != "" {
-		mOpts = append(mOpts, messenger.WithPeerID(cfg.PeerID))
-	}
 	m, err := messenger.New(cfg.Username, mc, cfg.DBPath, mOpts...)
 	if err != nil {
 		log.Printf("messenger_create: %v", err)
 		return -2
 	}
+
+	storedCfg := m.Config()
+	if storedCfg.Username != "" {
+		cfg.Username = storedCfg.Username
+	}
+	if storedCfg.MuninnAddr != "" {
+		cfg.MuninnAddr = storedCfg.MuninnAddr
+	}
+	if storedCfg.ChunkTTL != "" {
+		cfg.ChunkTTL = storedCfg.ChunkTTL
+	}
+	if storedCfg.PeerFlag != "" {
+		cfg.PeerFlag = storedCfg.PeerFlag
+	}
+	if storedCfg.TurnAddr != "" {
+		cfg.TurnAddr = storedCfg.TurnAddr
+	}
+	if storedCfg.TurnUsername != "" {
+		cfg.TurnUsername = storedCfg.TurnUsername
+	}
+	if storedCfg.TurnPassword != "" {
+		cfg.TurnPassword = storedCfg.TurnPassword
+	}
+	if storedCfg.PeerID != "" {
+		cfg.PeerID = storedCfg.PeerID
+	}
+	cfg.DBPath = goDB
+	if goTurnAddr != "" {
+		cfg.TurnAddr = goTurnAddr
+		cfg.TurnUsername = goTurnUser
+		cfg.TurnPassword = goTurnPass
+	}
+	if goMuninn != "" && goMuninn != "http://158.160.123.117:3080" {
+		cfg.MuninnAddr = goMuninn
+	}
+	if goTTL != "" && goTTL != "1w" {
+		cfg.ChunkTTL = goTTL
+	}
+	if err := m.SaveConfig(cfg); err != nil {
+		log.Printf("save config to db: %v", err)
+	}
+	log.Printf("config loaded from db, username=%s", cfg.Username)
 
 	go func() {
 		if err := m.Register(); err != nil {
@@ -179,11 +157,10 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 	}()
 
 	inst := &instance{
-		m:          m,
-		cfg:        cfg,
-		configPath: configPath,
-		events:     make(chan Event, 100),
-		done:       make(chan struct{}),
+		m:      m,
+		cfg:    cfg,
+		events: make(chan Event, 100),
+		done:   make(chan struct{}),
 	}
 
 	go inst.eventLoop()
@@ -194,8 +171,10 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 func (inst *instance) eventLoop() {
 	peerCh := inst.m.SubscribePeers()
 	msgCh := inst.m.SubscribeMessages()
+	fileReadyCh := inst.m.SubscribeFileReady()
 	defer inst.m.UnsubscribePeers(peerCh)
 	defer inst.m.UnsubscribeMessages(msgCh)
+	defer inst.m.UnsubscribeFileReady(fileReadyCh)
 
 	for {
 		select {
@@ -218,6 +197,10 @@ func (inst *instance) eventLoop() {
 		case msg := <-msgCh:
 			data, _ := json.Marshal(msg)
 			inst.pushEvent("message", data)
+
+		case fileReady := <-fileReadyCh:
+			data, _ := json.Marshal(fileReady)
+			inst.pushEvent("file_ready", data)
 
 		case <-inst.done:
 			return
@@ -406,8 +389,7 @@ func messenger_save_config(handle C.long, jsonConfig *C.char) *C.char {
 	if req.TurnPass != "" {
 		inst.cfg.TurnPassword = req.TurnPass
 	}
-	data, _ := json.MarshalIndent(inst.cfg, "", "  ")
-	if err := os.WriteFile(inst.configPath, data, 0644); err != nil {
+	if err := inst.m.SaveConfig(inst.cfg); err != nil {
 		return errorJSON("failed to save: " + err.Error())
 	}
 	return okJSON()
@@ -518,6 +500,23 @@ func messenger_apply_relogin_signature(handle C.long, signature *C.char) *C.char
 	if err := inst.m.ApplyReloginSignature(C.GoString(signature)); err != nil {
 		return errorJSON(err.Error())
 	}
+	return okJSON()
+}
+
+//export messenger_set_downloads_dir
+func messenger_set_downloads_dir(handle C.long, dir *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	goDir := C.GoString(dir)
+	if goDir == "" {
+		return errorJSON("empty path")
+	}
+	if err := os.MkdirAll(goDir, 0755); err != nil {
+		return errorJSON("mkdir: " + err.Error())
+	}
+	inst.m.SetDownloadsDir(goDir)
 	return okJSON()
 }
 

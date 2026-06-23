@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	pion "github.com/pion/webrtc/v3"
+	pion "github.com/pion/webrtc/v4"
 )
 
 const (
@@ -115,7 +115,19 @@ func (c *RTCClient) Connect(ctx context.Context) error {
 		ICEServers: c.iceServers,
 	}
 
-	pc, err := pion.NewPeerConnection(config)
+	se := pion.SettingEngine{}
+
+	// Полезно на Android: не собирать IPv6-кандидаты.
+	se.SetNetworkTypes([]pion.NetworkType{
+		pion.NetworkTypeUDP4,
+	})
+
+	// Не включайте SetLite(true) на мобильном клиенте.
+	// ICE Lite предназначен для публичного/серверного ICE-агента,
+	// а не как обход Android.
+	api := pion.NewAPI(pion.WithSettingEngine(se))
+
+	pc, err := api.NewPeerConnection(config)
 	if err != nil {
 		return fmt.Errorf("new pc: %w", err)
 	}

@@ -7,7 +7,7 @@ import (
 	"time"
 	"log"
 
-	pion "github.com/pion/webrtc/v3"
+	pion "github.com/pion/webrtc/v4"
 )
 
 type ChatMessage struct {
@@ -198,7 +198,19 @@ func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, erro
 	}
 	m.mu.Unlock()
 
-	pc, err := pion.NewPeerConnection(m.config)
+	se := pion.SettingEngine{}
+
+	// Полезно на Android: не собирать IPv6-кандидаты.
+	se.SetNetworkTypes([]pion.NetworkType{
+		pion.NetworkTypeUDP4,
+	})
+
+	// Не включайте SetLite(true) на мобильном клиенте.
+	// ICE Lite предназначен для публичного/серверного ICE-агента,
+	// а не как обход Android.
+	api := pion.NewAPI(pion.WithSettingEngine(se))
+
+	pc, err := api.NewPeerConnection(m.config)
 	if err != nil {
 		return nil, fmt.Errorf("new pc: %w", err)
 	}

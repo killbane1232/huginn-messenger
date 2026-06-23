@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
-	"os"
 
 	"golang.org/x/crypto/curve25519"
 )
@@ -21,11 +20,7 @@ type KeyFile struct {
 	EncPublic   string `json:"enc_public"`
 }
 
-func LoadKeys(path string) (ed25519.PublicKey, ed25519.PrivateKey, []byte, []byte, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
+func ParseKeyFile(data []byte) (ed25519.PublicKey, ed25519.PrivateKey, []byte, []byte, error) {
 	var kf KeyFile
 	if err := json.Unmarshal(data, &kf); err != nil {
 		return nil, nil, nil, nil, err
@@ -49,18 +44,14 @@ func LoadKeys(path string) (ed25519.PublicKey, ed25519.PrivateKey, []byte, []byt
 	return ed25519.PublicKey(signPub), ed25519.PrivateKey(signPriv), encPriv, encPub, nil
 }
 
-func SaveKeys(path string, signPub ed25519.PublicKey, signPriv ed25519.PrivateKey, encPriv, encPub []byte) error {
+func FormatKeyFile(signPub ed25519.PublicKey, signPriv ed25519.PrivateKey, encPriv, encPub []byte) ([]byte, error) {
 	kf := KeyFile{
 		SignPublic:  EncodeKey(signPub),
 		SignPrivate: EncodeKey(signPriv),
 		EncPrivate:  EncodeKey(encPriv),
 		EncPublic:   EncodeKey(encPub),
 	}
-	data, err := json.MarshalIndent(kf, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
+	return json.MarshalIndent(kf, "", "  ")
 }
 
 func GenerateSigningKey() (ed25519.PublicKey, ed25519.PrivateKey, error) {

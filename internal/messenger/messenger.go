@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,7 +24,8 @@ import (
 	"github.com/killbane1232/huginn-messenger/internal/store"
 	"github.com/killbane1232/huginn-messenger/internal/webrtc"
 	"github.com/google/uuid"
-	pion "github.com/pion/webrtc/v3"
+    "runtime/debug"
+	pion "github.com/pion/webrtc/v4"
 )
 
 type ChatMessage struct {
@@ -45,6 +47,13 @@ type FileMeta struct {
 type pendingFileDownload struct {
 	fileMeta  FileMeta
 	senderID  string
+}
+
+type FileReadyEvent struct {
+	FileID   string `json:"file_id"`
+	FilePath string `json:"file_path"`
+	Filename string `json:"filename"`
+	SenderID string `json:"sender_id"`
 }
 
 type MessagePayload struct {
@@ -117,6 +126,8 @@ type Messenger struct {
 	subsMu     sync.Mutex
 	msgSubs    []chan ChatMessage
 	msgSubsMu  sync.Mutex
+	fileReadySubs   []chan FileReadyEvent
+	fileReadySubsMu sync.Mutex
 
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -129,8 +140,7 @@ type Messenger struct {
 	processingMsg map[string]bool
 	processingMu  sync.Mutex
 
-	keysPath    string
-	configPath  string
+	appConfig *config.Config
 	reloginMu   sync.Mutex
 	reloginKeys string
 }
@@ -141,10 +151,29 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		opt(&o)
 	}
 
-	keysPath := filepath.Join(filepath.Dir(dbPath), "keys.conf")
-	configPath := filepath.Join(filepath.Dir(dbPath), "config.conf")
-	signPub, signPriv, encPriv, encPub, err := crypto.LoadKeys(keysPath)
+	st, err := store.New(dbPath)
 	if err != nil {
+		return nil, fmt.Errorf("open store: %w", err)
+	}
+
+	dbDir := filepath.Dir(dbPath)
+	if err := st.ImportLegacyFiles(dbDir); err != nil {
+		log.Printf("import legacy config files: %v", err)
+	}
+
+	var signPub ed25519.PublicKey
+	var signPriv ed25519.PrivateKey
+	var encPriv, encPub []byte
+
+	keysJSON, keysErr := st.GetKeysJSON()
+	if keysErr == nil {
+		signPub, signPriv, encPriv, encPub, err = crypto.ParseKeyFile([]byte(keysJSON))
+		if err != nil {
+			return nil, fmt.Errorf("parse stored keys: %w", err)
+		}
+	} else if !errors.Is(keysErr, store.ErrConfigNotFound) {
+		return nil, fmt.Errorf("load keys: %w", keysErr)
+	} else {
 		signPub, signPriv, err = crypto.GenerateSigningKey()
 		if err != nil {
 			return nil, fmt.Errorf("generate signing key: %w", err)
@@ -153,14 +182,31 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		if err != nil {
 			return nil, fmt.Errorf("generate encryption key: %w", err)
 		}
-			if err := crypto.SaveKeys(keysPath, signPub, signPriv, encPriv, encPub); err != nil {
-			log.Printf("save keys to %s: %v", keysPath, err)
+		keyData, err := crypto.FormatKeyFile(signPub, signPriv, encPriv, encPub)
+		if err != nil {
+			return nil, fmt.Errorf("format keys: %w", err)
+		}
+		if err := st.SaveKeysJSON(string(keyData)); err != nil {
+			log.Printf("save keys to db: %v", err)
 		}
 	}
 
-	st, err := store.New(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open store: %w", err)
+	appCfg := &config.Config{DBPath: dbPath}
+	if storedCfg, err := st.LoadAppConfig(); err == nil {
+		*appCfg = *storedCfg
+		appCfg.DBPath = dbPath
+	}
+	if username != "" {
+		appCfg.Username = username
+	}
+	if appCfg.ChunkTTL == "" {
+		appCfg.ChunkTTL = "1w"
+	}
+	if appCfg.PeerFlag == "" {
+		appCfg.PeerFlag = "thin"
+	}
+	if err := st.SaveAppConfig(appCfg); err != nil {
+		log.Printf("save initial config to db: %v", err)
 	}
 
 	downloadsDir := filepath.Join(filepath.Dir(dbPath), "downloads", "huginn")
@@ -174,7 +220,11 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 
 	peerID := o.peerID
 	if peerID == "" {
-		peerID = username
+		if appCfg.PeerID != "" {
+			peerID = appCfg.PeerID
+		} else {
+			peerID = username
+		}
 	}
 	m := &Messenger{
 		ID:       peerID,
@@ -198,8 +248,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 
 		pendingFileDownloads: make(map[string]*pendingFileDownload),
 		processingMsg:       make(map[string]bool),
-		keysPath:            keysPath,
-		configPath:          configPath,
+		appConfig:           appCfg,
 	}
 
 	if !o.iceSet {
@@ -399,6 +448,7 @@ func (m *Messenger) rtcReconnectLoop() {
 		log.Printf("[rtc] attempting to reconnect to muninn...")
 		if err := m.rtcClient.Connect(m.ctx); err != nil {
 			log.Printf("[rtc] reconnect failed: %v", err)
+			log.Printf("[rtc] reconnect stack:\n%s", debug.Stack())
 			continue
 		}
 		log.Printf("[rtc] reconnected to muninn")
@@ -1152,8 +1202,12 @@ func (m *Messenger) ApplyReloginSignature(signature string) error {
 		data := m.reloginKeys
 		m.reloginMu.Unlock()
 		if data != "" {
-			if err := os.WriteFile(m.keysPath, []byte(data), 0600); err != nil {
+			if err := m.store.SaveKeysJSON(data); err != nil {
 				return fmt.Errorf("save keys: %w", err)
+			}
+			m.signPublic, m.signPrivate, m.encPrivate, m.encPublic, err = crypto.ParseKeyFile([]byte(data))
+			if err != nil {
+				return fmt.Errorf("parse relogin keys: %w", err)
 			}
 			m.ID = peer.ID
 			peerUsername := peer.ID
@@ -1162,15 +1216,13 @@ func (m *Messenger) ApplyReloginSignature(signature string) error {
 			}
 			m.Username = peerUsername
 
-			cfg := &config.Config{Username: peerUsername, PeerID: peer.ID}
-			if existing, err := os.ReadFile(m.configPath); err == nil {
-				json.Unmarshal(existing, cfg)
-				cfg.Username = peerUsername
-				cfg.PeerID = peer.ID
-				cfg.Save()
+			if m.appConfig == nil {
+				m.appConfig = &config.Config{}
 			}
-			if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
-				os.WriteFile(m.configPath, data, 0644)
+			m.appConfig.Username = peerUsername
+			m.appConfig.PeerID = peer.ID
+			if err := m.store.SaveAppConfig(m.appConfig); err != nil {
+				return fmt.Errorf("save config: %w", err)
 			}
 			return nil
 		}
@@ -1201,12 +1253,12 @@ func (m *Messenger) handleReloginRequest(peerID string, req webrtc.ReloginReques
 		log.Printf("relogin: invalid signature from %s", peerID)
 		return
 	}
-	keysData, err := os.ReadFile(m.keysPath)
+	keysData, err := m.store.GetKeysJSON()
 	if err != nil {
-		log.Printf("relogin: read keys.conf: %v", err)
+		log.Printf("relogin: read keys from db: %v", err)
 		return
 	}
-	m.rtcManager.SendReloginResponse(peerID, webrtc.ReloginResponse{KeysData: string(keysData)})
+	m.rtcManager.SendReloginResponse(peerID, webrtc.ReloginResponse{KeysData: keysData})
 }
 
 func (m *Messenger) handleReloginResponse(peerID string, resp webrtc.ReloginResponse) {
@@ -1888,6 +1940,13 @@ func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {
 	m.pendingMu.Lock()
 	delete(m.pendingFileDownloads, f.FileID)
 	m.pendingMu.Unlock()
+
+	m.notifyFileReady(FileReadyEvent{
+		FileID:   f.FileID,
+		FilePath: fp,
+		Filename: f.Filename,
+		SenderID: senderID,
+	})
 }
 
 func (m *Messenger) requestMissingChunk(fileID string, chunkIndex int, senderID string) {
@@ -2039,8 +2098,43 @@ func (m *Messenger) UnsubscribeMessages(ch chan ChatMessage) {
 	m.msgSubsMu.Unlock()
 }
 
+func (m *Messenger) SubscribeFileReady() chan FileReadyEvent {
+	ch := make(chan FileReadyEvent, 50)
+	m.fileReadySubsMu.Lock()
+	m.fileReadySubs = append(m.fileReadySubs, ch)
+	m.fileReadySubsMu.Unlock()
+	return ch
+}
+
+func (m *Messenger) UnsubscribeFileReady(ch chan FileReadyEvent) {
+	m.fileReadySubsMu.Lock()
+	for i, c := range m.fileReadySubs {
+		if c == ch {
+			m.fileReadySubs = append(m.fileReadySubs[:i], m.fileReadySubs[i+1:]...)
+			close(ch)
+			break
+		}
+	}
+	m.fileReadySubsMu.Unlock()
+}
+
+func (m *Messenger) notifyFileReady(evt FileReadyEvent) {
+	m.fileReadySubsMu.Lock()
+	for _, sub := range m.fileReadySubs {
+		select {
+		case sub <- evt:
+		default:
+		}
+	}
+	m.fileReadySubsMu.Unlock()
+}
+
 func (m *Messenger) DownloadsDir() string {
 	return m.downloadsDir
+}
+
+func (m *Messenger) SetDownloadsDir(dir string) {
+	m.downloadsDir = dir
 }
 
 func (m *Messenger) StoredChunkData(fileID string, chunkIndex int) ([]byte, bool) {
@@ -2065,6 +2159,21 @@ func (m *Messenger) ListFailedChunks() ([]store.FailedChunk, error) {
 
 func (m *Messenger) IsChunkFailed(fileID string, chunkIndex int) bool {
 	return m.store.IsChunkFailed(fileID, chunkIndex)
+}
+
+func (m *Messenger) Config() *config.Config {
+	if m.appConfig == nil {
+		return &config.Config{}
+	}
+	return m.appConfig
+}
+
+func (m *Messenger) SaveConfig(cfg *config.Config) error {
+	if cfg == nil {
+		return fmt.Errorf("config is nil")
+	}
+	m.appConfig = cfg
+	return m.store.SaveAppConfig(cfg)
 }
 
 func (m *Messenger) Shutdown() {

@@ -20,7 +20,22 @@ import (
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 	"github.com/killbane1232/huginn-messenger/internal/messenger"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
+	"github.com/killbane1232/huginn-messenger/internal/store"
 )
+
+func keysJSONFromDB(t *testing.T, dbPath string) ([]byte, error) {
+	t.Helper()
+	st, err := store.New(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	keysJSON, err := st.GetKeysJSON()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(keysJSON), nil
+}
 
 func TestOfflineMessageWithoutWebRTC(t *testing.T) {
 	mn := newTestMuninnServer()
@@ -1436,14 +1451,11 @@ func TestReloginFlow(t *testing.T) {
 	}
 	time.Sleep(2 * time.Second)
 
-	aliceKeysPath := filepath.Join(filepath.Dir(aliceDB), "keys.conf")
-	bobKeysPath := filepath.Join(filepath.Dir(bobDB), "keys.conf")
-
-	aliceKeysBefore, err := os.ReadFile(aliceKeysPath)
+	aliceKeysBefore, err := keysJSONFromDB(t, aliceDB)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bobKeysBefore, err := os.ReadFile(bobKeysPath)
+	bobKeysBefore, err := keysJSONFromDB(t, bobDB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1489,7 +1501,7 @@ func TestReloginFlow(t *testing.T) {
 		t.Logf("correctly rejected: %v", err)
 	})
 
-	bobKeysAfterFail, err := os.ReadFile(bobKeysPath)
+	bobKeysAfterFail, err := keysJSONFromDB(t, bobDB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1513,12 +1525,12 @@ func TestReloginFlow(t *testing.T) {
 			t.Fatalf("relogin failed: %v", err)
 		}
 
-		bobKeysAfter, err := os.ReadFile(bobKeysPath)
+		bobKeysAfter, err := keysJSONFromDB(t, bobDB)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		aliceKeysAfter, err := os.ReadFile(aliceKeysPath)
+		aliceKeysAfter, err := keysJSONFromDB(t, aliceDB)
 		if err != nil {
 			t.Fatal(err)
 		}
