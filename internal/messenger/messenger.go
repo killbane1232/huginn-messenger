@@ -307,7 +307,7 @@ func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest
 	// Если мы не являемся конечным получателем — подтверждаем получение на сервере
 	if req.RecipientID != "" && req.RecipientID != m.ID && req.Hash != "" && req.Signature != "" {
 		confirmReq := muninn.ConfirmChunkRequest{
-			RecipientID: m.ID,
+			RecipientID: req.RecipientID,
 			FileID:      req.FileID,
 			ChunkIndex:  req.ChunkIndex,
 			Hash:        req.Hash,
