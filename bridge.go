@@ -71,7 +71,7 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 		return -1
 	}
 	if goMuninn == "" {
-		goMuninn = "http://158.160.123.117:3080"
+		goMuninn = "https://muninn.evil-bread.ru"
 	}
 	if goDB == "" {
 		goDB = "huginn.db"
@@ -139,7 +139,7 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 		cfg.TurnUsername = goTurnUser
 		cfg.TurnPassword = goTurnPass
 	}
-	if goMuninn != "" && goMuninn != "http://158.160.123.117:3080" {
+	if goMuninn != "" && goMuninn != "https://muninn.evil-bread.ru" {
 		cfg.MuninnAddr = goMuninn
 	}
 	if goTTL != "" && goTTL != "1w" {

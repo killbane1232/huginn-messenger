@@ -192,12 +192,20 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	}
 
 	appCfg := &config.Config{DBPath: dbPath}
-	if storedCfg, err := st.LoadAppConfig(); err == nil {
+	storedCfg, cfgErr := st.LoadAppConfig()
+	switch {
+	case cfgErr == nil:
 		*appCfg = *storedCfg
 		appCfg.DBPath = dbPath
-	}
-	if username != "" {
+		if appCfg.Username == "" && username != "" {
+			appCfg.Username = username
+			log.Printf("messenger: using passed username (stored had empty)")
+		}
+	case errors.Is(cfgErr, store.ErrConfigNotFound) && username != "":
 		appCfg.Username = username
+		log.Printf("messenger: new config with username=%q", username)
+	default:
+		log.Printf("messenger: cfgErr=%v, username=%q", cfgErr, username)
 	}
 	if appCfg.ChunkTTL == "" {
 		appCfg.ChunkTTL = "1w"
@@ -208,6 +216,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	if err := st.SaveAppConfig(appCfg); err != nil {
 		log.Printf("save initial config to db: %v", err)
 	}
+	log.Printf("messenger: final username=%q", appCfg.Username)
 
 	downloadsDir := filepath.Join(filepath.Dir(dbPath), "downloads", "huginn")
 	if err := os.MkdirAll(downloadsDir, 0755); err != nil {
@@ -218,17 +227,14 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	signalChan := make(chan muninn.Signal, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	peerID := o.peerID
+	peerID := appCfg.Username
 	if peerID == "" {
-		if appCfg.PeerID != "" {
-			peerID = appCfg.PeerID
-		} else {
-			peerID = username
-		}
+		peerID = crypto.EncodeKey(signPub)
 	}
+	appCfg.PeerID = peerID
 	m := &Messenger{
 		ID:       peerID,
-		Username: username,
+		Username: appCfg.Username,
 
 		signPublic:  signPub,
 		signPrivate: signPriv,
@@ -251,31 +257,22 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		appConfig:           appCfg,
 	}
 
-	if !o.iceSet {
-		o.iceServers = []pion.ICEServer{
-			{
-				URLs:       []string{"turn:158.160.123.117:3478"},
-				Username:   "turnuser",
-				Credential: "turnpass",
+	o.iceServers = []pion.ICEServer{
+		{
+			URLs:       []string{
+				"turn:stun.evil-bread.ru:3478",
+				"turn:turn.evil-bread.ru:3478?transport=udp",
+				"turn:turn.evil-bread.ru:3478?transport=tcp",
+				"turns:turn.evil-bread.ru:5349?transport=tcp",
 			},
-		}
+			Username:   "turnuser",
+			Credential: "turnpass",
+		},
 	}
-	if o.turnAddr != "" {
-		o.iceServers = append(o.iceServers,
-			pion.ICEServer{
-				URLs:       []string{"turn:" + o.turnAddr},
-				Username:   o.turnUser,
-				Credential: o.turnPass,
-			},
-			pion.ICEServer{
-				URLs: []string{"stun:" + o.turnAddr},
-			},
-		)
-	}
-	m.rtcManager = webrtc.NewManager(username, rtcMsgChan, m.handleChunkStore, m.handleChunkGet,
+	m.rtcManager = webrtc.NewManager(peerID, rtcMsgChan, m.handleChunkStore, m.handleChunkGet,
 		m.handleReloginRequest, m.handleReloginResponse, o.iceServers)
 
-	m.rtcClient = muninn.NewRTCClient(muninnClient.BaseURL(), username, o.iceServers)
+	m.rtcClient = muninn.NewRTCClient(muninnClient.BaseURL(), peerID, o.iceServers)
 	m.rtcClient.SetOnSignal(func(sig muninn.Signal) {
 		select {
 		case m.signalChan <- sig:
@@ -563,7 +560,7 @@ func (m *Messenger) Register() error {
 		EncryptionKey: crypto.EncodeKey(m.encPublic),
 		SignatureKey:  crypto.EncodeKey(m.signPublic),
 		Metadata: map[string]string{
-			"username": m.ID,
+			"username": m.Username,
 			"type":     "huginn-messenger",
 		},
 		TTLSeconds: 120,
@@ -818,22 +815,14 @@ func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []st
 				}
 			}
 
-			if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
-				log.Printf("distribute batch %s to %s: %v", fileID, pid, err)
+			if err := m.muninnClient.RegisterChunks(m.ctx, fileID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
+				log.Printf("register batch %s on %s: %v", fileID, pid, err)
 				continue
 			}
 
-			if err := m.muninnClient.RegisterChunks(m.ctx, fileID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
-				log.Printf("register batch %s on %s: %v", fileID, pid, err)
-				/*
-				for _, c := range fileChunks {
-					if err := m.muninnClient.RegisterChunk(m.ctx, c.FileID, c.ChunkIndex, muninn.RegisterChunkRequest{
-						SenderID: c.SenderID, RecipientID: c.RecipientID,
-						Hash: c.Hash, Signature: c.Signature, PeerID: pid,
-					}); err != nil {
-						log.Printf("register chunk %s/%d on %s fallback warning: %v", c.FileID, c.ChunkIndex, pid, err)
-					}
-				}*/
+			if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
+				log.Printf("distribute batch %s to %s: %v", fileID, pid, err)
+				continue
 			}
 
 			for _, c := range fileChunks {
@@ -1067,12 +1056,13 @@ func (m *Messenger) sendFileChunks(recipientID, filePath string, ttlSeconds int)
 			}
 		}
 
-		if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
-			log.Printf("distribute file chunks %s to %s: %v", fileID, pid, err)
-		}
-
 		if err := m.muninnClient.RegisterChunks(m.ctx, fileID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
 			log.Printf("register file chunks %s on %s: %v", fileID, pid, err)
+			continue
+		}
+
+		if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
+			log.Printf("distribute file chunks %s to %s: %v", fileID, pid, err)
 		}
 	}
 
@@ -1375,22 +1365,13 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		}
 
 		batch := make([]webrtc.ChunkStoreRequest, len(chunks))
+		regBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
 		for i, c := range chunks {
 			batch[i] = webrtc.ChunkStoreRequest{
 				FileID: msgID, ChunkIndex: i, Data: c.envData,
 				SenderID: m.ID, RecipientID: peer.ID, Hash: c.hash,
 				Signature: c.sig, TTLSeconds: ttlSeconds,
 			}
-		}
-		if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
-			continue
-		}
-		for i := range chunks {
-			storedOnPeers[i] = append(storedOnPeers[i], pid)
-		}
-
-		regBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
-		for i, c := range chunks {
 			regBatch[i] = muninn.RegisterChunkBatchEntry{
 				ChunkIndex: i, SenderID: m.ID, RecipientID: peer.ID,
 				Hash: c.hash, Signature: c.sig, PeerID: pid,
@@ -1398,14 +1379,13 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		}
 		if err := m.muninnClient.RegisterChunks(m.ctx, msgID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
 			log.Printf("register batch %s on %s: %v", msgID, pid, err)
-			/*
-			for i, c := range chunks {
-				if err := m.muninnClient.RegisterChunk(m.ctx, msgID, i, muninn.RegisterChunkRequest{
-					SenderID: m.ID, RecipientID: peer.ID, Hash: c.hash, Signature: c.sig, PeerID: pid,
-				}); err != nil {
-					log.Printf("register chunk %d on %s fallback warning: %v", i, pid, err)
-				}
-			}*/
+			continue
+		}
+		if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
+			continue
+		}
+		for i := range chunks {
+			storedOnPeers[i] = append(storedOnPeers[i], pid)
 		}
 	}
 
@@ -1436,6 +1416,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 }
 
 func (m *Messenger) checkPendingMessages() {
+	log.Printf("check pending messages for %s", m.ID)
 	m.checkRecipientMessages(m.ID)
 
 	groups, err := m.store.GetGroupChats()
@@ -1449,24 +1430,39 @@ func (m *Messenger) checkPendingMessages() {
 
 func (m *Messenger) checkRecipientMessages(recipientID string) {
 	lastCheck := m.store.GetLastChunkCheck(recipientID)
-	chunks, err := m.muninnClient.GetChunksByRecipient(m.ctx, recipientID, lastCheck)
+	chunks, err := m.muninnClient.GetChunksByRecipient(m.ctx, recipientID, lastCheck-30)
 	if err != nil {
+		log.Printf("check %s: GetChunksByRecipient err: %v", recipientID, err)
 		return
 	}
-	m.store.SetLastChunkCheck(recipientID, time.Now().Unix())
+	if len(chunks) == 0 {
+		m.retryFailedChunks(recipientID)
+		return
+	}
+	log.Printf("check %s: got %d chunk records", recipientID, len(chunks))
+	newLastCheck := int64(0)
 	if len(chunks) > 0 {
 		byMsg := make(map[string][]muninn.ChunkRecord)
 		for _, c := range chunks {
 			if m.store.IsChunkFailed(c.FileID, c.ChunkIndex) {
+				log.Printf("check %s: skip failed chunk %s/%d", recipientID, c.FileID, c.ChunkIndex)
 				continue
 			}
+			log.Printf("check %s: chunk %s/%d confirmed=%v peer=%s", recipientID, c.FileID, c.ChunkIndex, c.Confirmed, c.PeerID)
 			byMsg[c.FileID] = append(byMsg[c.FileID], c)
+			if c.CreatedAt > newLastCheck {
+				newLastCheck = c.CreatedAt
+			}
 		}
+		log.Printf("check %s: %d unique messages", recipientID, len(byMsg))
 		for msgID, msgChunks := range byMsg {
 			m.collectAndProcessMessage(msgID, msgChunks)
 		}
 	}
 
+	if newLastCheck > 0 {
+		m.store.SetLastChunkCheck(recipientID, newLastCheck)
+	}
 	m.retryFailedChunks(recipientID)
 }
 
@@ -2012,6 +2008,7 @@ func (m *Messenger) getChunkData(rec muninn.ChunkRecord) ([]byte, bool) {
 		return nil, false
 	}
 
+	log.Printf("send chunk get to %s", rec.PeerID)
 	if m.IsPeerConnected(rec.PeerID) {
 		m.rtcManager.SendChunkGet(rec.PeerID, webrtc.ChunkGetRequest{
 			FileID:     rec.FileID,

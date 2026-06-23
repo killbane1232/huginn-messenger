@@ -477,7 +477,7 @@ var indexHTML = `<!DOCTYPE html>
       <input type="text" id="cfg-username" placeholder="your username">
 
       <label for="cfg-muninn">Muninn address</label>
-      <input type="text" id="cfg-muninn" placeholder="http://158.160.123.117:3080">
+      <input type="text" id="cfg-muninn" placeholder="https://muninn.evil-bread.ru">
 
       <label for="cfg-ui-port">UI port (0 = random)</label>
       <input type="number" id="cfg-ui-port" placeholder="0">

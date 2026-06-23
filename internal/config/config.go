@@ -28,7 +28,7 @@ const configPath = "config.conf"
 
 func Parse() *Config {
 	c := &Config{
-		MuninnAddr: "http://158.160.123.117:3080",
+		MuninnAddr: "https://muninn.evil-bread.ru",
 		DBPath:     "huginn.db",
 		ChunkTTL:   "1w",
 		PeerFlag:   "thin",
