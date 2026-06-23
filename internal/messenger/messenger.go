@@ -304,20 +304,23 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 }
 
 func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest) {
-	// Если мы не являемся конечным получателем — подтверждаем получение на сервере
-	if req.RecipientID != "" && req.RecipientID != m.ID && req.Hash != "" && req.Signature != "" {
-		confirmReq := muninn.ConfirmChunkRequest{
-			RecipientID: req.RecipientID,
-			FileID:      req.FileID,
-			ChunkIndex:  req.ChunkIndex,
-			Hash:        req.Hash,
-			Signature:   req.Signature,
+	// Если мы не являемся конечным получателем — сообщаем серверу, что сохранили чанк
+	if req.RecipientID != "" && req.RecipientID != m.ID && req.Hash != "" && req.SenderID != "" {
+		reportedPayload := fmt.Sprintf("muninn/reported/v1\n%s\n%d\n%s\n%s",
+			req.FileID, req.ChunkIndex, req.Hash, req.SenderID)
+		sig := crypto.Sign(m.signPrivate, []byte(reportedPayload))
+		reportReq := muninn.ChunkReportRequest{
+			ReporterID: m.ID,
+			FileID:     req.FileID,
+			ChunkIndex: req.ChunkIndex,
+			Hash:       req.Hash,
+			Signature:  crypto.EncodeKey(sig),
 		}
-		if _, err := m.muninnClient.ConfirmChunk(m.ctx, confirmReq); err != nil {
-			log.Printf("confirm chunk %s/%d failed, not saving: %v", req.FileID, req.ChunkIndex, err)
+		if err := m.muninnClient.ReportChunk(m.ctx, req.SenderID, reportReq); err != nil {
+			log.Printf("report chunk %s/%d failed, not saving: %v", req.FileID, req.ChunkIndex, err)
 			return
 		}
-		log.Printf("confirmed chunk %s/%d as storage peer", req.FileID, req.ChunkIndex)
+		log.Printf("reported chunk %s/%d as storage peer", req.FileID, req.ChunkIndex)
 	}
 
 	ttl := req.TTLSeconds
