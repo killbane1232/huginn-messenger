@@ -1437,6 +1437,7 @@ func TestReloginFlow(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	alice.ConnectPeer("bob")
+	bob.ConnectPeer("alice")
 	deadline := time.Now().Add(5 * time.Second)
 	connected := false
 	for time.Now().Before(deadline) {
