@@ -10,6 +10,6 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /huginn /huginn
 
-COPY --from=builder /thick-conf.conf /thick-conf.conf
+COPY /thick-conf.conf /config.conf
 
 ENTRYPOINT ["/huginn"]
