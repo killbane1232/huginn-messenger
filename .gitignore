@@ -24,3 +24,5 @@ Thumbs.db
 
 **.db*
 build.sh
+libhuginn_messenger.h
+libhuginn_messenger.so

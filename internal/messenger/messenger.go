@@ -1430,7 +1430,7 @@ func (m *Messenger) checkPendingMessages() {
 
 func (m *Messenger) checkRecipientMessages(recipientID string) {
 	lastCheck := m.store.GetLastChunkCheck(recipientID)
-	chunks, err := m.muninnClient.GetChunksByRecipient(m.ctx, recipientID, lastCheck-30)
+	chunks, err := m.muninnClient.GetChunksByRecipient(m.ctx, recipientID, lastCheck-1)
 	if err != nil {
 		log.Printf("check %s: GetChunksByRecipient err: %v", recipientID, err)
 		return
@@ -1448,11 +1448,16 @@ func (m *Messenger) checkRecipientMessages(recipientID string) {
 				log.Printf("check %s: skip failed chunk %s/%d", recipientID, c.FileID, c.ChunkIndex)
 				continue
 			}
-			log.Printf("check %s: chunk %s/%d confirmed=%v peer=%s", recipientID, c.FileID, c.ChunkIndex, c.Confirmed, c.PeerID)
-			byMsg[c.FileID] = append(byMsg[c.FileID], c)
 			if c.CreatedAt > newLastCheck {
 				newLastCheck = c.CreatedAt
 			}
+			hasMsg, _ := m.store.FindMessageById(c.FileID)
+			if hasMsg {
+				log.Printf("collecting %s skipped", c.FileID)
+				continue
+			}
+			log.Printf("check %s: chunk %s/%d confirmed=%v peer=%s", recipientID, c.FileID, c.ChunkIndex, c.Confirmed, c.PeerID)
+			byMsg[c.FileID] = append(byMsg[c.FileID], c)
 		}
 		log.Printf("check %s: %d unique messages", recipientID, len(byMsg))
 		for msgID, msgChunks := range byMsg {
@@ -1460,7 +1465,7 @@ func (m *Messenger) checkRecipientMessages(recipientID string) {
 		}
 	}
 
-	if newLastCheck > 0 {
+	if newLastCheck > lastCheck {
 		m.store.SetLastChunkCheck(recipientID, newLastCheck)
 	}
 	m.retryFailedChunks(recipientID)
@@ -1534,6 +1539,11 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 		return
 	}
 	defer m.releaseProcessMsg(msgID)
+	hasMsg, _ := m.store.FindMessageById(msgID)
+	if hasMsg {
+		log.Printf("collecting %s skipped", msgID)
+		return
+	}
 	log.Printf("collecting %s (%d chunk records, persist=%v)", msgID, len(records), len(records) > 0 && records[0].Persist)
 
 	seen := make(map[int]bool)

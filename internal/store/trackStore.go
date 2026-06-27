@@ -11,26 +11,23 @@ type FailedChunk struct {
 }
 
 func (s *SQLiteStore) GetLastChunkCheck(recipientID string) int64 {
-	row, err := retryWith(func() (int64, error) {
-		var val int64
-		err := s.db.QueryRow(`SELECT last_check FROM last_check WHERE recipient_id = ?`, recipientID).Scan(&val)
-		return val, err
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var val int64
+	err := s.db.QueryRow(`SELECT last_check FROM last_check WHERE recipient_id = ?`, recipientID).Scan(&val)
 	if err != nil {
 		return 0
 	}
-	return row
+	return val
 }
 
 func (s *SQLiteStore) SetLastChunkCheck(recipientID string, unix int64) error {
-	_, err := retryWith(func() (struct{}, error) {
-		var empty struct{}
-		_, err := s.db.Exec(
-			`INSERT OR REPLACE INTO last_check (recipient_id, last_check) VALUES (?, ?)`,
-			recipientID, unix,
-		)
-		return empty, err
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT OR REPLACE INTO last_check (recipient_id, last_check) VALUES (?, ?)`,
+		recipientID, unix,
+	)
 	return err
 }
 
@@ -38,27 +35,25 @@ func (s *SQLiteStore) StoreFailedChunk(fileID string, chunkIndex int, recipientI
 	if ttlSeconds <= 0 {
 		ttlSeconds = 604800
 	}
-	_, err := retryWith(func() (struct{}, error) {
-		var empty struct{}
-		_, err := s.db.Exec(
-			`INSERT OR IGNORE INTO failed_chunks (file_id, chunk_index, recipient_id, created_at, ttl_seconds) VALUES (?, ?, ?, ?, ?)`,
-			fileID, chunkIndex, recipientID, time.Now().Unix(), ttlSeconds,
-		)
-		return empty, err
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO failed_chunks (file_id, chunk_index, recipient_id, created_at, ttl_seconds) VALUES (?, ?, ?, ?, ?)`,
+		fileID, chunkIndex, recipientID, time.Now().Unix(), ttlSeconds,
+	)
 	return err
 }
 
 func (s *SQLiteStore) DeleteFailedChunk(fileID string, chunkIndex int) error {
-	_, err := retryWith(func() (struct{}, error) {
-		var empty struct{}
-		_, err := s.db.Exec(`DELETE FROM failed_chunks WHERE file_id = ? AND chunk_index = ?`, fileID, chunkIndex)
-		return empty, err
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM failed_chunks WHERE file_id = ? AND chunk_index = ?`, fileID, chunkIndex)
 	return err
 }
 
 func (s *SQLiteStore) IsChunkFailed(fileID string, chunkIndex int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var count int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM failed_chunks WHERE file_id = ? AND chunk_index = ?`, fileID, chunkIndex).Scan(&count)
 	if err != nil {
@@ -68,6 +63,8 @@ func (s *SQLiteStore) IsChunkFailed(fileID string, chunkIndex int) bool {
 }
 
 func (s *SQLiteStore) ListFailedChunks(recipientID string) ([]FailedChunk, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	rows, err := s.db.Query(`SELECT file_id, chunk_index, recipient_id, created_at, ttl_seconds FROM failed_chunks WHERE recipient_id = ?`, recipientID)
 	if err != nil {
 		return nil, err
@@ -86,10 +83,8 @@ func (s *SQLiteStore) ListFailedChunks(recipientID string) ([]FailedChunk, error
 }
 
 func (s *SQLiteStore) DeleteExpiredFailedChunks(now int64) error {
-	_, err := retryWith(func() (struct{}, error) {
-		var empty struct{}
-		_, err := s.db.Exec(`DELETE FROM failed_chunks WHERE created_at + ttl_seconds <= ?`, now)
-		return empty, err
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM failed_chunks WHERE created_at + ttl_seconds <= ?`, now)
 	return err
 }

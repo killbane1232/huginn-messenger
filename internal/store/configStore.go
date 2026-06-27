@@ -30,9 +30,9 @@ var ErrConfigNotFound = errors.New("config value not found")
 
 func (s *SQLiteStore) GetConfigValue(name string) (string, error) {
 	var value string
-	err := retry(func() error {
-		return s.db.QueryRow(`SELECT value FROM config_values WHERE name = ?`, name).Scan(&value)
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.db.QueryRow(`SELECT value FROM config_values WHERE name = ?`, name).Scan(&value)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrConfigNotFound
 	}
@@ -40,14 +40,14 @@ func (s *SQLiteStore) GetConfigValue(name string) (string, error) {
 }
 
 func (s *SQLiteStore) SetConfigValue(name, value string) error {
-	return retry(func() error {
-		_, err := s.db.Exec(
-			`INSERT INTO config_values (name, value) VALUES (?, ?)
-			 ON CONFLICT(name) DO UPDATE SET value = excluded.value`,
-			name, value,
-		)
-		return err
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO config_values (name, value) VALUES (?, ?)
+			ON CONFLICT(name) DO UPDATE SET value = excluded.value`,
+		name, value,
+	)
+	return err
 }
 
 func (s *SQLiteStore) GetKeysJSON() (string, error) {

@@ -3,8 +3,8 @@ package store
 import (
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -24,6 +24,7 @@ type PendingChunk struct {
 
 type SQLiteStore struct {
 	db *sql.DB
+	mu   sync.Mutex
 }
 
 func New(path string) (*SQLiteStore, error) {
@@ -46,42 +47,7 @@ func New(path string) (*SQLiteStore, error) {
 }
 
 func (s *SQLiteStore) Close() error {
-	return retry(func() error {
-		return s.db.Close()
-	})
-}
-
-func isLocked(err error) bool {
-	return strings.Contains(err.Error(), "database is locked")
-}
-
-func retry(fn func() error) error {
-	var err error
-	for i := 0; i < 10; i++ {
-		err = fn()
-		if err == nil {
-			return nil
-		}
-		if !isLocked(err) {
-			return err
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return fmt.Errorf("database locked after retries: %w", err)
-}
-
-func retryWith[T any](fn func() (T, error)) (T, error) {
-	var result T
-	var err error
-	for i := 0; i < 10; i++ {
-		result, err = fn()
-		if err == nil {
-			return result, nil
-		}
-		if !isLocked(err) {
-			return result, err
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return result, fmt.Errorf("database locked after retries: %w", err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Close()
 }
