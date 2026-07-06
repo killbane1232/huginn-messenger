@@ -298,6 +298,20 @@ func messenger_get_messages(handle C.long, peerID *C.char) *C.char {
 	return C.CString(string(data))
 }
 
+//export messenger_get_messages_paginated
+func messenger_get_messages_paginated(handle C.long, peerID *C.char, limit, offset C.int) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	messages := inst.m.GetMessagesDesc(C.GoString(peerID), int(limit), int(offset))
+	if messages == nil {
+		return C.CString("[]")
+	}
+	data, _ := json.Marshal(messages)
+	return C.CString(string(data))
+}
+
 //export messenger_send_message
 func messenger_send_message(handle C.long, to, text *C.char, ttl C.int) *C.char {
 	inst := getInstance(int64(handle))

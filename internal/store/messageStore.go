@@ -31,6 +31,25 @@ func (s *SQLiteStore) GetMessages(peerID string) ([][]byte, error) {
 	return result, rows.Err()
 }
 
+func (s *SQLiteStore) GetMessagesDesc(peerID string, limit, offset int) ([][]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query("SELECT data FROM messages WHERE login = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", peerID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result [][]byte
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			return nil, err
+		}
+		result = append(result, data)
+	}
+	return result, rows.Err()
+}
+
 func (s *SQLiteStore) FindMessageById(msgID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

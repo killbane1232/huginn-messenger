@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sync"
 	"strings"
+	"slices"
 	"time"
 
 	"github.com/killbane1232/huginn-messenger/internal/chunk"
@@ -24,7 +25,7 @@ import (
 	"github.com/killbane1232/huginn-messenger/internal/store"
 	"github.com/killbane1232/huginn-messenger/internal/webrtc"
 	"github.com/google/uuid"
-    "runtime/debug"
+    //"runtime/debug"
 	pion "github.com/pion/webrtc/v4"
 )
 
@@ -103,6 +104,7 @@ func WithPeerID(id string) MessengerOption {
 
 type Messenger struct {
 	ID       string
+	Key       string
 	Username string
 
 	signPublic  ed25519.PublicKey
@@ -118,6 +120,7 @@ type Messenger struct {
 
 	store *store.SQLiteStore
 
+	peersMap            map[string]muninn.Peer
 	peers            []muninn.Peer
 	peersConnecting  map[string]struct{}
 	mu               sync.RWMutex
@@ -227,15 +230,22 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	signalChan := make(chan muninn.Signal, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	peerID := appCfg.Username
+	peerID := appCfg.PeerID
 	if peerID == "" {
-		peerID = crypto.EncodeKey(signPub)
+		peerID = uuid.New().String()
 	}
 	appCfg.PeerID = peerID
+	oldUsername := appCfg.Username
+	if oldUsername == "" {
+		oldUsername = peerID
+	}
+	key := username + ":" + crypto.EncodeKey(signPub)
 	m := &Messenger{
 		ID:       peerID,
-		Username: appCfg.Username,
+		Key:      key,
+		Username: oldUsername,
 
+		peersMap: make(map[string]muninn.Peer),
 		signPublic:  signPub,
 		signPrivate: signPriv,
 		encPrivate:  encPriv,
@@ -268,6 +278,11 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 			Username:   "turnuser",
 			Credential: "turnpass",
 		},
+		{
+			URLs:       []string{
+				"stun:stun.l.google.com:19302",
+			},
+		},
 	}
 	m.rtcManager = webrtc.NewManager(peerID, rtcMsgChan, m.handleChunkStore, m.handleChunkGet,
 		m.handleReloginRequest, m.handleReloginResponse, o.iceServers)
@@ -286,7 +301,9 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	go m.rtcReconnectLoop()
 	storedPeers, _ := st.GetStoredPeers()
 	for _, peer := range storedPeers {
-		m.peers = append(m.peers, peer.ToMuninnPeer())
+		munPeer := peer.ToMuninnPeer()
+		m.peersMap[peer.PeerID] = munPeer
+		m.peers = append(m.peers, munPeer)
 	}
 
 	go m.heartbeatLoop()   // TODO: переделать на более низкое энергопотребление
@@ -302,7 +319,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 
 func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest) {
 	// Если мы не являемся конечным получателем — сообщаем серверу, что сохранили чанк
-	if req.RecipientID != "" && req.RecipientID != m.ID && req.Hash != "" && req.SenderID != "" {
+	if req.RecipientID != "" && req.RecipientID != m.Key && req.Hash != "" && req.SenderID != "" {
 		reportedPayload := fmt.Sprintf("muninn/reported/v1\n%s\n%d\n%s\n%s",
 			req.FileID, req.ChunkIndex, req.Hash, req.SenderID)
 		sig := crypto.Sign(m.signPrivate, []byte(reportedPayload))
@@ -361,11 +378,6 @@ func (m *Messenger) processRTCMessages() {
 			if err := m.store.SaveMessage(msg.MsgID, msg.From, cm.From, cm.From, jsonData, cm.Timestamp); err != nil {
 				log.Printf("save message: %v", err)
 			}
-			encKey, signKey := "", ""
-			if p := m.findPeerByID(msg.From); p != nil {
-				encKey, signKey = p.EncryptionKey, p.SignatureKey
-			}
-			m.upsertPeer(msg.From, encKey, signKey, cm.Timestamp)
 			m.msgSubsMu.Lock()
 			for _, sub := range m.msgSubs {
 				select {
@@ -448,7 +460,7 @@ func (m *Messenger) rtcReconnectLoop() {
 		log.Printf("[rtc] attempting to reconnect to muninn...")
 		if err := m.rtcClient.Connect(m.ctx); err != nil {
 			log.Printf("[rtc] reconnect failed: %v", err)
-			log.Printf("[rtc] reconnect stack:\n%s", debug.Stack())
+			//log.Printf("[rtc] reconnect stack:\n%s", debug.Stack())
 			continue
 		}
 		log.Printf("[rtc] reconnected to muninn")
@@ -555,7 +567,7 @@ func (m *Messenger) chunkCleanupLoop() {
 func (m *Messenger) Register() error {
 	req := &muninn.RegisterRequest{
 		ID:       m.ID,
-		Keys:     []muninn.Key{{Login: m.ID, Signature: "huginn-v1"}},
+		Login:     m.Username,
 		Addresses: []string{""},
 		EncryptionKey: crypto.EncodeKey(m.encPublic),
 		SignatureKey:  crypto.EncodeKey(m.signPublic),
@@ -580,7 +592,7 @@ func (m *Messenger) SearchPeers(query string) []muninn.Peer {
 				continue
 			}
 			seen[s.PeerID] = &muninn.Peer{
-				ID:            s.PeerID,
+				Key:           s.PeerID,
 				EncryptionKey: s.EncryptionKey,
 				SignatureKey:  s.SignatureKey,
 				LastSeen:      s.LastSeen,
@@ -592,12 +604,12 @@ func (m *Messenger) SearchPeers(query string) []muninn.Peer {
 	muninnPeers, err := m.muninnClient.List(m.ctx)
 	if err == nil {
 		for _, p := range muninnPeers {
-			if p.ID == m.ID {
+			if p.Key == m.Key {
 				continue
 			}
-			if strings.Contains(strings.ToLower(p.ID), q) {
-				m.upsertPeer(p.ID, p.EncryptionKey, p.SignatureKey, p.LastSeen)
-				if existing, ok := seen[p.ID]; ok {
+			if strings.Contains(strings.ToLower(p.Key), q) {
+				m.upsertPeer(p.ID, p.Key, getLogin(p.Key), p.EncryptionKey, p.SignatureKey, p.LastSeen, false)
+				if existing, ok := seen[p.Key]; ok {
 					if p.LastSeen.After(existing.LastSeen) {
 						existing.LastSeen = p.LastSeen
 					}
@@ -611,12 +623,11 @@ func (m *Messenger) SearchPeers(query string) []muninn.Peer {
 						existing.Metadata = p.Metadata
 					}
 					existing.Addresses = p.Addresses
-					existing.Keys = p.Keys
 					existing.TTLSeconds = p.TTLSeconds
 					existing.QualityScore = p.QualityScore
 				} else {
 					cp := p
-					seen[p.ID] = &cp
+					seen[p.Key] = &cp
 				}
 			}
 		}
@@ -629,38 +640,32 @@ func (m *Messenger) SearchPeers(query string) []muninn.Peer {
 	return result
 }
 
-func (m *Messenger) upsertPeer(peerID, encryptionKey, signatureKey string, lastSeen time.Time) {
+func (m *Messenger) upsertPeer(peerID, peerKey, login, encryptionKey, signatureKey string, lastSeen time.Time, isFake bool) {
 	m.mu.Lock()
 	found := false
-	for i := range m.peers {
-		if m.peers[i].ID == peerID {
-			if encryptionKey != "" {
-				m.peers[i].EncryptionKey = encryptionKey
-			}
-			if signatureKey != "" {
-				m.peers[i].SignatureKey = signatureKey
-			}
-			if lastSeen.After(m.peers[i].LastSeen) {
-				m.peers[i].LastSeen = lastSeen
-			}
-			found = true
-			break
+	peer, found := m.peersMap[peerKey]
+	if found {
+		if !slices.Contains(peer.IDS, peerID) {
+			peer.IDS = append(peer.IDS, peerID)
 		}
 	}
 	if !found {
-		m.peers = append(m.peers, muninn.Peer{
+		m.peersMap[peerKey] = muninn.Peer{
 			ID:            peerID,
+			Key:           peerKey,
 			EncryptionKey: encryptionKey,
 			SignatureKey:  signatureKey,
 			LastSeen:      lastSeen,
 			QualityScore:  100,
-		})
+			IsFake:        isFake,
+			IDS:		   []string{peerID},
+		}
+		if err := m.store.StorePeer(peerKey, login, encryptionKey, signatureKey, lastSeen, isFake); err != nil {
+			log.Printf("store peer %s: %v", peerID, err)
+		}
 	}
+	m.peers = m.PeerSlice()
 	m.mu.Unlock()
-
-	if err := m.store.StorePeer(m.ID, peerID, encryptionKey, signatureKey, lastSeen); err != nil {
-		log.Printf("store peer %s: %v", peerID, err)
-	}
 
 	m.subsMu.Lock()
 	for _, ch := range m.peerSubs {
@@ -677,7 +682,7 @@ func (m *Messenger) GetPeers() []muninn.Peer {
 	defer m.mu.RUnlock()
 	result := make([]muninn.Peer, 0, len(m.peers))
 	for _, p := range m.peers {
-		if p.ID != m.ID {
+		if p.Key != m.Key {
 			result = append(result, p)
 		}
 	}
@@ -704,7 +709,7 @@ func (m *Messenger) IsPeerOnline(peerID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, p := range m.peers {
-		if p.ID == peerID {
+		if p.ID == peerID && p.IsFake {
 			return p.LastSeen.After(time.Now().Add(time.Duration(- p.TTLSeconds / 2) * time.Second))
 		}
 	}
@@ -837,7 +842,7 @@ func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []st
 func (m *Messenger) findPeerByID(id string) *muninn.Peer {
 	m.mu.RLock()
 	for _, p := range m.peers {
-		if p.ID == id {
+		if slices.Contains(p.IDS, id) {
 			m.mu.RUnlock()
 			return &p
 		}
@@ -849,7 +854,7 @@ func (m *Messenger) findPeerByID(id string) *muninn.Peer {
 		return nil
 	}
 
-	m.upsertPeer(stored.ID, stored.EncryptionKey, stored.SignatureKey, time.Now())
+	m.upsertPeer(stored.ID, stored.Key, getLogin(stored.Key), stored.EncryptionKey, stored.SignatureKey, time.Now(), stored.IsFake)
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -861,30 +866,55 @@ func (m *Messenger) findPeerByID(id string) *muninn.Peer {
 	return nil
 }
 
+func (m *Messenger) findPeerByKey(key string) *muninn.Peer {
+	keySplit := strings.Split(key, ":")
+	login := keySplit[0]
+	signature := keySplit[1]
+	m.mu.RLock()
+	peer, exists := m.peersMap[key]
+	if exists {
+		return &peer
+	}
+	m.mu.RUnlock()
+
+	stored, err := m.muninnClient.GetAllByKey(m.ctx, login, signature)
+	if err != nil || stored == nil {
+		return nil
+	}
+
+	for _, p := range stored {
+		m.upsertPeer(p.ID, p.Key, getLogin(p.Key), p.EncryptionKey, p.SignatureKey, time.Now(), p.IsFake)
+	}
+	peer, exists = m.peersMap[key]
+	if exists {
+		return &peer
+	}
+	return nil
+}
+
 func (m *Messenger) SendMessage(to, text string, filePaths []string, ttlSeconds int) error {
+	go m.sendMessageAsync(to, text, filePaths, ttlSeconds)
+	return nil
+}
+
+func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSeconds int) error {
 	if ttlSeconds <= 0 {
 		ttlSeconds = config.ChunkTTLSeconds("1w")
 	}
 
-	if gc, err := m.store.GetGroupChat(to); err == nil {
-		var files []FileMeta
-		for _, fp := range filePaths {
-			meta, err := m.sendFileChunks(to, fp, ttlSeconds)
-			if err != nil {
-				return fmt.Errorf("send file %s: %w", fp, err)
+	peer := m.findPeerByKey(to)
+
+	if peer == nil {
+		if gc, err := m.store.GetGroupChat(to); err == nil {
+			peer = &muninn.Peer{
+				ID:            gc.UID,
+				EncryptionKey: gc.EncPublic,
+				SignatureKey:  gc.SignPublic,
+				IsFake:        true,
 			}
-			files = append(files, *meta)
 		}
-		peer := &muninn.Peer{
-			ID:            gc.UID,
-			EncryptionKey: gc.EncPublic,
-			SignatureKey:  gc.SignPublic,
-		}
-		msgID := uuid.New().String()
-		return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 	}
 
-	peer := m.findPeerByID(to)
 	if peer == nil {
 		return fmt.Errorf("peer %s not found", to)
 	}
@@ -911,7 +941,6 @@ func (m *Messenger) SendMessage(to, text string, filePaths []string, ttlSeconds 
 		if err := m.rtcManager.SendMessage(to, text, now, msgID); err != nil {
 			return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 		}
-		m.upsertPeer(to, peer.EncryptionKey, peer.SignatureKey, now)
 		return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 	}
 
@@ -1202,11 +1231,8 @@ func (m *Messenger) ApplyReloginSignature(signature string) error {
 			if err != nil {
 				return fmt.Errorf("parse relogin keys: %w", err)
 			}
-			m.ID = peer.ID
-			peerUsername := peer.ID
-			if len(peer.Keys) > 0 && peer.Keys[0].Login != "" {
-				peerUsername = peer.Keys[0].Login
-			}
+			m.Key = peer.Key
+			peerUsername := getLogin(peer.Key)
 			m.Username = peerUsername
 
 			if m.appConfig == nil {
@@ -1359,7 +1385,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		}*/
 	}
 
-		for _, pid := range storagePeers {
+	for _, pid := range storagePeers {
 		if !m.IsPeerConnected(pid) {
 			continue
 		}
@@ -1393,8 +1419,8 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		if err := m.store.StorePendingChunk(&store.PendingChunk{
 			FileID:      msgID,
 			ChunkIndex:  i,
-			RecipientID: peer.ID,
-			SenderID:    m.ID,
+			RecipientID: peer.Key,
+			SenderID:    m.Key,
 			Data:        c.envData,
 			Hash:        c.hash,
 			Signature:   c.sig,
@@ -1411,7 +1437,6 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 	if err := m.store.SaveMessage(msgID, peer.ID, m.ID, peer.ID, jsonData, cm.Timestamp); err != nil {
 		log.Printf("save message: %v", err)
 	}
-	m.upsertPeer(peer.ID, peer.EncryptionKey, peer.SignatureKey, now)
 	return nil
 }
 
@@ -1600,7 +1625,7 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 		return
 	}
 
-	senderPeer := m.findPeerByID(records[0].SenderID)
+	senderPeer := m.findPeerByKey(records[0].SenderID)
 	if senderPeer == nil {
 		log.Printf("sender %s not found for %s", records[0].SenderID, msgID)
 		return
@@ -1665,10 +1690,9 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 	}
 
 	jsonData, _ := json.Marshal(decryptedMsg)
-	if err := m.store.SaveMessage(msgID, chatID, decryptedMsg.From, chatID, jsonData, decryptedMsg.Timestamp); err != nil {
+	if err := m.store.SaveMessage(msgID, chatID, senderPeer.Key, chatID, jsonData, decryptedMsg.Timestamp); err != nil {
 		log.Printf("save message: %v", err)
 	}
-	m.upsertPeer(decryptedMsg.From, senderPeer.EncryptionKey, senderPeer.SignatureKey, decryptedMsg.Timestamp)
 
 	m.msgSubsMu.Lock()
 	for _, sub := range m.msgSubs {
@@ -1780,7 +1804,7 @@ func (m *Messenger) CreateGroupChat(name string) (*store.GroupChat, error) {
 	fake := true
 	req := &muninn.RegisterRequest{
 		ID:            uid,
-		Keys:          []muninn.Key{{Login: name, Signature: "huginn-v1"}},
+		Login:         name,
 		Addresses:     []string{""},
 		EncryptionKey: gc.EncPublic,
 		SignatureKey:  gc.SignPublic,
@@ -1796,7 +1820,7 @@ func (m *Messenger) CreateGroupChat(name string) (*store.GroupChat, error) {
 		log.Printf("register group peer %s (%s): %v", name, uid, err)
 	}
 
-	m.upsertPeer(uid, gc.EncPublic, gc.SignPublic, time.Now())
+	m.upsertPeer(uid, name + ":" + gc.SignPublic, name, gc.EncPublic, gc.SignPublic, time.Now(), true)
 
 	log.Printf("group chat %s created with uid %s", name, uid)
 	return gc, nil
@@ -1810,7 +1834,7 @@ func (m *Messenger) registerGroupPeer(gc store.GroupChat) {
 	fake := true
 	req := &muninn.RegisterRequest{
 		ID:            gc.UID,
-		Keys:          []muninn.Key{{Login: gc.Name, Signature: "huginn-v1"}},
+		Login:         gc.Name,
 		Addresses:     []string{""},
 		EncryptionKey: gc.EncPublic,
 		SignatureKey:  gc.SignPublic,
@@ -1898,7 +1922,7 @@ func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {
 		envelopes[i] = env
 	}
 
-	senderPeer := m.findPeerByID(senderID)
+	senderPeer := m.findPeerByKey(senderID)
 	if senderPeer == nil {
 		log.Printf("sender %s not found for file %s", senderID, f.FileID)
 		return
@@ -1959,12 +1983,12 @@ func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {
 }
 
 func (m *Messenger) requestMissingChunk(fileID string, chunkIndex int, senderID string) {
-	targets := []string{senderID}
-	for _, p := range m.getConnectedPeers() {
-		if p.ID != senderID {
-			targets = append(targets, p.ID)
-		}
+	targets := []string{}	
+	p := m.findPeerByKey(senderID)
+	if p == nil {
+		return
 	}
+	targets = p.IDS
 	for _, pid := range targets {
 		if m.IsPeerConnected(pid) {
 			m.rtcManager.SendChunkGet(pid, webrtc.ChunkGetRequest{
@@ -2050,6 +2074,22 @@ func (m *Messenger) getChunkData(rec muninn.ChunkRecord) ([]byte, bool) {
 
 func (m *Messenger) GetMessages(peerID string) []ChatMessage {
 	dataList, err := m.store.GetMessages(peerID)
+	if err != nil {
+		return nil
+	}
+	result := make([]ChatMessage, 0, len(dataList))
+	for _, data := range dataList {
+		var msg ChatMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+		result = append(result, msg)
+	}
+	return result
+}
+
+func (m *Messenger) GetMessagesDesc(peerID string, limit, offset int) []ChatMessage {
+	dataList, err := m.store.GetMessagesDesc(peerID, limit, offset)
 	if err != nil {
 		return nil
 	}
@@ -2194,4 +2234,16 @@ func (m *Messenger) Shutdown() {
 	m.rtcClient.Close()
 	m.rtcManager.CloseAll()
 	m.store.Close()
+}
+
+func getLogin(key string) string {
+	return strings.Split(key, ":")[0]
+}
+
+func (m *Messenger) PeerSlice() []muninn.Peer {
+    s := make([]muninn.Peer, 0, len(m.peers))
+    for _, v := range m.peers {
+        s = append(s, v)
+    }
+    return s
 }

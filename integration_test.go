@@ -65,14 +65,14 @@ func TestOfflineMessageWithoutWebRTC(t *testing.T) {
 	msgCh := bob.SubscribeMessages()
 	defer bob.UnsubscribeMessages(msgCh)
 
-	err = alice.SendMessage("bob", "hello from alice without webrtc", nil, 604800)
+	err = alice.SendMessage(bob.Key, "hello from alice without webrtc", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
+	records, err := mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestOfflineMessageWithoutWebRTC(t *testing.T) {
 		t.Fatal("message id is empty")
 	}
 
-	msgs := bob.GetMessages("alice")
+	msgs := bob.GetMessages(alice.Key)
 	if len(msgs) == 0 {
 		t.Fatal("bob.GetMessages(\"alice\") returned no messages")
 	}
@@ -566,7 +566,7 @@ func TestMessengerOfflineFlow(t *testing.T) {
 
 	t.Logf("alice peers: %d, bob peers: %d", len(alice.GetPeers()), len(bob.GetPeers()))
 
-	err = alice.SendMessage("bob", "hello from alice via offline chunks", nil, 604800)
+	err = alice.SendMessage(bob.Key, "hello from alice via offline chunks", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -574,7 +574,7 @@ func TestMessengerOfflineFlow(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
+	records, err := mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -593,7 +593,7 @@ func TestMessengerOfflineFlow(t *testing.T) {
 	var lastMsg messenger.ChatMessage
 	found := false
 	for time.Now().Before(deadline) {
-		msgs := bob.GetMessages("alice")
+		msgs := bob.GetMessages(alice.Key)
 		if len(msgs) > 0 {
 			lastMsg = msgs[len(msgs)-1]
 			found = true
@@ -603,7 +603,7 @@ func TestMessengerOfflineFlow(t *testing.T) {
 	}
 
 	if !found {
-		aliceMsgs := alice.GetMessages("bob")
+		aliceMsgs := alice.GetMessages(bob.Key)
 		t.Logf("alice->bob msgs: %d", len(aliceMsgs))
 		for _, m := range aliceMsgs {
 			t.Logf("  alice stored: %+v", m)
@@ -655,7 +655,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 	t.Logf("alice peers: %d, bob peers: %d, charley peers: %d",
 		len(alice.GetPeers()), len(bob.GetPeers()), len(charley.GetPeers()))
 
-	err = alice.SendMessage("bob", "hello from alice via charley storage", nil, 604800)
+	err = alice.SendMessage(bob.Key, "hello from alice via charley storage", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,7 +663,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
+	records, err := mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -697,7 +697,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 		t.Logf("registered charley as storage peer for chunk %s/%d", rec.FileID, rec.ChunkIndex)
 	}
 
-	records2, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
+	records2, err := mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -723,7 +723,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 	var lastMsg messenger.ChatMessage
 	found := false
 	for time.Now().Before(deadline) {
-		msgs := bob.GetMessages("alice")
+		msgs := bob.GetMessages(alice.Key)
 		if len(msgs) > 0 {
 			lastMsg = msgs[len(msgs)-1]
 			found = true
@@ -733,7 +733,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 	}
 
 	if !found {
-		aliceMsgs := alice.GetMessages("bob")
+		aliceMsgs := alice.GetMessages(alice.Key)
 		t.Logf("alice->bob msgs: %d", len(aliceMsgs))
 		for _, m := range aliceMsgs {
 			t.Logf("  alice stored: %+v", m)
@@ -784,14 +784,14 @@ func TestFileSendAndReceive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = alice.SendMessage("bob", "here is a file", []string{tmpFile}, 604800)
+	err = alice.SendMessage(bob.Key, "here is a file", []string{tmpFile}, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
+	records, err := mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
 	if err != nil {
 		t.Fatalf("get chunk records: %v", err)
 	}
@@ -853,7 +853,7 @@ func TestFileSendAndReceive(t *testing.T) {
 		t.Fatalf("message text mismatch: got %q", delivered.Text)
 	}
 
-	msgs := bob.GetMessages("alice")
+	msgs := bob.GetMessages(alice.Key)
 	var foundMsg messenger.ChatMessage
 	for _, m := range msgs {
 		if m.MsgID == delivered.MsgID {
@@ -943,7 +943,7 @@ func TestGroupChatFlow(t *testing.T) {
 	bobMsgCh := bob.SubscribeMessages()
 	defer bob.UnsubscribeMessages(bobMsgCh)
 
-	if err := alice.InviteToGroupChat(gc.UID, "bob"); err != nil {
+	if err := alice.InviteToGroupChat(gc.UID, bob.Key); err != nil {
 		t.Fatalf("invite bob: %v", err)
 	}
 
@@ -961,7 +961,7 @@ func TestGroupChatFlow(t *testing.T) {
 			break
 		}
 
-		records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
+		records, err := mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
 		if err == nil && len(records) > 0 {
 			for _, rec := range records {
 				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
@@ -1096,7 +1096,7 @@ func TestGroupFileSendAndReceive(t *testing.T) {
 	bobMsgCh := bob.SubscribeMessages()
 	defer bob.UnsubscribeMessages(bobMsgCh)
 
-	if err := alice.InviteToGroupChat(gc.UID, "bob"); err != nil {
+	if err := alice.InviteToGroupChat(gc.UID, bob.Key); err != nil {
 		t.Fatalf("invite bob: %v", err)
 	}
 
@@ -1113,7 +1113,7 @@ func TestGroupFileSendAndReceive(t *testing.T) {
 		if gotInvite {
 			break
 		}
-		records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
+		records, err := mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
 		if err == nil && len(records) > 0 {
 			for _, rec := range records {
 				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
@@ -1319,7 +1319,7 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 	t.Log("WebRTC connection established, waiting for data channel to open...")
 	time.Sleep(2 * time.Second)
 
-	err = alice.SendMessage("bob", "hello via webrtc", nil, 604800)
+	err = alice.SendMessage(bob.Key, "hello via webrtc", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1344,7 +1344,7 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 		t.Log("message not received via WebRTC instantly, checking offline fallback...")
 		time.Sleep(2 * time.Second)
 
-		records, err := mc.GetChunksByRecipient(context.Background(), "bob", 0)
+		records, err := mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
 		if err == nil && len(records) > 0 {
 			t.Logf("found %d chunk records, injecting...", len(records))
 			for _, rec := range records {
@@ -1385,7 +1385,7 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 		t.Fatal("message id is empty")
 	}
 
-	msgs := bob.GetMessages("alice")
+	msgs := bob.GetMessages(alice.Key)
 	found := false
 	for _, m := range msgs {
 		if m.MsgID == delivered.MsgID {
@@ -1590,7 +1590,7 @@ func TestFailedChunkRetry(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	err = alice.SendMessage("bob", "test retry failed chunks", nil, 604800)
+	err = alice.SendMessage(bob.Key, "test retry failed chunks", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1598,7 +1598,7 @@ func TestFailedChunkRetry(t *testing.T) {
 
 	var records []muninn.ChunkRecord
 	for i := 0; i < 20; i++ {
-		records, err = mc.GetChunksByRecipient(context.Background(), "bob", 0)
+		records, err = mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1615,7 +1615,7 @@ func TestFailedChunkRetry(t *testing.T) {
 	bob.InjectChunk("_trigger_", 0, []byte{})
 	time.Sleep(100 * time.Millisecond)
 
-	msgs := bob.GetMessages("alice")
+	msgs := bob.GetMessages(alice.Key)
 	if len(msgs) > 0 {
 		t.Logf("message delivered via WebRTC before retry, id=%s", msgs[len(msgs)-1].MsgID)
 		return
@@ -1624,7 +1624,7 @@ func TestFailedChunkRetry(t *testing.T) {
 	for i := 0; i < 15; i++ {
 		bob.InjectChunk("_trigger_", i, []byte{})
 		time.Sleep(150 * time.Millisecond)
-		msgs = bob.GetMessages("alice")
+		msgs = bob.GetMessages(alice.Key)
 		if len(msgs) > 0 {
 			t.Logf("message delivered via WebRTC async, id=%s", msgs[len(msgs)-1].MsgID)
 			return
@@ -1652,7 +1652,7 @@ func TestFailedChunkRetry(t *testing.T) {
 	var msg messenger.ChatMessage
 	found := false
 	for time.Now().Before(deadline) {
-		msgs = bob.GetMessages("alice")
+		msgs = bob.GetMessages(alice.Key)
 		if len(msgs) > 0 {
 			msg = msgs[len(msgs)-1]
 			found = true

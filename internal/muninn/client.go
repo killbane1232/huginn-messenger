@@ -49,7 +49,8 @@ func NewClient(baseURL string) *Client {
 
 type Peer struct {
 	ID            string            `json:"id"`
-	Keys          []Key             `json:"keys"`
+	IDS			  []string			`json:ignore`
+	Key           string            `json:"key"`
 	Addresses     []string          `json:"addresses"`
 	PublicKey     string            `json:"public_key,omitempty"`
 	EncryptionKey string            `json:"encryption_key,omitempty"`
@@ -60,16 +61,12 @@ type Peer struct {
 	QualityScore  int               `json:"quality_score"`
 	Quality       QualityStats      `json:"quality"`
 	PeerFlag      PeerFlag          `json:"peer_flag,omitempty"`
-}
-
-type Key struct {
-	Login     string `json:"login"`
-	Signature string `json:"signature"`
+	IsFake        bool              `json:"is_fake,omitempty"`
 }
 
 type RegisterRequest struct {
 	ID            string            `json:"id"`
-	Keys          []Key             `json:"keys"`
+	Login         string            `json:"login"`
 	Addresses     []string          `json:"addresses"`
 	EncryptionKey string            `json:"encryption_key,omitempty"`
 	SignatureKey  string            `json:"signature_key,omitempty"`
@@ -524,11 +521,33 @@ func (c *Client) GetByKey(ctx context.Context, login, signature string) (*Peer, 
 		b, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("get by key failed (status %d): %s", resp.StatusCode, string(b))
 	}
-	var peer Peer
-	if err := json.NewDecoder(resp.Body).Decode(&peer); err != nil {
+	var peers []Peer
+	if err := json.NewDecoder(resp.Body).Decode(&peers); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
-	return &peer, nil
+	return &peers[0], nil
+}
+
+func (c *Client) GetAllByKey(ctx context.Context, login, signature string) ([]Peer, error) {
+	url := fmt.Sprintf("%s/api/v1/keys/%s?signature=%s", c.baseURL, login, signature)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get by key failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	var peers []Peer
+	if err := json.NewDecoder(resp.Body).Decode(&peers); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return peers, nil
 }
 
 func (c *Client) ConfirmChunk(ctx context.Context, req ConfirmChunkRequest) (*ConfirmChunkResult, error) {
