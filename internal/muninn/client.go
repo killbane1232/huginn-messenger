@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -404,7 +405,7 @@ func (c *Client) ReportChunk(ctx context.Context, sourcePeerID string, req Chunk
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	url := fmt.Sprintf("%s/api/v1/peers/%s/chunk-reports", c.baseURL, sourcePeerID)
+	url := fmt.Sprintf("%s/api/v1/peers/%s/chunk-reports", c.baseURL, url.PathEscape(sourcePeerID))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
@@ -423,7 +424,7 @@ func (c *Client) ReportChunk(ctx context.Context, sourcePeerID string, req Chunk
 }
 
 func (c *Client) GetChunksByRecipient(ctx context.Context, recipientID string, dateFrom int64) ([]ChunkRecord, error) {
-	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks?date_from=%d", c.baseURL, recipientID, dateFrom)
+	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks?date_from=%d", c.baseURL, url.PathEscape(recipientID), dateFrom)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
@@ -467,7 +468,7 @@ func (c *Client) GetChunksByFileID(ctx context.Context, fileID string) ([]ChunkR
 }
 
 func (c *Client) DeleteChunksByRecipient(ctx context.Context, recipientID string, fileID string) error {
-	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks/%s", c.baseURL, recipientID, fileID)
+	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks/%s", c.baseURL, url.PathEscape(recipientID), url.PathEscape(fileID))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
