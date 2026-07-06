@@ -940,7 +940,7 @@ func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSec
 		if gc, err := m.store.GetGroupChat(to); err == nil {
 			peer = &muninn.Peer{
 				ID:            gc.UID,
-				Key:		   gc.UID + ":" + gc.SignPublic
+				Key:		   gc.UID + ":" + gc.SignPublic,
 				EncryptionKey: gc.EncPublic,
 				SignatureKey:  gc.SignPublic,
 				IsFake:        true,
