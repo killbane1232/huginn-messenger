@@ -1331,6 +1331,40 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		chunks[i] = chunkData{envData, chunkHash, crypto.EncodeKey(sig)}
 	}
 
+	cm := ChatMessage{From: m.Username, Text: text, Timestamp: now, MsgID: msgID, Files: files}
+	jsonData, _ := json.Marshal(cm)
+	if err := m.store.SaveMessage(msgID, peer.Key, m.Key, peer.Key, jsonData, cm.Timestamp); err != nil {
+		log.Printf("save message: %v", err)
+	}
+
+	for i := range chunks {
+		if err := m.store.StorePendingChunk(&store.PendingChunk{
+			FileID:      msgID,
+			ChunkIndex:  i,
+			RecipientID: peer.Key,
+			SenderID:    m.Key,
+			Data:        chunks[i].envData,
+			Hash:        chunks[i].hash,
+			Signature:   chunks[i].sig,
+			CreatedAt:   time.Now(),
+			Placed:      false,
+			TTLSeconds:  ttlSeconds,
+		}); err != nil {
+			log.Printf("store pending chunk %s/%d: %v", msgID, i, err)
+		}
+	}
+
+	localRegBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
+	for i, c := range chunks {
+		localRegBatch[i] = muninn.RegisterChunkBatchEntry{
+			ChunkIndex: i, SenderID: m.Key, RecipientID: peer.Key,
+			Hash: c.hash, Signature: c.sig, PeerID: m.ID,
+		}
+	}
+	if err := m.muninnClient.RegisterChunks(m.ctx, msgID, muninn.RegisterChunkBatchRequest{Chunks: localRegBatch}); err != nil {
+		log.Printf("register batch %s on %s: %v", msgID, peer.Key, err)
+	}
+
 	onlinePeers, err := m.muninnClient.GetBestPeers(m.ctx, 10)
 	if err != nil {
 		onlinePeers = m.getOnlinePeers()
@@ -1361,30 +1395,6 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		}
 	}
 
-	storedOnPeers := make(map[int][]string, len(chunks))
-	for i := range chunks {
-		storedOnPeers[i] = []string{m.ID}
-	}
-
-	localRegBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
-	for i, c := range chunks {
-		localRegBatch[i] = muninn.RegisterChunkBatchEntry{
-			ChunkIndex: i, SenderID: m.Key, RecipientID: peer.Key,
-			Hash: c.hash, Signature: c.sig, PeerID: m.ID,
-		}
-	}
-	if err := m.muninnClient.RegisterChunks(m.ctx, msgID, muninn.RegisterChunkBatchRequest{Chunks: localRegBatch}); err != nil {
-		log.Printf("register batch %s on %s: %v", msgID,  peer.Key, err)
-		/*
-		for i, c := range chunks {
-			if err := m.muninnClient.RegisterChunk(m.ctx, msgID, i, muninn.RegisterChunkRequest{
-				SenderID: m.Key, RecipientID: peer.Key, Hash: c.hash, Signature: c.sig, PeerID: m.ID,
-			}); err != nil {
-				log.Printf("register local chunk %d warning: %v", i, err)
-			}
-		}*/
-	}
-
 	for _, pid := range storagePeers {
 		if !m.IsPeerConnected(pid) {
 			continue
@@ -1411,32 +1421,11 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 			continue
 		}
 		for i := range chunks {
-			storedOnPeers[i] = append(storedOnPeers[i], pid)
+			m.store.MarkChunkPlaced(msgID, i)
 		}
 	}
 
-	for i, c := range chunks {
-		if err := m.store.StorePendingChunk(&store.PendingChunk{
-			FileID:      msgID,
-			ChunkIndex:  i,
-			RecipientID: peer.Key,
-			SenderID:    m.Key,
-			Data:        c.envData,
-			Hash:        c.hash,
-			Signature:   c.sig,
-			CreatedAt:   time.Now(),
-			Placed:      len(storedOnPeers[i]) > 1,
-			TTLSeconds:  ttlSeconds,
-		}); err != nil {
-			log.Printf("store pending chunk %s/%d: %v", msgID, i, err)
-		}
-	}
-
-	cm := ChatMessage{From: m.Username, Text: text, Timestamp: now, MsgID: msgID, Files: files}
-	jsonData, _ := json.Marshal(cm)
-	if err := m.store.SaveMessage(msgID, peer.Key, m.Key, peer.Key, jsonData, cm.Timestamp); err != nil {
-		log.Printf("save message: %v", err)
-	}
+	log.Printf("offline message %s sent", msgID)
 	return nil
 }
 
