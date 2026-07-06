@@ -117,7 +117,7 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		}
 		var req ChunkStoreRequest
 		if json.Unmarshal(env.Data, &req) == nil {
-			m.chunkStore(remoteID, req)
+			go m.chunkStore(remoteID, req)
 		}
 	case MsgTypeChunkStoreBatch:
 		if m.chunkStore == nil {
@@ -126,7 +126,7 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		var batch ChunkStoreBatchRequest
 		if json.Unmarshal(env.Data, &batch) == nil {
 			for _, req := range batch.Chunks {
-				m.chunkStore(remoteID, req)
+				go m.chunkStore(remoteID, req)
 			}
 		}
 	case MsgTypeChunkGet:
@@ -150,7 +150,7 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		}
 		var msg ChunkStoreRequest
 		if json.Unmarshal(env.Data, &msg) == nil {
-			m.chunkStore(remoteID, msg)
+			go m.chunkStore(remoteID, msg)
 		}
 	case MsgTypeReloginRequest:
 		if m.reloginReq == nil {

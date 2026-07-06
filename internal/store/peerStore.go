@@ -16,7 +16,7 @@ type StoredPeer struct {
 
 func (s *StoredPeer) ToMuninnPeer() muninn.Peer {
 	return muninn.Peer{
-		ID:            s.PeerID,
+		Key:           s.PeerID,
 		Addresses:     nil,
 		EncryptionKey: s.EncryptionKey,
 		SignatureKey:  s.SignatureKey,

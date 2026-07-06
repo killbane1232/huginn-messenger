@@ -698,8 +698,11 @@ func (m *Messenger) getConnectedPeers() []muninn.Peer {
 	defer m.mu.RUnlock()
 	var online []muninn.Peer
 	for _, p := range m.peers {
-		if p.ID != m.ID && m.IsPeerConnected(p.ID) {
-			online = append(online, p)
+		for _, pid := range p.IDS {
+			if pid != m.ID && m.IsPeerConnected(pid) {
+				online = append(online, p)
+				break
+			}
 		}
 	}
 	return online
@@ -709,7 +712,21 @@ func (m *Messenger) IsPeerOnline(peerID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, p := range m.peers {
-		if p.ID == peerID && p.IsFake {
+		for _, pid := range p.IDS {
+			if pid == peerID && p.IsFake {
+				return p.LastSeen.After(time.Now().Add(time.Duration(- p.TTLSeconds / 2) * time.Second))
+				break
+			}
+		}
+	}
+	return false
+}
+
+func (m *Messenger) IsPeerOnlineByKey(key string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, p := range m.peers {
+		if p.Key == key && p.IsFake {
 			return p.LastSeen.After(time.Now().Add(time.Duration(- p.TTLSeconds / 2) * time.Second))
 		}
 	}
@@ -721,8 +738,11 @@ func (m *Messenger) getOnlinePeers() []muninn.Peer {
 	defer m.mu.RUnlock()
 	var online []muninn.Peer
 	for _, p := range m.peers {
-		if p.ID != m.ID && p.LastSeen.After(time.Now().Add(time.Duration(- p.TTLSeconds / 2) * time.Second)) {
-			online = append(online, p)
+		for _, pid := range p.IDS {
+			if pid != m.ID && p.LastSeen.After(time.Now().Add(time.Duration(- p.TTLSeconds / 2) * time.Second)) {
+				online = append(online, p)
+				break
+			}
 		}
 	}
 	return online
@@ -859,7 +879,7 @@ func (m *Messenger) findPeerByID(id string) *muninn.Peer {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, p := range m.peers {
-		if p.ID == id {
+		if slices.Contains(p.IDS, id) {
 			return &p
 		}
 	}
@@ -868,6 +888,9 @@ func (m *Messenger) findPeerByID(id string) *muninn.Peer {
 
 func (m *Messenger) findPeerByKey(key string) *muninn.Peer {
 	keySplit := strings.Split(key, ":")
+	if len(keySplit) < 2 {
+		return nil
+	}
 	login := keySplit[0]
 	signature := keySplit[1]
 	m.mu.RLock()
@@ -897,7 +920,13 @@ func (m *Messenger) SendMessage(to, text string, filePaths []string, ttlSeconds 
 	return nil
 }
 
-func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSeconds int) error {
+func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSeconds int) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic in sendMessageAsync: %v", r)
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
 	if ttlSeconds <= 0 {
 		ttlSeconds = config.ChunkTTLSeconds("1w")
 	}
