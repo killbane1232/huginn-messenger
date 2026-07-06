@@ -67,11 +67,11 @@ function renderPeerList() {
   list.innerHTML = '';
   peers.forEach(p => {
     if (p.metadata && p.metadata.type === 'huginn-group') return;
-    const name = p.metadata && p.metadata.username ? p.metadata.username : p.id;
+    const name = p.metadata && p.metadata.username ? p.metadata.username : p.key.split(':')[0];
     const initials = name.charAt(0).toUpperCase();
 
     const div = document.createElement('div');
-    div.className = 'peer-item' + (activePeer === p.id ? ' active' : '');
+    div.className = 'peer-item' + (activePeer === p.key ? ' active' : '');
     div.innerHTML = `
       <div class="peer-avatar ${p.online ? 'online' : 'offline'}">${initials}</div>
       <div class="peer-info">
@@ -79,7 +79,7 @@ function renderPeerList() {
         <div class="peer-status"><span class="${p.online ? 'status-online' : 'status-offline'}">${p.online ? 'online' : 'offline'}</span></div>
       </div>
     `;
-    div.addEventListener('click', () => selectPeer(p.id));
+    div.addEventListener('click', () => selectPeer(p.key));
     list.appendChild(div);
   });
 }
@@ -114,8 +114,8 @@ async function selectPeer(peerID) {
   renderPeerList();
   renderGroupList();
 
-  const p = peers.find(p => p.id === peerID);
-  const name = p && p.metadata && p.metadata.username ? p.metadata.username : peerID;
+  const p = peers.find(p => p.key === peerID);
+  const name = p && p.metadata && p.metadata.username ? p.metadata.username : peerID.split(':')[0];
 
   document.getElementById('no-chat').style.display = 'none';
   document.getElementById('main').style.display = 'flex';
@@ -328,7 +328,7 @@ function setupSSE() {
     peers = JSON.parse(e.data);
     renderPeerList();
     if (activePeer) {
-      const stillExists = peers.some(p => p.id === activePeer);
+      const stillExists = peers.some(p => p.key === activePeer);
       if (!stillExists) {
         activePeer = null;
         document.getElementById('main').style.display = 'none';
@@ -342,7 +342,7 @@ function setupSSE() {
     if (activeGroup) {
       const msgs = await fetchMessages(activeGroup);
       renderMessages(msgs, activeGroup);
-    } else if (activePeer && (msg.from === activePeer || msg.from === me.username)) {
+    } else if (activePeer && (msg.from === activePeer.split(':')[0] || msg.from === me.username)) {
       const msgs = await fetchMessages(activePeer);
       renderMessages(msgs, activePeer);
     }

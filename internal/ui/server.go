@@ -88,6 +88,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"id":       s.messenger.ID,
+		"key":      s.messenger.Key,
 		"username": s.messenger.Username,
 		"peer_id":  s.cfg.PeerID,
 	})

@@ -587,7 +587,7 @@ func (m *Messenger) SearchPeers(query string) []muninn.Peer {
 	stored, err := m.store.SearchStoredPeers(query)
 	if err == nil {
 		for _, s := range stored {
-			if s.PeerID == m.ID {
+			if s.PeerID == m.Key {
 				continue
 			}
 			seen[s.PeerID] = &muninn.Peer{
@@ -760,7 +760,7 @@ func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []st
 	// Подключаем пиры
 	var storagePeers []string
 	for _, p := range onlinePeers {
-		if p.ID == m.ID || p.ID == recipientID {
+		if p.ID == m.ID || p.Key == recipientID {
 			continue
 		}
 		if !m.IsPeerConnected(p.ID) {
@@ -930,15 +930,15 @@ func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSec
 
 	msgID := uuid.New().String()
 
-	if m.IsPeerOnline(to) {
-		if !m.IsPeerConnected(to) {
-			m.ConnectPeer(to)
+	if m.IsPeerOnline(peer.ID) {
+		if !m.IsPeerConnected(peer.ID) {
+			m.ConnectPeer(peer.ID)
 		}
 	}
 
-	if m.IsPeerConnected(to) {
+	if m.IsPeerConnected(peer.ID) {
 		now := time.Now()
-		if err := m.rtcManager.SendMessage(to, text, now, msgID); err != nil {
+		if err := m.rtcManager.SendMessage(peer.ID, text, now, msgID); err != nil {
 			return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 		}
 		return m.sendOffline(msgID, text, peer, ttlSeconds, files)
@@ -1432,7 +1432,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		}
 	}
 
-	cm := ChatMessage{From: m.ID, Text: text, Timestamp: now, MsgID: msgID, Files: files}
+	cm := ChatMessage{From: m.Username, Text: text, Timestamp: now, MsgID: msgID, Files: files}
 	jsonData, _ := json.Marshal(cm)
 	if err := m.store.SaveMessage(msgID, peer.Key, m.Key, peer.Key, jsonData, cm.Timestamp); err != nil {
 		log.Printf("save message: %v", err)
@@ -1716,7 +1716,7 @@ func (m *Messenger) MarkMessageRead(msgID string) error {
 	payload := fmt.Sprintf("muninn/read/v1\n%s", msgID)
 	sig := crypto.Sign(m.signPrivate, []byte(payload))
 	req := muninn.ReadChunkRequest{
-		RecipientID: m.ID,
+		RecipientID: m.Key,
 		FileID:      msgID,
 		Signature:    base64.StdEncoding.EncodeToString(sig),
 	}
