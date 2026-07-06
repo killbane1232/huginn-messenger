@@ -891,9 +891,9 @@ func (m *Messenger) findPeerByKey(key string) *muninn.Peer {
 	if len(keySplit) < 2 {
 		return nil
 	}
+
 	login := keySplit[0]
 	signature := keySplit[1]
-
 	m.mu.RLock()
 	peer, exists := m.peersMap[key]
 	m.mu.RUnlock()
@@ -903,9 +903,6 @@ func (m *Messenger) findPeerByKey(key string) *muninn.Peer {
 
 	stored, err := m.muninnClient.GetAllByKey(m.ctx, login, signature)
 	if err != nil || stored == nil {
-		if exists {
-			return &peer
-		}
 		return nil
 	}
 
@@ -915,29 +912,6 @@ func (m *Messenger) findPeerByKey(key string) *muninn.Peer {
 	m.mu.RLock()
 	peer, exists = m.peersMap[key]
 	m.mu.RUnlock()
-	if exists {
-		return &peer
-	}
-	return nil
-}
-	login := keySplit[0]
-	signature := keySplit[1]
-	m.mu.RLock()
-	peer, exists := m.peersMap[key]
-	if exists {
-		return &peer
-	}
-	m.mu.RUnlock()
-
-	stored, err := m.muninnClient.GetAllByKey(m.ctx, login, signature)
-	if err != nil || stored == nil {
-		return nil
-	}
-
-	for _, p := range stored {
-		m.upsertPeer(p.ID, p.Key, getLogin(p.Key), p.EncryptionKey, p.SignatureKey, time.Now(), p.IsFake)
-	}
-	peer, exists = m.peersMap[key]
 	if exists {
 		return &peer
 	}
