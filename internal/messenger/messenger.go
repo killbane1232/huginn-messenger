@@ -940,11 +940,18 @@ func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSec
 		if gc, err := m.store.GetGroupChat(to); err == nil {
 			peer = &muninn.Peer{
 				ID:            gc.UID,
+				Key:		   gc.UID + ":" + gc.SignPublic
 				EncryptionKey: gc.EncPublic,
 				SignatureKey:  gc.SignPublic,
 				IsFake:        true,
 			}
 		}
+	}
+
+	cm := ChatMessage{From: m.Username, Text: text, Timestamp: now, MsgID: msgID, Files: files}
+	jsonData, _ := json.Marshal(cm)
+	if err := m.store.SaveMessage(msgID, peer.Key, m.Key, peer.Key, jsonData, cm.Timestamp); err != nil {
+		log.Printf("save message: %v", err)
 	}
 
 	if peer == nil {
@@ -1371,20 +1378,6 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		chunks[i] = chunkData{envData, chunkHash, crypto.EncodeKey(sig)}
 	}
 	log.Printf("sendOffline[%s]: stored %d chunks locally", msgID, len(chunks))
-
-	cm := ChatMessage{From: m.Username, Text: text, Timestamp: now, MsgID: msgID, Files: files}
-	jsonData, _ := json.Marshal(cm)
-	if err := m.store.SaveMessage(msgID, peer.Key, m.Key, peer.Key, jsonData, cm.Timestamp); err != nil {
-		log.Printf("save message: %v", err)
-	}
-	m.msgSubsMu.Lock()
-	for _, sub := range m.msgSubs {
-		select {
-		case sub <- cm:
-		default:
-		}
-	}
-	m.msgSubsMu.Unlock()
 
 	for i := range chunks {
 		if err := m.store.StorePendingChunk(&store.PendingChunk{
