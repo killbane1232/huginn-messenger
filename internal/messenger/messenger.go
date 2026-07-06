@@ -948,12 +948,6 @@ func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSec
 		}
 	}
 
-	cm := ChatMessage{From: m.Username, Text: text, Timestamp: now, MsgID: msgID, Files: files}
-	jsonData, _ := json.Marshal(cm)
-	if err := m.store.SaveMessage(msgID, peer.Key, m.Key, peer.Key, jsonData, cm.Timestamp); err != nil {
-		log.Printf("save message: %v", err)
-	}
-
 	if peer == nil {
 		return fmt.Errorf("peer %s not found", to)
 	}
@@ -968,6 +962,12 @@ func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSec
 	}
 
 	msgID := uuid.New().String()
+	now := time.Now()
+	cm := ChatMessage{From: m.Username, Text: text, Timestamp: now, MsgID: msgID, Files: files}
+	jsonData, _ := json.Marshal(cm)
+	if err := m.store.SaveMessage(msgID, peer.Key, m.Key, peer.Key, jsonData, cm.Timestamp); err != nil {
+		log.Printf("save message: %v", err)
+	}
 
 	onlinePeerID := peer.ID
 	if onlinePeerID == "" {
