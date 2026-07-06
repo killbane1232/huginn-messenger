@@ -2231,9 +2231,9 @@ func getLogin(key string) string {
 }
 
 func (m *Messenger) PeerSlice() []muninn.Peer {
-    s := make([]muninn.Peer, 0, len(m.peers))
-    for _, v := range m.peers {
-        s = append(s, v)
-    }
-    return s
+	s := make([]muninn.Peer, 0, len(m.peersMap))
+	for _, v := range m.peersMap {
+		s = append(s, v)
+	}
+	return s
 }
