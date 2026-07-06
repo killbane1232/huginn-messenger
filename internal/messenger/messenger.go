@@ -1377,6 +1377,14 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 	if err := m.store.SaveMessage(msgID, peer.Key, m.Key, peer.Key, jsonData, cm.Timestamp); err != nil {
 		log.Printf("save message: %v", err)
 	}
+	m.msgSubsMu.Lock()
+	for _, sub := range m.msgSubs {
+		select {
+		case sub <- cm:
+		default:
+		}
+	}
+	m.msgSubsMu.Unlock()
 
 	for i := range chunks {
 		if err := m.store.StorePendingChunk(&store.PendingChunk{
