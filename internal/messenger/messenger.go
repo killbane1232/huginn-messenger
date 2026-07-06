@@ -893,6 +893,35 @@ func (m *Messenger) findPeerByKey(key string) *muninn.Peer {
 	}
 	login := keySplit[0]
 	signature := keySplit[1]
+
+	m.mu.RLock()
+	peer, exists := m.peersMap[key]
+	m.mu.RUnlock()
+	if exists && peer.ID != "" {
+		return &peer
+	}
+
+	stored, err := m.muninnClient.GetAllByKey(m.ctx, login, signature)
+	if err != nil || stored == nil {
+		if exists {
+			return &peer
+		}
+		return nil
+	}
+
+	for _, p := range stored {
+		m.upsertPeer(p.ID, p.Key, getLogin(p.Key), p.EncryptionKey, p.SignatureKey, time.Now(), p.IsFake)
+	}
+	m.mu.RLock()
+	peer, exists = m.peersMap[key]
+	m.mu.RUnlock()
+	if exists {
+		return &peer
+	}
+	return nil
+}
+	login := keySplit[0]
+	signature := keySplit[1]
 	m.mu.RLock()
 	peer, exists := m.peersMap[key]
 	if exists {
@@ -959,15 +988,22 @@ func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSec
 
 	msgID := uuid.New().String()
 
-	if m.IsPeerOnline(peer.ID) {
-		if !m.IsPeerConnected(peer.ID) {
-			m.ConnectPeer(peer.ID)
+	onlinePeerID := peer.ID
+	if onlinePeerID == "" {
+		if p := m.findPeerByKey(to); p != nil {
+			onlinePeerID = p.ID
 		}
 	}
 
-	if m.IsPeerConnected(peer.ID) {
+	if onlinePeerID != "" && m.IsPeerOnline(onlinePeerID) {
+		if !m.IsPeerConnected(onlinePeerID) {
+			m.ConnectPeer(onlinePeerID)
+		}
+	}
+
+	if onlinePeerID != "" && m.IsPeerConnected(onlinePeerID) {
 		now := time.Now()
-		if err := m.rtcManager.SendMessage(peer.ID, text, now, msgID); err != nil {
+		if err := m.rtcManager.SendMessage(onlinePeerID, text, now, msgID); err != nil {
 			return m.sendOffline(msgID, text, peer, ttlSeconds, files)
 		}
 		return m.sendOffline(msgID, text, peer, ttlSeconds, files)
@@ -1316,7 +1352,7 @@ func (m *Messenger) handleReloginResponse(peerID string, resp webrtc.ReloginResp
 }
 
 func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSeconds int, files []FileMeta) error {
-	log.Printf("sending offline message %s to %s via chunks", msgID, peer.ID)
+	log.Printf("sendOffline[%s]: start peer.ID=%q peer.Key=%q", msgID, peer.ID, peer.Key)
 
 	now := time.Now()
 
@@ -1335,6 +1371,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 	if err != nil {
 		return fmt.Errorf("split encrypt: %w", err)
 	}
+	log.Printf("sendOffline[%s]: split into %d chunks", msgID, len(envelopes))
 
 	if ttlSeconds <= 0 {
 		ttlSeconds = config.ChunkTTLSeconds("1w")
@@ -1359,6 +1396,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		sig := crypto.Sign(m.signPrivate, []byte(expectedPayload))
 		chunks[i] = chunkData{envData, chunkHash, crypto.EncodeKey(sig)}
 	}
+	log.Printf("sendOffline[%s]: stored %d chunks locally", msgID, len(chunks))
 
 	cm := ChatMessage{From: m.Username, Text: text, Timestamp: now, MsgID: msgID, Files: files}
 	jsonData, _ := json.Marshal(cm)
@@ -1382,6 +1420,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 			log.Printf("store pending chunk %s/%d: %v", msgID, i, err)
 		}
 	}
+	log.Printf("sendOffline[%s]: stored pending chunks", msgID)
 
 	localRegBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
 	for i, c := range chunks {
@@ -1390,18 +1429,24 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 			Hash: c.hash, Signature: c.sig, PeerID: m.ID,
 		}
 	}
+	log.Printf("sendOffline[%s]: registering chunks locally...", msgID)
 	if err := m.muninnClient.RegisterChunks(m.ctx, msgID, muninn.RegisterChunkBatchRequest{Chunks: localRegBatch}); err != nil {
-		log.Printf("register batch %s on %s: %v", msgID, peer.Key, err)
+		log.Printf("register batch %s on self: %v", msgID, err)
+	} else {
+		log.Printf("sendOffline[%s]: registered chunks locally", msgID)
 	}
 
+	log.Printf("sendOffline[%s]: getting best peers...", msgID)
 	onlinePeers, err := m.muninnClient.GetBestPeers(m.ctx, 10)
 	if err != nil {
+		log.Printf("sendOffline[%s]: GetBestPeers failed: %v, fallback to local", msgID, err)
 		onlinePeers = m.getOnlinePeers()
 	}
+	log.Printf("sendOffline[%s]: got %d best peers", msgID, len(onlinePeers))
 
 	storagePeers := []string{}
 	for _, p := range onlinePeers {
-		if p.ID == m.ID || p.ID == peer.ID {
+		if p.ID == m.ID || (peer.ID != "" && p.ID == peer.ID) {
 			continue
 		}
 		if !m.IsPeerConnected(p.ID) {
@@ -1409,6 +1454,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		}
 		storagePeers = append(storagePeers, p.ID)
 	}
+	log.Printf("sendOffline[%s]: connecting to %d storage peers", msgID, len(storagePeers))
 
 	for i := 0; i < 30 && len(storagePeers) > 0; i++ {
 		time.Sleep(100 * time.Millisecond)
@@ -1424,10 +1470,12 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 		}
 	}
 
+	connected := 0
 	for _, pid := range storagePeers {
 		if !m.IsPeerConnected(pid) {
 			continue
 		}
+		connected++
 
 		batch := make([]webrtc.ChunkStoreRequest, len(chunks))
 		regBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
@@ -1442,19 +1490,22 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 				Hash: c.hash, Signature: c.sig, PeerID: pid,
 			}
 		}
+		log.Printf("sendOffline[%s]: registering chunks on peer %s...", msgID, pid)
 		if err := m.muninnClient.RegisterChunks(m.ctx, msgID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
 			log.Printf("register batch %s on %s: %v", msgID, pid, err)
 			continue
 		}
+		log.Printf("sendOffline[%s]: sending chunk batch to %s...", msgID, pid)
 		if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
+			log.Printf("send chunk batch %s to %s: %v", msgID, pid, err)
 			continue
 		}
 		for i := range chunks {
 			m.store.MarkChunkPlaced(msgID, i)
 		}
+		log.Printf("sendOffline[%s]: chunks sent to %s", msgID, pid)
 	}
-
-	log.Printf("offline message %s sent", msgID)
+	log.Printf("sendOffline[%s]: done, connected=%d/%d", msgID, connected, len(storagePeers))
 	return nil
 }
 
