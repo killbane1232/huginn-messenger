@@ -239,7 +239,8 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	if oldUsername == "" {
 		oldUsername = peerID
 	}
-	key := username + ":" + crypto.EncodeKey(signPub)
+	key := oldUsername + ":" + crypto.EncodeKey(signPub)
+	log.Printf("messenger: final key=%q", key)
 	m := &Messenger{
 		ID:       peerID,
 		Key:      key,
@@ -968,6 +969,14 @@ func (m *Messenger) sendMessageAsync(to, text string, filePaths []string, ttlSec
 	if err := m.store.SaveMessage(msgID, peer.Key, m.Key, peer.Key, jsonData, cm.Timestamp); err != nil {
 		log.Printf("save message: %v", err)
 	}
+	m.msgSubsMu.Lock()
+	for _, sub := range m.msgSubs {
+		select {
+		case sub <- cm:
+		default:
+		}
+	}
+	m.msgSubsMu.Unlock()
 
 	onlinePeerID := peer.ID
 	if onlinePeerID == "" {
