@@ -424,7 +424,7 @@ func (c *Client) ReportChunk(ctx context.Context, sourcePeerID string, req Chunk
 }
 
 func (c *Client) GetChunksByRecipient(ctx context.Context, recipientID string, dateFrom int64) ([]ChunkRecord, error) {
-	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks?date_from=%d", c.baseURL, url.PathEscape(recipientID), dateFrom)
+	url := fmt.Sprintf("%s/api/v1/recipient/chunks?date_from=%d&recipient_id=%s", c.baseURL, dateFrom, url.PathEscape(recipientID))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
