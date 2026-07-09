@@ -41,13 +41,12 @@ func keysJSONFromDB(t *testing.T, dbPath string) ([]byte, error) {
 func iceServers() []pion.ICEServer {
 	return []pion.ICEServer{
 		{
-			URLs:       []string{
+			URLs: []string{
 				"stun:stun.l.google.com:19302",
 			},
 		},
 	}
 }
-
 
 func TestCryptoRoundtrip(t *testing.T) {
 	signPub, signPriv, err := crypto.GenerateSigningKey()
@@ -249,15 +248,22 @@ func (ts *testMuninnServer) handleRegister(w http.ResponseWriter, r *http.Reques
 	key := req.Login + ":" + req.SignatureKey
 	ts.peers[req.ID] = &muninn.Peer{
 		ID:            req.ID,
-		Key:           key,
+		Login:         req.Login,
 		IDS:           []string{req.ID},
-		Addresses:     req.Addresses,
 		EncryptionKey: req.EncryptionKey,
 		SignatureKey:  req.SignatureKey,
-		Metadata:      req.Metadata,
 		LastSeen:      time.Now(),
 		TTLSeconds:    req.TTLSeconds,
-		QualityScore:  100,
+		IsFake:        req.Fake != nil && *req.Fake,
+	}
+	ts.peers[key] = &muninn.Peer{
+		ID:            req.ID,
+		Login:         req.Login,
+		IDS:           []string{req.ID},
+		EncryptionKey: req.EncryptionKey,
+		SignatureKey:  req.SignatureKey,
+		LastSeen:      time.Now(),
+		TTLSeconds:    req.TTLSeconds,
 		IsFake:        req.Fake != nil && *req.Fake,
 	}
 	ts.mu.Unlock()
@@ -381,7 +387,7 @@ func (ts *testMuninnServer) handleGetChunks(w http.ResponseWriter, r *http.Reque
 	// recipientID may be a Key or an ID; if it's an ID, map to Key
 	recipientKey := recipientID
 	if p, ok := ts.peers[recipientID]; ok {
-		recipientKey = p.Key
+		recipientKey = p.Key()
 	}
 	var records []muninn.ChunkRecord
 	for _, c := range ts.chunks {
@@ -442,7 +448,7 @@ func (ts *testMuninnServer) handleGetByKey(w http.ResponseWriter, r *http.Reques
 	ts.mu.Lock()
 	var result []muninn.Peer
 	for _, p := range ts.peers {
-		if strings.HasPrefix(p.Key, login+":") {
+		if strings.HasPrefix(p.Login, login) {
 			result = append(result, *p)
 		}
 	}
@@ -526,7 +532,7 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 	t.Logf("alice peers: %d, bob peers: %d, charley peers: %d",
 		len(alice.GetPeers()), len(bob.GetPeers()), len(charley.GetPeers()))
 
-	err = alice.SendMessage(bob.Key, "hello from alice via charley storage", nil, 604800)
+	err = alice.SendMessageSync(bob.Key, "hello from alice via charley storage", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +628,6 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 }
 
 func TestFileSendAndReceive(t *testing.T) {
-	t.Skip("WebRTC не работает в тестовом окружении (нет ICE серверов)")
 	mn := newTestMuninnServer()
 	defer mn.Close()
 
@@ -638,9 +643,14 @@ func TestFileSendAndReceive(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer bob.Shutdown()
+	charley, err := messenger.New("charley", mc, t.TempDir()+"/charley.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer charley.Shutdown()
 	time.Sleep(300 * time.Millisecond)
 
-	for _, m := range []*messenger.Messenger{alice, bob} {
+	for _, m := range []*messenger.Messenger{alice, bob, charley} {
 		if err := m.Register(); err != nil {
 			t.Fatal(err)
 		}
@@ -656,7 +666,7 @@ func TestFileSendAndReceive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = alice.SendMessage(bob.Key, "here is a file", []string{tmpFile}, 604800)
+	err = alice.SendMessageSync(bob.Key, "here is a file", []string{tmpFile}, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,20 +768,21 @@ func TestFileSendAndReceive(t *testing.T) {
 }
 
 func TestGroupChatFlow(t *testing.T) {
-	t.Skip("WebRTC не работает в тестовом окружении (нет ICE серверов)")
 	mn := newTestMuninnServer()
 	defer mn.Close()
 
 	mc := muninn.NewClient(mn.URL())
 
 	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db",
-		messenger.WithICEServers(iceServers()))
+		messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer alice.Shutdown()
 	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db",
-		messenger.WithICEServers(iceServers()))
+		messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,11 +800,11 @@ func TestGroupChatFlow(t *testing.T) {
 	bob.SearchPeers("alice")
 	time.Sleep(100 * time.Millisecond)
 
-	alice.ConnectPeer("bob")
+	alice.ConnectPeer(bob.ID)
 	deadline := time.Now().Add(5 * time.Second)
 	connected := false
 	for time.Now().Before(deadline) {
-		if alice.IsPeerConnected("bob") && bob.IsPeerConnected("alice") {
+		if alice.IsPeerConnected(bob.ID) && bob.IsPeerConnected(alice.ID) {
 			connected = true
 			break
 		}
@@ -866,13 +877,13 @@ func TestGroupChatFlow(t *testing.T) {
 	aliceMsgCh := alice.SubscribeMessages()
 	defer alice.UnsubscribeMessages(aliceMsgCh)
 
-	if err := alice.SendMessage(gc.UID, "hello from alice in group", nil, 604800); err != nil {
+	if err := alice.SendMessageSync(gc.UID, "hello from alice in group", nil, 604800); err != nil {
 		t.Fatalf("alice send group msg: %v", err)
 	}
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), gc.UID, 0)
+	records, err := mc.GetChunksByRecipient(context.Background(), gc.UID+":"+gc.SignPublic, 0)
 	if err != nil {
 		t.Fatalf("get group chunks: %v", err)
 	}
@@ -905,7 +916,7 @@ func TestGroupChatFlow(t *testing.T) {
 			break
 		}
 
-		records2, err := mc.GetChunksByRecipient(context.Background(), gc.UID, 0)
+		records2, err := mc.GetChunksByRecipient(context.Background(), gc.UID+":"+gc.SignPublic, 0)
 		if err == nil && len(records2) > 0 {
 			for _, rec := range records2 {
 				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
@@ -930,20 +941,21 @@ func TestGroupChatFlow(t *testing.T) {
 }
 
 func TestGroupFileSendAndReceive(t *testing.T) {
-	t.Skip("WebRTC не работает в тестовом окружении (нет ICE серверов)")
 	mn := newTestMuninnServer()
 	defer mn.Close()
 
 	mc := muninn.NewClient(mn.URL())
 
 	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db",
-		messenger.WithICEServers(iceServers()))
+		messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer alice.Shutdown()
 	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db",
-		messenger.WithICEServers(iceServers()))
+		messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1022,14 +1034,14 @@ func TestGroupFileSendAndReceive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = alice.SendMessage(gc.UID, "here is a file in group chat", []string{tmpFile}, 604800)
+	err = alice.SendMessageSync(gc.UID, "here is a file in group chat", []string{tmpFile}, 604800)
 	if err != nil {
 		t.Fatalf("alice send group file msg: %v", err)
 	}
 
 	time.Sleep(2 * time.Second)
 
-	records, err := mc.GetChunksByRecipient(context.Background(), gc.UID, 0)
+	records, err := mc.GetChunksByRecipient(context.Background(), gc.UID+":"+gc.SignPublic, 0)
 	if err != nil {
 		t.Fatalf("get group chunks: %v", err)
 	}
@@ -1085,7 +1097,7 @@ func TestGroupFileSendAndReceive(t *testing.T) {
 			break
 		}
 
-		records2, err := mc.GetChunksByRecipient(context.Background(), gc.UID, 0)
+		records2, err := mc.GetChunksByRecipient(context.Background(), gc.UID+":"+gc.SignPublic, 0)
 		if err == nil && len(records2) > 0 {
 			for _, rec := range records2 {
 				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
@@ -1143,20 +1155,21 @@ func TestGroupFileSendAndReceive(t *testing.T) {
 }
 
 func TestWebRTCOfflineFallback(t *testing.T) {
-	t.Skip("WebRTC не работает в тестовом окружении (нет ICE серверов)")
 	mn := newTestMuninnServer()
 	defer mn.Close()
 
 	mc := muninn.NewClient(mn.URL())
 
 	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db",
-		messenger.WithICEServers(iceServers()))
+		messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer alice.Shutdown()
 	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db",
-		messenger.WithICEServers(iceServers()))
+		messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1177,12 +1190,12 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 	msgCh := bob.SubscribeMessages()
 	defer bob.UnsubscribeMessages(msgCh)
 
-	alice.ConnectPeer("bob")
+	alice.ConnectPeer(bob.ID)
 
 	deadline := time.Now().Add(5 * time.Second)
 	connected := false
 	for time.Now().Before(deadline) {
-		if alice.IsPeerConnected("bob") && bob.IsPeerConnected("alice") {
+		if alice.IsPeerConnected(bob.ID) && bob.IsPeerConnected(alice.ID) {
 			connected = true
 			break
 		}
@@ -1194,7 +1207,7 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 	t.Log("WebRTC connection established, waiting for data channel to open...")
 	time.Sleep(2 * time.Second)
 
-	err = alice.SendMessage(bob.Key, "hello via webrtc", nil, 604800)
+	err = alice.SendMessageSync(bob.Key, "hello via webrtc", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1273,7 +1286,7 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 	}
 
 	via := "WebRTC"
-	if !alice.IsPeerConnected("bob") {
+	if !alice.IsPeerConnected(bob.ID) {
 		via = "offline fallback"
 	}
 	t.Logf("OK: message delivered via %s, id=%s", via, delivered.MsgID)
@@ -1288,12 +1301,14 @@ func TestReloginFlow(t *testing.T) {
 	aliceDB := t.TempDir() + "/alice.db"
 	bobDB := t.TempDir() + "/bob.db"
 
-	alice, err := messenger.New("alice", mc, aliceDB, messenger.WithICEServers(iceServers()))
+	alice, err := messenger.New("alice", mc, aliceDB, messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer alice.Shutdown()
-	bob, err := messenger.New("bob", mc, bobDB, messenger.WithICEServers(iceServers()))
+	bob, err := messenger.New("bob", mc, bobDB, messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1311,12 +1326,12 @@ func TestReloginFlow(t *testing.T) {
 	bob.SearchPeers("alice")
 	time.Sleep(100 * time.Millisecond)
 
-	alice.ConnectPeer("bob")
-	bob.ConnectPeer("alice")
+	alice.ConnectPeer(bob.ID)
+	bob.ConnectPeer(alice.ID)
 	deadline := time.Now().Add(5 * time.Second)
 	connected := false
 	for time.Now().Before(deadline) {
-		if alice.IsPeerConnected("bob") && bob.IsPeerConnected("alice") {
+		if alice.IsPeerConnected(bob.ID) && bob.IsPeerConnected(alice.ID) {
 			connected = true
 			break
 		}
@@ -1441,18 +1456,19 @@ func TestReloginFlow(t *testing.T) {
 }
 
 func TestFailedChunkRetry(t *testing.T) {
-	t.Skip("Флапает")
 	mn := newTestMuninnServer()
 	defer mn.Close()
 
 	mc := muninn.NewClient(mn.URL())
 
-	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db", messenger.WithICEServers(iceServers()))
+	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db", messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer alice.Shutdown()
-	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db", messenger.WithICEServers(iceServers()))
+	bob, err := messenger.New("bob", mc, t.TempDir()+"/bob.db", messenger.WithICEServers(iceServers()),
+		messenger.WithPoll())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1466,7 +1482,7 @@ func TestFailedChunkRetry(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	err = alice.SendMessage(bob.Key, "test retry failed chunks", nil, 604800)
+	err = alice.SendMessageSync(bob.Key, "test retry failed chunks", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}

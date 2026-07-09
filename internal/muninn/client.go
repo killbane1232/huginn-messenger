@@ -19,11 +19,6 @@ const (
 	PeerFlagVeryThick PeerFlag = "very_thick"
 )
 
-type QualityStats struct {
-	ValidReports   int `json:"valid_reports"`
-	InvalidReports int `json:"invalid_reports"`
-}
-
 type Signal struct {
 	From string `json:"from"`
 	Type string `json:"type"`
@@ -49,32 +44,35 @@ func NewClient(baseURL string) *Client {
 }
 
 type Peer struct {
-	ID            string            `json:"id"`
-	IDS			  []string			`json:ignore`
-	Key           string            `json:"key"`
-	Addresses     []string          `json:"addresses"`
-	PublicKey     string            `json:"public_key,omitempty"`
-	EncryptionKey string            `json:"encryption_key,omitempty"`
-	SignatureKey  string            `json:"signature_key,omitempty"`
-	Metadata      map[string]string `json:"metadata,omitempty"`
-	LastSeen      time.Time         `json:"last_seen"`
-	TTLSeconds    int               `json:"ttl_seconds"`
-	QualityScore  int               `json:"quality_score"`
-	Quality       QualityStats      `json:"quality"`
-	PeerFlag      PeerFlag          `json:"peer_flag,omitempty"`
-	IsFake        bool              `json:"is_fake,omitempty"`
+	ID            string    `json:"id"`
+	IDS           []string  `json:ignore`
+	Login         string    `json:"login"`
+	EncryptionKey string    `json:"encryption_key,omitempty"`
+	SignatureKey  string    `json:"signature_key,omitempty"`
+	LastSeen      time.Time `json:"last_seen"`
+	TTLSeconds    int       `json:"ttl_seconds"`
+	PeerFlag      PeerFlag  `json:"peer_flag,omitempty"`
+	IsFake        bool      `json:"is_fake,omitempty"`
+}
+
+func (p Peer) Key() string {
+	return p.Login + ":" + p.SignatureKey
 }
 
 type RegisterRequest struct {
-	ID            string            `json:"id"`
-	Login         string            `json:"login"`
-	Addresses     []string          `json:"addresses"`
-	EncryptionKey string            `json:"encryption_key,omitempty"`
-	SignatureKey  string            `json:"signature_key,omitempty"`
-	Metadata      map[string]string `json:"metadata,omitempty"`
-	TTLSeconds    int               `json:"ttl_seconds,omitempty"`
-	PeerFlag      PeerFlag          `json:"peer_flag,omitempty"`
-	Fake          *bool             `json:"fake,omitempty"`
+	ID            string   `json:"id"`
+	Login         string   `json:"login"`
+	EncryptionKey string   `json:"encryption_key,omitempty"`
+	SignatureKey  string   `json:"signature_key,omitempty"`
+	TTLSeconds    int      `json:"ttl_seconds,omitempty"`
+	PeerFlag      PeerFlag `json:"peer_flag,omitempty"`
+	Fake          *bool    `json:"fake,omitempty"`
+}
+
+type RefreshRequest struct {
+	ID           string `json:"id"`
+	Login        string `json:"login"`
+	SignatureKey string `json:"signature_key,omitempty"`
 }
 
 type RegisterChunkRequest struct {
@@ -228,6 +226,28 @@ func (c *Client) Register(ctx context.Context, req *RegisterRequest) error {
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("register failed (status %d): %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+func (c *Client) Refresh(ctx context.Context, req *RefreshRequest) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+"/api/v1/peers", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("refresh failed (status %d): %s", resp.StatusCode, string(b))
 	}
 	return nil
 }

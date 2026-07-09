@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS stored_peers (
     encryption_key TEXT NOT NULL DEFAULT '',
     signature_key TEXT NOT NULL DEFAULT '',
     last_seen DATETIME NOT NULL,
-    PRIMARY KEY (login, peer_id)
+    PRIMARY KEY (login, signature_key)
 );
 
 CREATE TABLE IF NOT EXISTS messages (

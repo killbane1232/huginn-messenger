@@ -168,7 +168,7 @@ func (s *Server) handlePeerSearch(w http.ResponseWriter, r *http.Request) {
 	peers := s.messenger.SearchPeers(q)
 	resp := make([]peerResponse, len(peers))
 	for i, p := range peers {
-		resp[i] = peerResponse{Peer: p, Online: s.messenger.IsPeerOnlineByKey(p.Key)}
+		resp[i] = peerResponse{Peer: p, Online: s.messenger.IsPeerOnlineByKey(p.Key())}
 	}
 	json.NewEncoder(w).Encode(resp)
 }
@@ -180,7 +180,7 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := make([]peerResponse, len(peers))
 	for i, p := range peers {
-		resp[i] = peerResponse{Peer: p, Online: s.messenger.IsPeerOnlineByKey(p.Key)}
+		resp[i] = peerResponse{Peer: p, Online: s.messenger.IsPeerOnlineByKey(p.Key())}
 	}
 	json.NewEncoder(w).Encode(resp)
 }
@@ -402,7 +402,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			peers := s.messenger.GetPeers()
 			resp := make([]peerResponse, len(peers))
 			for i, p := range peers {
-				resp[i] = peerResponse{Peer: p, Online: s.messenger.IsPeerOnlineByKey(p.Key)}
+				resp[i] = peerResponse{Peer: p, Online: s.messenger.IsPeerOnlineByKey(p.Key())}
 			}
 			data, _ := json.Marshal(resp)
 			fmt.Fprintf(w, "event: peers\ndata: %s\n\n", data)

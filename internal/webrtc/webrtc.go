@@ -3,9 +3,9 @@ package webrtc
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
-	"log"
 
 	pion "github.com/pion/webrtc/v4"
 )
@@ -273,7 +273,11 @@ func (m *Manager) CreateOffer(remoteID string) (pion.SessionDescription, error) 
 		return pion.SessionDescription{}, fmt.Errorf("set local desc: %w", err)
 	}
 
-	<-pion.GatheringCompletePromise(pc)
+	gatherDone := pion.GatheringCompletePromise(pc)
+	select {
+	case <-gatherDone:
+	case <-time.After(3 * time.Second):
+	}
 	return *pc.LocalDescription(), nil
 }
 
@@ -300,7 +304,11 @@ func (m *Manager) HandleOffer(remoteID string, offer pion.SessionDescription) (p
 		return pion.SessionDescription{}, fmt.Errorf("set local answer: %w", err)
 	}
 
-	<-pion.GatheringCompletePromise(pc)
+	gatherDone := pion.GatheringCompletePromise(pc)
+	select {
+	case <-gatherDone:
+	case <-time.After(3 * time.Second):
+	}
 	return *pc.LocalDescription(), nil
 }
 

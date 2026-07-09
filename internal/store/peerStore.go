@@ -2,6 +2,7 @@ package store
 
 import (
 	_ "database/sql"
+	"strings"
 	"time"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
 )
@@ -16,18 +17,19 @@ type StoredPeer struct {
 
 func (s *StoredPeer) ToMuninnPeer() muninn.Peer {
 	return muninn.Peer{
-		Key:           s.PeerID,
-		Addresses:     nil,
+		Login:         getLogin(s.PeerID),
 		EncryptionKey: s.EncryptionKey,
 		SignatureKey:  s.SignatureKey,
-		Metadata:      nil,
 		LastSeen:      time.Now(),
-		QualityScore:  100,
 		IsFake:        s.IsFake,
 	}
 }
 
-func (s *SQLiteStore) StorePeer(peerID string, login string, encryptionKey, signatureKey string, lastSeen time.Time, isFake bool) error {
+func getLogin(key string) string {
+	return strings.Split(key, ":")[0]
+}
+
+func (s *SQLiteStore) StorePeer(login, peerID, encryptionKey, signatureKey string, lastSeen time.Time, isFake bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
@@ -36,7 +38,7 @@ func (s *SQLiteStore) StorePeer(peerID string, login string, encryptionKey, sign
 	return err
 }
 
-func (s *SQLiteStore) SearchStoredPeers(query string) ([]StoredPeer, error) {
+func (s *SQLiteStore) SearchStoredPeers(query string) ([]muninn.Peer, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
@@ -46,13 +48,13 @@ func (s *SQLiteStore) SearchStoredPeers(query string) ([]StoredPeer, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var peers []StoredPeer
+	var peers []muninn.Peer
 	for rows.Next() {
 		var p StoredPeer
 		if err := rows.Scan(&p.PeerID, &p.EncryptionKey, &p.SignatureKey, &p.LastSeen, &p.IsFake); err != nil {
 			return nil, err
 		}
-		peers = append(peers, p)
+		peers = append(peers, p.ToMuninnPeer())
 	}
 	return peers, rows.Err()
 }
