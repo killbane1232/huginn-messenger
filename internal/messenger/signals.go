@@ -5,8 +5,9 @@ import (
 	"log"
 	"time"
 
+	"runtime/debug"
+
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
-	//"runtime/debug"
 	pion "github.com/pion/webrtc/v4"
 )
 
@@ -45,8 +46,8 @@ func (m *Messenger) handleSignal(sig muninn.Signal) {
 		}
 		ansData, _ := json.Marshal(answer)
 
-		if m.rtcClient != nil && m.rtcClient.IsConnected() {
-			if err := m.rtcClient.RelaySignal(m.ctx, sig.From, "answer", string(ansData)); err != nil {
+		if m.wsClient != nil && m.wsClient.IsConnected() {
+			if err := m.wsClient.RelaySignal(m.ctx, sig.From, "answer", string(ansData)); err != nil {
 				log.Printf("rtc relay answer to %s: %v, fallback to http", sig.From, err)
 				m.muninnClient.SendSignal(m.ctx, sig.From, muninn.Signal{From: m.ID, Type: "answer", Data: string(ansData)})
 			}
@@ -73,17 +74,17 @@ func (m *Messenger) rtcReconnectLoop() {
 		case <-time.After(5 * time.Second):
 		}
 
-		if m.rtcClient.IsConnected() {
+		if m.wsClient.IsConnected() {
 			continue
 		}
 
-		log.Printf("[rtc] attempting to reconnect to muninn...")
-		if err := m.rtcClient.Connect(m.ctx); err != nil {
-			log.Printf("[rtc] reconnect failed: %v", err)
-			//log.Printf("[rtc] reconnect stack:\n%s", debug.Stack())
+		log.Printf("[ws] attempting to reconnect to muninn...")
+		if err := m.wsClient.Connect(m.ctx); err != nil {
+			log.Printf("[ws] reconnect failed: %v", err)
+			log.Printf("[ws] reconnect stack:\n%s", debug.Stack())
 			continue
 		}
-		log.Printf("[rtc] reconnected to muninn")
+		log.Printf("[ws] reconnected to muninn")
 	}
 }
 

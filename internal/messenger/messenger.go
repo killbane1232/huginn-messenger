@@ -117,7 +117,7 @@ type Messenger struct {
 	encPublic   []byte
 
 	muninnClient *muninn.Client
-	rtcClient    *muninn.RTCClient
+	wsClient     *muninn.WSClient
 	rtcManager   *webrtc.Manager
 	rtcMsgChan   chan webrtc.ChatMessage
 	signalChan   chan muninn.Signal
@@ -293,16 +293,21 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	m.rtcManager = webrtc.NewManager(peerID, rtcMsgChan, m.handleChunkStore, m.handleChunkGet,
 		m.handleReloginRequest, m.handleReloginResponse, o.iceServers)
 
-	m.rtcClient = muninn.NewRTCClient(muninnClient.BaseURL(), peerID, o.iceServers)
-	m.rtcClient.SetOnSignal(func(sig muninn.Signal) {
+	m.wsClient = muninn.NewWSClient(muninnClient.BaseURL(), peerID)
+	m.wsClient.SetOnSignal(func(sig muninn.Signal) {
 		select {
 		case m.signalChan <- sig:
 		default:
-			log.Printf("dropping rtc signal from %s (channel full)", sig.From)
+			log.Printf("dropping ws signal from %s (channel full)", sig.From)
 		}
 	})
-	m.rtcClient.SetOnDisconnect(func() {
-		log.Printf("[rtc] connection to muninn lost, will reconnect")
+	m.wsClient.SetOnDisconnect(func() {
+		log.Printf("[ws] connection to muninn lost, will reconnect")
+		err := m.wsClient.Connect(m.ctx)
+		if err == nil {
+			log.Printf("[ws] reconnected to muninn")
+		}
+		log.Printf("[ws] reconnect failed: %v", err)
 	})
 	go m.rtcReconnectLoop()
 	storedPeers, _ := st.GetStoredPeers()
@@ -581,7 +586,7 @@ func (m *Messenger) Shutdown() {
 	delCtx, delCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer delCancel()
 	m.muninnClient.Delete(delCtx, m.ID)
-	m.rtcClient.Close()
+	m.wsClient.Close()
 	m.rtcManager.CloseAll()
 	m.store.Close()
 }

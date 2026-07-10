@@ -1,24 +1,23 @@
 package muninn
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	pion "github.com/pion/webrtc/v4"
+	"github.com/gorilla/websocket"
 )
 
 const (
-	rpcMethodSignalRelay     = "signal_relay"
-	rpcNotifyIncomingSignal  = "incoming_signal"
-	rpcMethodConnectToPeer   = "connect_to_peer"
+	rpcMethodSignalRelay    = "signal_relay"
+	rpcNotifyIncomingSignal = "incoming_signal"
+	rpcMethodConnectToPeer  = "connect_to_peer"
 
 	rtcRequestTimeout = 10 * time.Second
 )
@@ -29,7 +28,7 @@ type rpcRequest struct {
 	Params json.RawMessage `json:"params"`
 }
 
-type rpcResponse struct {
+type wsResponse struct {
 	ID     string          `json:"id"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  string          `json:"error,omitempty"`
@@ -62,17 +61,15 @@ type OnSignalFunc func(sig Signal)
 
 type OnDisconnectFunc func()
 
-type RTCClient struct {
+type WSClient struct {
 	mu      sync.RWMutex
 	baseURL string
 	localID string
 
-	pc         *pion.PeerConnection
-	dc         *pion.DataChannel
-	connected  bool
-	iceServers []pion.ICEServer
+	conn      *websocket.Conn
+	connected bool
 
-	pending   map[string]chan<- rpcResponse
+	pending   map[string]chan<- wsResponse
 	pendingMu sync.Mutex
 
 	onSignal     OnSignalFunc
@@ -81,160 +78,107 @@ type RTCClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	httpClient *http.Client
-	closeOnce  sync.Once
+	writeMu   sync.Mutex
+	closeOnce sync.Once
 }
 
-func NewRTCClient(baseURL, localID string, iceServers []pion.ICEServer) *RTCClient {
+func NewWSClient(baseURL, localID string) *WSClient {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &RTCClient{
-		baseURL:    baseURL,
-		localID:    localID,
-		iceServers: iceServers,
-		pending:    make(map[string]chan<- rpcResponse),
-		ctx:        ctx,
-		cancel:     cancel,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+	return &WSClient{
+		baseURL: baseURL,
+		localID: localID,
+		pending: make(map[string]chan<- wsResponse),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
-func (c *RTCClient) SetOnSignal(fn OnSignalFunc) {
+func (c *WSClient) SetOnSignal(fn OnSignalFunc) {
 	c.mu.Lock()
 	c.onSignal = fn
 	c.mu.Unlock()
 }
 
-func (c *RTCClient) SetOnDisconnect(fn OnDisconnectFunc) {
+func (c *WSClient) SetOnDisconnect(fn OnDisconnectFunc) {
 	c.mu.Lock()
 	c.onDisconnect = fn
 	c.mu.Unlock()
 }
 
-func (c *RTCClient) Connect(ctx context.Context) error {
-	config := pion.Configuration{
-		ICEServers: c.iceServers,
-	}
-
-	se := pion.SettingEngine{}
-
-	// Полезно на Android: не собирать IPv6-кандидаты.
-	se.SetNetworkTypes([]pion.NetworkType{
-		pion.NetworkTypeUDP4,
-	})
-
-	// Не включайте SetLite(true) на мобильном клиенте.
-	// ICE Lite предназначен для публичного/серверного ICE-агента,
-	// а не как обход Android.
-	api := pion.NewAPI(pion.WithSettingEngine(se))
-
-	pc, err := api.NewPeerConnection(config)
+func (c *WSClient) Connect(ctx context.Context) error {
+	u, err := url.Parse(c.baseURL)
 	if err != nil {
-		return fmt.Errorf("new pc: %w", err)
+		return fmt.Errorf("parse base url: %w", err)
+	}
+	switch u.Scheme {
+	case "https":
+		u.Scheme = "wss"
+	default:
+		u.Scheme = "ws"
+	}
+	u.Path = "/api/v1/ws"
+	q := u.Query()
+	q.Set("peer_id", c.localID)
+	u.RawQuery = q.Encode()
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
 	}
 
-	dc, err := pc.CreateDataChannel("muninn-rpc", nil)
+	header := http.Header{}
+	header.Set("X-Peer-ID", c.localID)
+
+	conn, _, err := dialer.DialContext(ctx, u.String(), header)
 	if err != nil {
-		pc.Close()
-		return fmt.Errorf("create dc: %w", err)
+		return fmt.Errorf("websocket dial: %w", err)
 	}
 
-	c.dc = dc
-	c.pc = pc
+	c.mu.Lock()
+	c.conn = conn
+	c.connected = true
+	c.mu.Unlock()
 
-	dc.OnMessage(func(msg pion.DataChannelMessage) {
-		c.handleMessage(msg.Data)
-	})
+	c.mu.RLock()
+	onDisconnect := c.onDisconnect
+	c.mu.RUnlock()
 
-	dc.OnOpen(func() {
-		c.mu.Lock()
-		c.connected = true
-		c.mu.Unlock()
-		log.Printf("[rtc] connected to muninn")
-	})
+	go c.readLoop(conn, onDisconnect)
 
-	offer, err := pc.CreateOffer(nil)
-	if err != nil {
-		pc.Close()
-		return fmt.Errorf("create offer: %w", err)
-	}
-	if err := pc.SetLocalDescription(offer); err != nil {
-		pc.Close()
-		return fmt.Errorf("set local desc: %w", err)
-	}
-
-	<-pion.GatheringCompletePromise(pc)
-
-	answer, err := c.bootstrap(ctx, *pc.LocalDescription())
-	if err != nil {
-		pc.Close()
-		return fmt.Errorf("bootstrap: %w", err)
-	}
-
-	if err := pc.SetRemoteDescription(*answer); err != nil {
-		pc.Close()
-		return fmt.Errorf("set remote desc: %w", err)
-	}
-
-	pc.OnConnectionStateChange(func(s pion.PeerConnectionState) {
-		switch s {
-		case pion.PeerConnectionStateConnected:
-			log.Printf("[rtc] connection state: connected")
-		case pion.PeerConnectionStateDisconnected,
-			pion.PeerConnectionStateFailed,
-			pion.PeerConnectionStateClosed:
-			c.mu.Lock()
-			c.connected = false
-			c.mu.Unlock()
-			log.Printf("[rtc] connection state: %s", s)
-			if fn := c.onDisconnect; fn != nil {
-				fn()
-			}
-		}
-	})
-
+	log.Printf("[ws] connected to muninn at %s", u.String())
 	return nil
 }
 
-func (c *RTCClient) bootstrap(ctx context.Context, offer pion.SessionDescription) (*pion.SessionDescription, error) {
-	body, err := json.Marshal(offer)
-	if err != nil {
-		return nil, fmt.Errorf("marshal offer: %w", err)
-	}
+func (c *WSClient) readLoop(conn *websocket.Conn, onDisconnect OnDisconnectFunc) {
+	defer func() {
+		c.mu.Lock()
+		c.connected = false
+		c.mu.Unlock()
+		conn.Close()
+		if onDisconnect != nil {
+			onDisconnect()
+		}
+	}()
 
-	url := fmt.Sprintf("%s/api/v1/webrtc/bootstrap", c.baseURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("request: %w", err)
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			if c.ctx.Err() == nil {
+				log.Printf("[ws] read error: %v", err)
+			}
+			return
+		}
+		c.handleMessage(data)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Peer-ID", c.localID)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("bootstrap failed (status %d): %s", resp.StatusCode, string(b))
-	}
-
-	var answer pion.SessionDescription
-	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
-		return nil, fmt.Errorf("decode answer: %w", err)
-	}
-	return &answer, nil
 }
 
-func (c *RTCClient) handleMessage(data []byte) {
+func (c *WSClient) handleMessage(data []byte) {
 	var notif rpcNotification
 	if err := json.Unmarshal(data, &notif); err == nil && notif.Method != "" {
 		c.handleNotification(notif)
 		return
 	}
 
-	var resp rpcResponse
+	var resp wsResponse
 	if err := json.Unmarshal(data, &resp); err != nil || resp.ID == "" {
 		return
 	}
@@ -249,7 +193,7 @@ func (c *RTCClient) handleMessage(data []byte) {
 	}
 }
 
-func (c *RTCClient) handleNotification(notif rpcNotification) {
+func (c *WSClient) handleNotification(notif rpcNotification) {
 	switch notif.Method {
 	case rpcNotifyIncomingSignal:
 		var sig IncomingSignal
@@ -265,9 +209,9 @@ func (c *RTCClient) handleNotification(notif rpcNotification) {
 	}
 }
 
-func (c *RTCClient) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
+func (c *WSClient) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	id := uuid.New().String()
-	ch := make(chan rpcResponse, 1)
+	ch := make(chan wsResponse, 1)
 
 	c.pendingMu.Lock()
 	c.pending[id] = ch
@@ -291,15 +235,18 @@ func (c *RTCClient) sendRequest(ctx context.Context, method string, params any) 
 	}
 
 	c.mu.RLock()
-	dc := c.dc
+	conn := c.conn
 	connected := c.connected
 	c.mu.RUnlock()
 
-	if !connected || dc == nil {
+	if !connected || conn == nil {
 		return nil, fmt.Errorf("not connected to muninn")
 	}
 
-	if err := dc.Send(data); err != nil {
+	c.writeMu.Lock()
+	err = conn.WriteMessage(websocket.TextMessage, data)
+	c.writeMu.Unlock()
+	if err != nil {
 		return nil, fmt.Errorf("send: %w", err)
 	}
 
@@ -316,7 +263,7 @@ func (c *RTCClient) sendRequest(ctx context.Context, method string, params any) 
 	}
 }
 
-func (c *RTCClient) RelaySignal(ctx context.Context, targetID, sigType, data string) error {
+func (c *WSClient) RelaySignal(ctx context.Context, targetID, sigType, data string) error {
 	params := SignalRelayRequest{
 		TargetID: targetID,
 		From:     c.localID,
@@ -327,7 +274,7 @@ func (c *RTCClient) RelaySignal(ctx context.Context, targetID, sigType, data str
 	return err
 }
 
-func (c *RTCClient) ConnectToPeer(ctx context.Context, targetID, offer string) error {
+func (c *WSClient) ConnectToPeer(ctx context.Context, targetID, offer string) error {
 	params := ConnectToPeerRequest{
 		TargetID: targetID,
 		Offer:    offer,
@@ -336,21 +283,18 @@ func (c *RTCClient) ConnectToPeer(ctx context.Context, targetID, offer string) e
 	return err
 }
 
-func (c *RTCClient) IsConnected() bool {
+func (c *WSClient) IsConnected() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.connected
 }
 
-func (c *RTCClient) Close() {
+func (c *WSClient) Close() {
 	c.closeOnce.Do(func() {
 		c.cancel()
 		c.mu.Lock()
-		if c.dc != nil {
-			c.dc.Close()
-		}
-		if c.pc != nil {
-			c.pc.Close()
+		if c.conn != nil {
+			c.conn.Close()
 		}
 		c.connected = false
 		c.mu.Unlock()

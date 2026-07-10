@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/killbane1232/huginn-messenger/internal/chunk"
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 	"github.com/killbane1232/huginn-messenger/internal/messenger"
@@ -204,6 +205,10 @@ type testMuninnServer struct {
 	chunks  []muninn.ChunkRecord
 	signals map[string][]muninn.Signal
 	srv     *httptest.Server
+
+	wsMu     sync.Mutex
+	wsConns  map[string]*websocket.Conn
+	upgrader websocket.Upgrader
 }
 
 func newTestMuninnServer() *testMuninnServer {
@@ -211,6 +216,10 @@ func newTestMuninnServer() *testMuninnServer {
 		peers:   make(map[string]*muninn.Peer),
 		chunks:  nil,
 		signals: make(map[string][]muninn.Signal),
+		wsConns: make(map[string]*websocket.Conn),
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/peers", ts.handleRegister)
@@ -230,7 +239,7 @@ func newTestMuninnServer() *testMuninnServer {
 	mux.HandleFunc("POST /api/v1/chunks/read", ts.handleReadChunk)
 	mux.HandleFunc("DELETE /api/v1/recipient/{recipientID}/chunks/{fileID}", ts.handleDeleteChunksByRecipient)
 	mux.HandleFunc("GET /api/v1/keys/{login}", ts.handleGetByKey)
-	mux.HandleFunc("POST /api/v1/webrtc/bootstrap", ts.handleBootstrap)
+	mux.HandleFunc("/api/v1/ws", ts.handleWebSocket)
 	ts.srv = httptest.NewServer(mux)
 	return ts
 }
@@ -459,17 +468,130 @@ func (ts *testMuninnServer) handleGetByKey(w http.ResponseWriter, r *http.Reques
 	json.NewEncoder(w).Encode(result)
 }
 
-func (ts *testMuninnServer) handleBootstrap(w http.ResponseWriter, r *http.Request) {
-	var offer pion.SessionDescription
-	if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+func (ts *testMuninnServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := ts.upgrader.Upgrade(w, r, nil)
+	if err != nil {
 		return
 	}
-	answer := pion.SessionDescription{
-		Type: pion.SDPTypeAnswer,
-		SDP:  offer.SDP,
+
+	peerID := r.URL.Query().Get("peer_id")
+
+	ts.wsMu.Lock()
+	ts.wsConns[peerID] = conn
+	ts.wsMu.Unlock()
+	ts.mu.Lock()
+	signals := ts.signals[peerID]
+	ts.mu.Unlock()
+	for _, sig := range signals {
+		notif := map[string]any{
+			"method": "incoming_signal",
+			"params": map[string]string{
+				"from": sig.From,
+				"type": sig.Type,
+				"data": sig.Data,
+			},
+		}
+		notifData, _ := json.Marshal(notif)
+		conn.WriteMessage(websocket.TextMessage, notifData)
 	}
-	json.NewEncoder(w).Encode(answer)
+
+	defer func() {
+		ts.wsMu.Lock()
+		delete(ts.wsConns, peerID)
+		ts.wsMu.Unlock()
+		conn.Close()
+	}()
+
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		var rpcReq struct {
+			ID     string          `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.Unmarshal(data, &rpcReq); err != nil {
+			continue
+		}
+
+		switch rpcReq.Method {
+		case "connect_to_peer":
+			var params struct {
+				TargetID string `json:"target_id"`
+				Offer    string `json:"offer"`
+			}
+			if err := json.Unmarshal(rpcReq.Params, &params); err != nil {
+				continue
+			}
+
+			resp := map[string]any{"id": rpcReq.ID, "result": map[string]string{"status": "relayed"}}
+			respData, _ := json.Marshal(resp)
+			conn.WriteMessage(websocket.TextMessage, respData)
+
+			ts.wsMu.Lock()
+			targetConn, ok := ts.wsConns[params.TargetID]
+			ts.wsMu.Unlock()
+			if ok {
+				notif := map[string]any{
+					"method": "incoming_signal",
+					"params": map[string]string{
+						"from": peerID,
+						"type": "offer",
+						"data": params.Offer,
+					},
+				}
+				notifData, _ := json.Marshal(notif)
+				targetConn.WriteMessage(websocket.TextMessage, notifData)
+			} else {
+				ts.mu.Lock()
+				ts.signals[params.TargetID] = append(ts.signals[params.TargetID], muninn.Signal{From: peerID, Type: "offer", Data: params.Offer})
+				ts.mu.Unlock()
+			}
+
+		case "signal_relay":
+			var params struct {
+				TargetID string `json:"target_id"`
+				From     string `json:"from"`
+				Type     string `json:"type"`
+				Data     string `json:"data"`
+			}
+			if err := json.Unmarshal(rpcReq.Params, &params); err != nil {
+				continue
+			}
+
+			resp := map[string]any{"id": rpcReq.ID, "result": map[string]string{"status": "relayed"}}
+			respData, _ := json.Marshal(resp)
+			conn.WriteMessage(websocket.TextMessage, respData)
+
+			ts.wsMu.Lock()
+			targetConn, ok := ts.wsConns[params.TargetID]
+			ts.wsMu.Unlock()
+			if ok {
+				notif := map[string]any{
+					"method": "incoming_signal",
+					"params": map[string]string{
+						"from": params.From,
+						"type": params.Type,
+						"data": params.Data,
+					},
+				}
+				notifData, _ := json.Marshal(notif)
+				targetConn.WriteMessage(websocket.TextMessage, notifData)
+			} else {
+				ts.mu.Lock()
+				ts.signals[params.TargetID] = append(ts.signals[params.TargetID], muninn.Signal{From: params.From, Type: params.Type, Data: params.Data})
+				ts.mu.Unlock()
+			}
+
+		default:
+			resp := map[string]any{"id": rpcReq.ID, "error": "unknown method"}
+			respData, _ := json.Marshal(resp)
+			conn.WriteMessage(websocket.TextMessage, respData)
+		}
+	}
 }
 
 func (ts *testMuninnServer) handleSendSignal(w http.ResponseWriter, r *http.Request) {
@@ -482,6 +604,21 @@ func (ts *testMuninnServer) handleSendSignal(w http.ResponseWriter, r *http.Requ
 	ts.mu.Lock()
 	ts.signals[peerID] = append(ts.signals[peerID], sig)
 	ts.mu.Unlock()
+	ts.wsMu.Lock()
+	targetConn, ok := ts.wsConns[peerID]
+	ts.wsMu.Unlock()
+	if ok {
+		notif := map[string]any{
+			"method": "incoming_signal",
+			"params": map[string]string{
+				"from": sig.From,
+				"type": sig.Type,
+				"data": sig.Data,
+			},
+		}
+		notifData, _ := json.Marshal(notif)
+		targetConn.WriteMessage(websocket.TextMessage, notifData)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

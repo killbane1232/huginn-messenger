@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
@@ -93,7 +93,7 @@ func (m *Messenger) upsertPeer(peerID, peerKey, login, encryptionKey, signatureK
 			SignatureKey:  signatureKey,
 			LastSeen:      lastSeen,
 			IsFake:        isFake,
-			IDS:		   []string{peerID},
+			IDS:           []string{peerID},
 		}
 		if err := m.store.StorePeer(login, peerKey, encryptionKey, signatureKey, lastSeen, isFake); err != nil {
 			log.Printf("store peer %s: %v", peerID, err)
@@ -149,7 +149,7 @@ func (m *Messenger) IsPeerOnline(peerID string) bool {
 	for _, p := range m.peers {
 		for _, pid := range p.IDS {
 			if pid == peerID && p.IsFake {
-				return p.LastSeen.After(time.Now().Add(time.Duration(- p.TTLSeconds / 2) * time.Second))
+				return p.LastSeen.After(time.Now().Add(time.Duration(-p.TTLSeconds/2) * time.Second))
 				break
 			}
 		}
@@ -162,7 +162,7 @@ func (m *Messenger) IsPeerOnlineByKey(key string) bool {
 	defer m.mu.RUnlock()
 	for _, p := range m.peers {
 		if p.Key() == key && p.IsFake {
-			return p.LastSeen.After(time.Now().Add(time.Duration(- p.TTLSeconds / 2) * time.Second))
+			return p.LastSeen.After(time.Now().Add(time.Duration(-p.TTLSeconds/2) * time.Second))
 		}
 	}
 	return false
@@ -174,7 +174,7 @@ func (m *Messenger) getOnlinePeers() []muninn.Peer {
 	var online []muninn.Peer
 	for _, p := range m.peers {
 		for _, pid := range p.IDS {
-			if pid != m.ID && p.LastSeen.After(time.Now().Add(time.Duration(- p.TTLSeconds / 2) * time.Second)) {
+			if pid != m.ID && p.LastSeen.After(time.Now().Add(time.Duration(-p.TTLSeconds/2)*time.Second)) {
 				online = append(online, p)
 				break
 			}
@@ -263,8 +263,11 @@ func (m *Messenger) ConnectPeer(toPeerID string) error {
 	}
 	offerData, _ := json.Marshal(offer)
 
-	if m.rtcClient != nil && m.rtcClient.IsConnected() {
-		if err := m.rtcClient.ConnectToPeer(m.ctx, toPeerID, string(offerData)); err == nil {
+	if !m.wsClient.IsConnected() {
+		m.wsClient.Connect(m.ctx)
+	}
+	if m.wsClient != nil && m.wsClient.IsConnected() {
+		if err := m.wsClient.ConnectToPeer(m.ctx, toPeerID, string(offerData)); err == nil {
 			log.Printf("webrtc offer sent to %s via rtc relay", toPeerID)
 			return nil
 		}

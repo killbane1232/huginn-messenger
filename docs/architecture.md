@@ -395,7 +395,7 @@ Response: pion.SessionDescription (SDP answer)
 
 ### Клиентская часть (Huginn)
 
-Клиент (`internal/muninn/rtc.go` → `RTCClient`):
+Клиент (`internal/muninn/rtc.go` → `WSClient`):
 - Управляет `PeerConnection` к Muninn
 - Отправляет RPC-запросы и сопоставляет ответы по UUID
 - Принимает notification'ы через колбэк `OnSignal`
