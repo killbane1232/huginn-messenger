@@ -11,12 +11,14 @@ import (
 )
 
 func (m *Messenger) processPendingSignals() {
-	sigs, err := m.muninnClient.PollSignals(m.ctx, m.ID)
-	if err != nil {
-		return
-	}
-	for _, sig := range sigs {
-		m.handleSignal(sig)
+	if m.pollSignal {
+		sigs, err := m.muninnClient.PollSignals(m.ctx, m.ID)
+		if err != nil {
+			return
+		}
+		for _, sig := range sigs {
+			m.handleSignal(sig)
+		}
 	}
 
 	for {

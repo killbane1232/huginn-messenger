@@ -151,6 +151,7 @@ type Messenger struct {
 	appConfig   *config.Config
 	reloginMu   sync.Mutex
 	reloginKeys string
+	pollSignal  bool
 }
 
 func New(username string, muninnClient *muninn.Client, dbPath string, opts ...MessengerOption) (*Messenger, error) {
@@ -272,6 +273,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		pendingFileDownloads: make(map[string]*pendingFileDownload),
 		processingMsg:        make(map[string]bool),
 		appConfig:            appCfg,
+		pollSignal:           o.pollSignal,
 	}
 
 	if len(o.iceServers) < 1 {
@@ -312,9 +314,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 
 	go m.heartbeatLoop()   // TODO: переделать на более низкое энергопотребление
 	go m.peerRefreshLoop() // т.к. текущее решение занимает все потоки на всё время
-	if o.pollSignal {
-		go m.signalPollLoop()
-	}
+	go m.signalPollLoop()
 	go m.processRTCMessages()
 	go m.pendingChunkLoop()
 	go m.fileDownloadLoop()
