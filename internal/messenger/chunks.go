@@ -11,21 +11,21 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/killbane1232/huginn-messenger/internal/chunk"
 	"github.com/killbane1232/huginn-messenger/internal/config"
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
 	"github.com/killbane1232/huginn-messenger/internal/store"
 	"github.com/killbane1232/huginn-messenger/internal/webrtc"
-	"github.com/google/uuid"
-    //"runtime/debug"
+	//"runtime/debug"
 )
 
 func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest) {
 	// Если мы не являемся конечным получателем — сообщаем серверу, что сохранили чанк
 	if req.RecipientID != "" && req.RecipientID != m.Key && req.Hash != "" && req.SenderID != "" {
 		reportedPayload := fmt.Sprintf("muninn/reported/v1\n%s\n%d\n%s\n%s",
-			req.FileID, req.ChunkIndex, req.Hash, req.SenderID)
+			req.FileID, req.ChunkIndex, req.Hash, peerID)
 		sig := crypto.Sign(m.signPrivate, []byte(reportedPayload))
 		reportReq := muninn.ChunkReportRequest{
 			ReporterID: m.ID,
@@ -34,7 +34,7 @@ func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest
 			Hash:       req.Hash,
 			Signature:  crypto.EncodeKey(sig),
 		}
-		if err := m.muninnClient.ReportChunk(m.ctx, req.SenderID, reportReq); err != nil {
+		if err := m.muninnClient.ReportChunk(m.ctx, peerID, reportReq); err != nil {
 			log.Printf("report chunk %s/%d failed, not saving: %v", req.FileID, req.ChunkIndex, err)
 			return
 		}
@@ -49,7 +49,7 @@ func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest
 		log.Printf("store chunk %s/%d: %v", req.FileID, req.ChunkIndex, err)
 		return
 	}
-		log.Printf("stored chunk %s/%d from %s", req.FileID, req.ChunkIndex, peerID)
+	log.Printf("stored chunk %s/%d from %s", req.FileID, req.ChunkIndex, peerID)
 }
 
 func (m *Messenger) handleChunkGet(peerID string, req webrtc.ChunkGetRequest) ([]byte, bool) {
@@ -112,7 +112,7 @@ func (m *Messenger) distributePendingChunks() {
 
 	byRecipient := make(map[string][]store.PendingChunk)
 	for _, c := range chunks {
-		if (byRecipient[c.RecipientID] == nil) {
+		if byRecipient[c.RecipientID] == nil {
 			byRecipient[c.RecipientID] = []store.PendingChunk{}
 		}
 		byRecipient[c.RecipientID] = append(byRecipient[c.RecipientID], c)
@@ -122,7 +122,6 @@ func (m *Messenger) distributePendingChunks() {
 		m.distributeChunksForRecipient(recipientID, recipientChunks)
 	}
 }
-
 
 func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []store.PendingChunk) {
 	onlinePeers, err := m.muninnClient.GetBestPeers(m.ctx, 10)
@@ -142,7 +141,6 @@ func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []st
 		storagePeers = append(storagePeers, p.ID)
 	}
 
-	
 	if len(storagePeers) == 0 {
 		return
 	}
@@ -189,7 +187,7 @@ func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []st
 				}
 				regBatch[i] = muninn.RegisterChunkBatchEntry{
 					ChunkIndex: c.ChunkIndex, SenderID: c.SenderID, RecipientID: c.RecipientID,
-					Hash: c.Hash, Signature: c.Signature, PeerID: pid,
+					Hash: c.Hash, Signature: c.Signature, PeerID: pid, TTL: ttlSeconds,
 				}
 			}
 
@@ -332,7 +330,7 @@ func (m *Messenger) sendFileChunks(recipientID, filePath string, ttlSeconds int)
 		}
 	}
 
-		for _, pid := range storagePeers {
+	for _, pid := range storagePeers {
 		if !m.IsPeerConnected(pid) {
 			continue
 		}
@@ -347,7 +345,7 @@ func (m *Messenger) sendFileChunks(recipientID, filePath string, ttlSeconds int)
 			}
 			regBatch[i] = muninn.RegisterChunkBatchEntry{
 				ChunkIndex: i, SenderID: m.Key, Hash: c.hash,
-				Signature: c.sig, PeerID: pid, Persist: true,
+				Signature: c.sig, PeerID: pid, Persist: true, TTL: ttlSeconds,
 			}
 		}
 
@@ -365,7 +363,7 @@ func (m *Messenger) sendFileChunks(recipientID, filePath string, ttlSeconds int)
 	for i, c := range chunks {
 		localRegBatch[i] = muninn.RegisterChunkBatchEntry{
 			ChunkIndex: i, SenderID: m.Key,
-			Hash: c.hash, Signature: c.sig, PeerID: m.ID, Persist: true,
+			Hash: c.hash, Signature: c.sig, PeerID: m.ID, Persist: true, TTL: ttlSeconds,
 		}
 	}
 	if err := m.muninnClient.RegisterChunks(m.ctx, fileID, muninn.RegisterChunkBatchRequest{Chunks: localRegBatch}); err != nil {
@@ -429,7 +427,7 @@ func (m *Messenger) deleteChunksAndReturn(msgID string) {
 }
 
 func (m *Messenger) requestMissingChunk(fileID string, chunkIndex int, senderID string) {
-	targets := []string{}	
+	targets := []string{}
 	p := m.findPeerByKey(senderID)
 	if p == nil {
 		return

@@ -215,7 +215,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 	for i, c := range chunks {
 		localRegBatch[i] = muninn.RegisterChunkBatchEntry{
 			ChunkIndex: i, SenderID: m.Key, RecipientID: peer.Key(),
-			Hash: c.hash, Signature: c.sig, PeerID: m.ID,
+			Hash: c.hash, Signature: c.sig, PeerID: m.ID, TTL: ttlSeconds,
 		}
 	}
 	log.Printf("sendOffline[%s]: registering chunks locally...", msgID)
@@ -276,7 +276,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 			}
 			regBatch[i] = muninn.RegisterChunkBatchEntry{
 				ChunkIndex: i, SenderID: m.Key, RecipientID: peer.Key(),
-				Hash: c.hash, Signature: c.sig, PeerID: pid,
+				Hash: c.hash, Signature: c.sig, PeerID: pid, TTL: ttlSeconds,
 			}
 		}
 		log.Printf("sendOffline[%s]: registering chunks on peer %s...", msgID, pid)

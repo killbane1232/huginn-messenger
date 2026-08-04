@@ -368,6 +368,10 @@ func (ts *testMuninnServer) handleRegisterChunks(w http.ResponseWriter, r *http.
 	now := time.Now().Unix()
 	ts.mu.Lock()
 	for _, entry := range req.Chunks {
+		ttl := entry.TTL
+		if ttl <= 0 {
+			ttl = 86400
+		}
 		ts.chunks = append(ts.chunks, muninn.ChunkRecord{
 			FileID:      fileID,
 			ChunkIndex:  entry.ChunkIndex,
@@ -377,7 +381,7 @@ func (ts *testMuninnServer) handleRegisterChunks(w http.ResponseWriter, r *http.
 			PeerID:      entry.PeerID,
 			Persist:     entry.Persist,
 			CreatedAt:   now,
-			TTL:         604800,
+			TTL:         ttl,
 		})
 	}
 	ts.mu.Unlock()

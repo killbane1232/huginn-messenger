@@ -82,6 +82,7 @@ type RegisterChunkRequest struct {
 	Signature   string `json:"signature"`
 	PeerID      string `json:"peer_id"`
 	Persist     bool   `json:"persist"`
+	TTL         int    `json:"ttl,omitempty"`
 }
 
 type RegisterChunkBatchEntry struct {
@@ -92,6 +93,7 @@ type RegisterChunkBatchEntry struct {
 	Signature   string `json:"signature"`
 	PeerID      string `json:"peer_id"`
 	Persist     bool   `json:"persist"`
+	TTL         int    `json:"ttl,omitempty"`
 }
 
 type RegisterChunkBatchRequest struct {
@@ -104,7 +106,6 @@ type ChunkReportRequest struct {
 	ChunkIndex int    `json:"chunk_index"`
 	Hash       string `json:"hash"`
 	Signature  string `json:"signature"`
-	TTL        int    `json:"ttl,omitempty"`
 }
 
 type ChunkRecord struct {
@@ -444,8 +445,8 @@ func (c *Client) ReportChunk(ctx context.Context, sourcePeerID string, req Chunk
 }
 
 func (c *Client) GetChunksByRecipient(ctx context.Context, recipientID string, dateFrom int64) ([]ChunkRecord, error) {
-	url := fmt.Sprintf("%s/api/v1/recipient/chunks?date_from=%d&recipient_id=%s", c.baseURL, dateFrom, url.PathEscape(recipientID))
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	endpoint := fmt.Sprintf("%s/api/v1/recipient/chunks?date_from=%d&recipient_id=%s", c.baseURL, dateFrom, url.QueryEscape(recipientID))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
@@ -528,8 +529,8 @@ func (c *Client) ReadChunk(ctx context.Context, req ReadChunkRequest) error {
 }
 
 func (c *Client) GetByKey(ctx context.Context, login, signature string) (*Peer, error) {
-	url := fmt.Sprintf("%s/api/v1/keys/%s?signature=%s", c.baseURL, login, signature)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	endpoint := fmt.Sprintf("%s/api/v1/keys/%s?signature=%s", c.baseURL, url.PathEscape(login), url.QueryEscape(signature))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
@@ -550,8 +551,8 @@ func (c *Client) GetByKey(ctx context.Context, login, signature string) (*Peer, 
 }
 
 func (c *Client) GetAllByKey(ctx context.Context, login, signature string) ([]Peer, error) {
-	url := fmt.Sprintf("%s/api/v1/keys/%s?signature=%s", c.baseURL, login, signature)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	endpoint := fmt.Sprintf("%s/api/v1/keys/%s?signature=%s", c.baseURL, url.PathEscape(login), url.QueryEscape(signature))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
