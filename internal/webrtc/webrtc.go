@@ -64,6 +64,8 @@ type Manager struct {
 	mu          sync.RWMutex
 	connections map[string]*pion.PeerConnection
 	dataChans   map[string]*pion.DataChannel
+	negMu       sync.Mutex
+	negotiation map[string]*sync.Mutex
 	chatMsgChan chan ChatMessage
 	chunkStore  func(peerID string, req ChunkStoreRequest)
 	chunkGet    func(peerID string, req ChunkGetRequest) ([]byte, bool)
@@ -86,6 +88,7 @@ func NewManager(localID string, chatMsgChan chan ChatMessage,
 	return &Manager{
 		connections: make(map[string]*pion.PeerConnection),
 		dataChans:   make(map[string]*pion.DataChannel),
+		negotiation: make(map[string]*sync.Mutex),
 		chatMsgChan: chatMsgChan,
 		chunkStore:  chunkStore,
 		chunkGet:    chunkGet,
@@ -97,6 +100,18 @@ func NewManager(localID string, chatMsgChan chan ChatMessage,
 			ICEServers: iceServers,
 		},
 	}
+}
+
+func (m *Manager) lockNegotiation(remoteID string) func() {
+	m.negMu.Lock()
+	lock := m.negotiation[remoteID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.negotiation[remoteID] = lock
+	}
+	m.negMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (m *Manager) submitAsync(job func()) {
@@ -242,6 +257,7 @@ func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, erro
 	})
 
 	pc.OnConnectionStateChange(func(s pion.PeerConnectionState) {
+		log.Printf("webrtc connection %s state=%s", remoteID, s.String())
 		if s == pion.PeerConnectionStateDisconnected || s == pion.PeerConnectionStateFailed || s == pion.PeerConnectionStateClosed {
 			m.mu.Lock()
 			if m.connections[remoteID] == pc {
@@ -260,6 +276,8 @@ func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, erro
 }
 
 func (m *Manager) CreateOffer(remoteID string) (pion.SessionDescription, error) {
+	unlock := m.lockNegotiation(remoteID)
+	defer unlock()
 	log.Printf("creating offer: %s", remoteID)
 	pc, err := m.NewPeerConnection(remoteID)
 	if err != nil {
@@ -273,7 +291,9 @@ func (m *Manager) CreateOffer(remoteID string) (pion.SessionDescription, error) 
 	}
 
 	m.mu.Lock()
-	m.dataChans[remoteID] = dc
+	if m.connections[remoteID] == pc {
+		m.dataChans[remoteID] = dc
+	}
 	m.mu.Unlock()
 
 	dc.OnMessage(func(msg pion.DataChannelMessage) {
@@ -300,6 +320,8 @@ func (m *Manager) CreateOffer(remoteID string) (pion.SessionDescription, error) 
 }
 
 func (m *Manager) HandleOffer(remoteID string, offer pion.SessionDescription) (pion.SessionDescription, error) {
+	unlock := m.lockNegotiation(remoteID)
+	defer unlock()
 	log.Printf("handle offer: %s", remoteID)
 	pc, err := m.NewPeerConnection(remoteID)
 	if err != nil {
@@ -414,8 +436,18 @@ func (m *Manager) SendReloginResponse(remoteID string, resp ReloginResponse) {
 
 func (m *Manager) IsConnected(remoteID string) bool {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	dc, ok := m.dataChans[remoteID]
+	m.mu.RUnlock()
+	return ok && dc != nil && dc.ReadyState() == pion.DataChannelStateOpen
+}
+
+// HasConnection reports whether a connection attempt is already in progress.
+// It is intentionally separate from IsConnected, which requires an open data
+// channel and is therefore safe to use before sending application data.
+func (m *Manager) HasConnection(remoteID string) bool {
+	m.mu.RLock()
 	_, ok := m.connections[remoteID]
+	m.mu.RUnlock()
 	return ok
 }
 

@@ -10,6 +10,12 @@ func TestCloseDoesNotHoldManagerLockWhileClosingPeer(t *testing.T) {
 	if _, err := m.NewPeerConnection("remote"); err != nil {
 		t.Fatal(err)
 	}
+	if !m.HasConnection("remote") {
+		t.Fatal("new connection attempt is not tracked")
+	}
+	if m.IsConnected("remote") {
+		t.Fatal("connection reported ready before its data channel opened")
+	}
 
 	done := make(chan struct{})
 	go func() {

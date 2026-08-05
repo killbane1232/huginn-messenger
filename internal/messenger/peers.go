@@ -48,7 +48,7 @@ func (m *Messenger) SearchPeers(query string) []muninn.Peer {
 				continue
 			}
 			if strings.Contains(strings.ToLower(p.Key()), q) {
-				m.upsertPeer(p.ID, p.Key(), p.Login, p.EncryptionKey, p.SignatureKey, p.LastSeen, false)
+				m.upsertPeer(p.ID, p.Key(), p.Login, p.EncryptionKey, p.SignatureKey, p.LastSeen, p.TTLSeconds, false)
 				if existing, ok := seen[p.Key()]; ok {
 					if p.LastSeen.After(existing.LastSeen) {
 						existing.LastSeen = p.LastSeen
@@ -75,7 +75,7 @@ func (m *Messenger) SearchPeers(query string) []muninn.Peer {
 	return result
 }
 
-func (m *Messenger) upsertPeer(peerID, peerKey, login, encryptionKey, signatureKey string, lastSeen time.Time, isFake bool) {
+func (m *Messenger) upsertPeer(peerID, peerKey, login, encryptionKey, signatureKey string, lastSeen time.Time, ttlSeconds int, isFake bool) {
 	login = (muninn.Peer{
 		ID:           peerID,
 		Login:        login,
@@ -89,6 +89,13 @@ func (m *Messenger) upsertPeer(peerID, peerKey, login, encryptionKey, signatureK
 		if !slices.Contains(peer.IDS, peerID) {
 			peer.IDS = append(peer.IDS, peerID)
 		}
+		peer.ID = peerID
+		peer.Login = login
+		peer.EncryptionKey = encryptionKey
+		peer.SignatureKey = signatureKey
+		peer.LastSeen = lastSeen
+		peer.TTLSeconds = ttlSeconds
+		peer.IsFake = isFake
 		m.peersMap[peerKey] = peer
 	}
 	if !found {
@@ -98,6 +105,7 @@ func (m *Messenger) upsertPeer(peerID, peerKey, login, encryptionKey, signatureK
 			EncryptionKey: encryptionKey,
 			SignatureKey:  signatureKey,
 			LastSeen:      lastSeen,
+			TTLSeconds:    ttlSeconds,
 			IsFake:        isFake,
 			IDS:           []string{peerID},
 		}
@@ -154,9 +162,8 @@ func (m *Messenger) IsPeerOnline(peerID string) bool {
 	defer m.mu.RUnlock()
 	for _, p := range m.peers {
 		for _, pid := range p.IDS {
-			if pid == peerID && p.IsFake {
-				return p.LastSeen.After(time.Now().Add(time.Duration(-p.TTLSeconds/2) * time.Second))
-				break
+			if pid == peerID && !p.IsFake && p.TTLSeconds > 0 {
+				return p.LastSeen.Add(time.Duration(p.TTLSeconds) * time.Second).After(time.Now())
 			}
 		}
 	}
@@ -167,8 +174,8 @@ func (m *Messenger) IsPeerOnlineByKey(key string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, p := range m.peers {
-		if p.Key() == key && p.IsFake {
-			return p.LastSeen.After(time.Now().Add(time.Duration(-p.TTLSeconds/2) * time.Second))
+		if p.Key() == key && !p.IsFake && p.TTLSeconds > 0 {
+			return p.LastSeen.Add(time.Duration(p.TTLSeconds) * time.Second).After(time.Now())
 		}
 	}
 	return false
@@ -204,7 +211,7 @@ func (m *Messenger) findPeerByID(id string) *muninn.Peer {
 		return nil
 	}
 
-	m.upsertPeer(stored.ID, stored.Key(), stored.Login, stored.EncryptionKey, stored.SignatureKey, time.Now(), stored.IsFake)
+	m.upsertPeer(stored.ID, stored.Key(), stored.Login, stored.EncryptionKey, stored.SignatureKey, stored.LastSeen, stored.TTLSeconds, stored.IsFake)
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -237,7 +244,7 @@ func (m *Messenger) findPeerByKey(key string) *muninn.Peer {
 	}
 
 	for _, p := range stored {
-		m.upsertPeer(p.ID, p.Key(), p.Login, p.EncryptionKey, p.SignatureKey, time.Now(), p.IsFake)
+		m.upsertPeer(p.ID, p.Key(), p.Login, p.EncryptionKey, p.SignatureKey, p.LastSeen, p.TTLSeconds, p.IsFake)
 	}
 	m.mu.RLock()
 	peer, exists = m.peersMap[key]
@@ -249,6 +256,9 @@ func (m *Messenger) findPeerByKey(key string) *muninn.Peer {
 }
 
 func (m *Messenger) ConnectPeer(toPeerID string) error {
+	if m.rtcManager.HasConnection(toPeerID) {
+		return nil
+	}
 	m.mu.Lock()
 	if _, ok := m.peersConnecting[toPeerID]; ok {
 		m.mu.Unlock()

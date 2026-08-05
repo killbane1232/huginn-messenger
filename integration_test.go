@@ -1302,7 +1302,7 @@ func TestGroupFileSendAndReceive(t *testing.T) {
 	t.Logf("OK: group file sent and received, msgID=%s, file=%s, content=%q", delivered.MsgID, delivered.Files[0].Filename, content)
 }
 
-func TestWebRTCOfflineFallback(t *testing.T) {
+func TestFirstMessageEstablishesWebRTC(t *testing.T) {
 	mn := newTestMuninnServer()
 	defer mn.Close()
 
@@ -1338,29 +1338,12 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 	msgCh := bob.SubscribeMessages()
 	defer bob.UnsubscribeMessages(msgCh)
 
-	alice.ConnectPeer(bob.ID)
-
-	deadline := time.Now().Add(5 * time.Second)
-	connected := false
-	for time.Now().Before(deadline) {
-		if alice.IsPeerConnected(bob.ID) && bob.IsPeerConnected(alice.ID) {
-			connected = true
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if !connected {
-		t.Fatal("WebRTC connection not established between alice and bob within 5s")
-	}
-	t.Log("WebRTC connection established, waiting for data channel to open...")
-	time.Sleep(2 * time.Second)
-
 	err = alice.SendMessageSync(bob.Key, "hello via webrtc", nil, 604800)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	deadline = time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	var delivered messenger.ChatMessage
 	gotViaWebRTC := false
 	for time.Now().Before(deadline) {
@@ -1377,38 +1360,10 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 	}
 
 	if !gotViaWebRTC {
-		t.Log("message not received via WebRTC instantly, checking offline fallback...")
-		time.Sleep(2 * time.Second)
-
-		records, err := mc.GetChunksByRecipient(context.Background(), bob.Key, 0)
-		if err == nil && len(records) > 0 {
-			t.Logf("found %d chunk records, injecting...", len(records))
-			for _, rec := range records {
-				data, ok := alice.StoredChunkData(rec.FileID, rec.ChunkIndex)
-				if !ok {
-					t.Fatalf("alice does not have chunk %s/%d", rec.FileID, rec.ChunkIndex)
-				}
-				bob.InjectChunk(rec.FileID, rec.ChunkIndex, data)
-			}
-
-			deadline = time.Now().Add(10 * time.Second)
-			for time.Now().Before(deadline) {
-				select {
-				case msg := <-msgCh:
-					delivered = msg
-					gotViaWebRTC = true
-				default:
-				}
-				if gotViaWebRTC {
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
+		t.Fatal("bob did not receive the first message after it established WebRTC")
 	}
-
-	if !gotViaWebRTC {
-		t.Fatal("bob did not receive the message via either WebRTC or offline fallback")
+	if !alice.IsPeerConnected(bob.ID) || !bob.IsPeerConnected(alice.ID) {
+		t.Fatal("first message did not leave an open data channel between alice and bob")
 	}
 
 	if delivered.From != "alice" {
@@ -1433,11 +1388,7 @@ func TestWebRTCOfflineFallback(t *testing.T) {
 		t.Fatal("delivered message not found in bob.GetMessages(\"alice\")")
 	}
 
-	via := "WebRTC"
-	if !alice.IsPeerConnected(bob.ID) {
-		via = "offline fallback"
-	}
-	t.Logf("OK: message delivered via %s, id=%s", via, delivered.MsgID)
+	t.Logf("OK: first message established WebRTC and was delivered, id=%s", delivered.MsgID)
 }
 
 func TestReloginFlow(t *testing.T) {

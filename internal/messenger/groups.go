@@ -92,7 +92,7 @@ func (m *Messenger) CreateGroupChat(name string) (*store.GroupChat, error) {
 		return nil, fmt.Errorf("save group chat: %w", err)
 	}
 
-	m.upsertPeer(uid, uid+":"+gc.SignPublic, name, gc.EncPublic, gc.SignPublic, time.Now(), true)
+	m.upsertPeer(uid, uid+":"+gc.SignPublic, name, gc.EncPublic, gc.SignPublic, time.Now(), 86400, true)
 
 	log.Printf("group chat %s created with uid %s", name, uid)
 	return gc, nil
@@ -105,6 +105,8 @@ func (m *Messenger) GetGroupChats() ([]store.GroupChat, error) {
 func (m *Messenger) registerGroupPeer(gc store.GroupChat) {
 	fake := true
 	key := gc.UID + ":" + gc.SignPublic
+	m.registeredMu.Lock()
+	defer m.registeredMu.Unlock()
 	if m.registeredMap[key] != true {
 		req := &muninn.RegisterRequest{
 			ID:            gc.UID,

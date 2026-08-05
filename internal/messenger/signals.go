@@ -35,6 +35,17 @@ func (m *Messenger) processPendingSignals() {
 func (m *Messenger) handleSignal(sig muninn.Signal) {
 	switch sig.Type {
 	case "offer":
+		m.mu.RLock()
+		_, dialing := m.peersConnecting[sig.From]
+		m.mu.RUnlock()
+		if m.rtcManager.IsConnected(sig.From) {
+			log.Printf("ignoring duplicate offer from %s: data channel already open", sig.From)
+			return
+		}
+		if (dialing || m.rtcManager.HasConnection(sig.From)) && m.ID < sig.From {
+			log.Printf("ignoring colliding offer from %s: keeping local offer", sig.From)
+			return
+		}
 		var offer pion.SessionDescription
 		if err := json.Unmarshal([]byte(sig.Data), &offer); err != nil {
 			return
@@ -67,24 +78,27 @@ func (m *Messenger) handleSignal(sig muninn.Signal) {
 }
 
 func (m *Messenger) rtcReconnectLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 	for {
+		if !m.wsClient.IsConnected() {
+			log.Printf("[ws] attempting to connect to muninn...")
+			if err := m.wsClient.Connect(m.ctx); err != nil {
+				if m.ctx.Err() != nil {
+					return
+				}
+				log.Printf("[ws] connect failed: %v", err)
+				log.Printf("[ws] connect stack:\n%s", debug.Stack())
+			} else {
+				log.Printf("[ws] connected to muninn")
+			}
+		}
+
 		select {
 		case <-m.ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
+		case <-ticker.C:
 		}
-
-		if m.wsClient.IsConnected() {
-			continue
-		}
-
-		log.Printf("[ws] attempting to reconnect to muninn...")
-		if err := m.wsClient.Connect(m.ctx); err != nil {
-			log.Printf("[ws] reconnect failed: %v", err)
-			log.Printf("[ws] reconnect stack:\n%s", debug.Stack())
-			continue
-		}
-		log.Printf("[ws] reconnected to muninn")
 	}
 }
 

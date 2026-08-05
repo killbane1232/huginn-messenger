@@ -18,6 +18,8 @@ import (
 	//"runtime/debug"
 )
 
+const peerConnectTimeout = 5 * time.Second
+
 func (m *Messenger) processRTCMessages() {
 	for {
 		select {
@@ -157,13 +159,16 @@ func (m *Messenger) sendMessage(to, text string, filePaths []string, ttlSeconds 
 		}
 	}
 
-	if onlinePeerID != "" && m.IsPeerOnline(onlinePeerID) {
-		if !m.IsPeerConnected(onlinePeerID) {
-			m.ConnectPeer(onlinePeerID)
+	directDelivery := onlinePeerID != "" && !peer.IsFake && len(files) == 0
+	if directDelivery && !m.IsPeerConnected(onlinePeerID) {
+		if err := m.ConnectPeer(onlinePeerID); err != nil {
+			log.Printf("connect to %s before sending %s: %v", onlinePeerID, msgID, err)
+		} else if !m.waitForPeerConnection(onlinePeerID, peerConnectTimeout) {
+			log.Printf("data channel to %s not ready for %s, using offline delivery", onlinePeerID, msgID)
 		}
 	}
 
-	if onlinePeerID != "" && m.IsPeerConnected(onlinePeerID) {
+	if directDelivery && m.IsPeerConnected(onlinePeerID) {
 		now := time.Now()
 		if err := m.rtcManager.SendMessage(onlinePeerID, text, now, msgID); err != nil {
 			return m.sendOffline(msgID, text, peer, ttlSeconds, files)
@@ -173,6 +178,28 @@ func (m *Messenger) sendMessage(to, text string, filePaths []string, ttlSeconds 
 	}
 
 	return m.sendOffline(msgID, text, peer, ttlSeconds, files)
+}
+
+func (m *Messenger) waitForPeerConnection(peerID string, timeout time.Duration) bool {
+	if m.IsPeerConnected(peerID) {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return false
+		case <-timer.C:
+			return m.IsPeerConnected(peerID)
+		case <-ticker.C:
+			if m.IsPeerConnected(peerID) {
+				return true
+			}
+		}
+	}
 }
 
 func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSeconds int, files []FileMeta) error {
