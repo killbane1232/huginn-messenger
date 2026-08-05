@@ -19,15 +19,14 @@ jobs:
   publish:
     needs: test
     if: github.event_name == 'push'
-    strategy:
-      matrix:
-        arch: [amd64, arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
 
@@ -37,12 +36,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+
       - uses: docker/build-push-action@v6
         with:
           push: true
-          platforms: linux/${{ matrix.arch }}
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ github.run_number }}-${{ matrix.arch }}
-            ghcr.io/${{ github.repository }}:latest-${{ matrix.arch }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
