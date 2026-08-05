@@ -69,6 +69,7 @@ type Manager struct {
 	chunkGet    func(peerID string, req ChunkGetRequest) ([]byte, bool)
 	reloginReq  func(peerID string, req ReloginRequest)
 	reloginResp func(peerID string, resp ReloginResponse)
+	submit      func(func()) bool
 	localID     string
 
 	config pion.Configuration
@@ -79,7 +80,8 @@ func NewManager(localID string, chatMsgChan chan ChatMessage,
 	chunkGet func(peerID string, req ChunkGetRequest) ([]byte, bool),
 	reloginReq func(peerID string, req ReloginRequest),
 	reloginResp func(peerID string, resp ReloginResponse),
-	iceServers []pion.ICEServer) *Manager {
+	iceServers []pion.ICEServer,
+	submit func(func()) bool) *Manager {
 
 	return &Manager{
 		connections: make(map[string]*pion.PeerConnection),
@@ -89,11 +91,20 @@ func NewManager(localID string, chatMsgChan chan ChatMessage,
 		chunkGet:    chunkGet,
 		reloginReq:  reloginReq,
 		reloginResp: reloginResp,
+		submit:      submit,
 		localID:     localID,
 		config: pion.Configuration{
 			ICEServers: iceServers,
 		},
 	}
+}
+
+func (m *Manager) submitAsync(job func()) {
+	if m.submit != nil {
+		m.submit(job)
+		return
+	}
+	job()
 }
 
 func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
@@ -117,7 +128,7 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		}
 		var req ChunkStoreRequest
 		if json.Unmarshal(env.Data, &req) == nil {
-			go m.chunkStore(remoteID, req)
+			m.submitAsync(func() { m.chunkStore(remoteID, req) })
 		}
 	case MsgTypeChunkStoreBatch:
 		if m.chunkStore == nil {
@@ -126,7 +137,8 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		var batch ChunkStoreBatchRequest
 		if json.Unmarshal(env.Data, &batch) == nil {
 			for _, req := range batch.Chunks {
-				go m.chunkStore(remoteID, req)
+				req := req
+				m.submitAsync(func() { m.chunkStore(remoteID, req) })
 			}
 		}
 	case MsgTypeChunkGet:
@@ -150,7 +162,7 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		}
 		var msg ChunkStoreRequest
 		if json.Unmarshal(env.Data, &msg) == nil {
-			go m.chunkStore(remoteID, msg)
+			m.submitAsync(func() { m.chunkStore(remoteID, msg) })
 		}
 	case MsgTypeReloginRequest:
 		if m.reloginReq == nil {
@@ -192,11 +204,13 @@ func (m *Manager) sendEnvelope(remoteID, msgType string, v any) {
 
 func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, error) {
 	m.mu.Lock()
-	if existing, ok := m.connections[remoteID]; ok {
-		existing.Close()
-		delete(m.dataChans, remoteID)
-	}
+	existing := m.connections[remoteID]
+	delete(m.connections, remoteID)
+	delete(m.dataChans, remoteID)
 	m.mu.Unlock()
+	if existing != nil {
+		existing.Close()
+	}
 
 	se := pion.SettingEngine{}
 
@@ -217,7 +231,9 @@ func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, erro
 
 	pc.OnDataChannel(func(dc *pion.DataChannel) {
 		m.mu.Lock()
-		m.dataChans[remoteID] = dc
+		if m.connections[remoteID] == pc {
+			m.dataChans[remoteID] = dc
+		}
 		m.mu.Unlock()
 
 		dc.OnMessage(func(msg pion.DataChannelMessage) {
@@ -228,8 +244,10 @@ func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, erro
 	pc.OnConnectionStateChange(func(s pion.PeerConnectionState) {
 		if s == pion.PeerConnectionStateDisconnected || s == pion.PeerConnectionStateFailed || s == pion.PeerConnectionStateClosed {
 			m.mu.Lock()
-			delete(m.connections, remoteID)
-			delete(m.dataChans, remoteID)
+			if m.connections[remoteID] == pc {
+				delete(m.connections, remoteID)
+				delete(m.dataChans, remoteID)
+			}
 			m.mu.Unlock()
 		}
 	})
@@ -403,20 +421,25 @@ func (m *Manager) IsConnected(remoteID string) bool {
 
 func (m *Manager) Close(remoteID string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if pc, ok := m.connections[remoteID]; ok {
-		pc.Close()
-	}
+	pc := m.connections[remoteID]
 	delete(m.connections, remoteID)
 	delete(m.dataChans, remoteID)
+	m.mu.Unlock()
+	if pc != nil {
+		pc.Close()
+	}
 }
 
 func (m *Manager) CloseAll() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for id, pc := range m.connections {
+	connections := make([]*pion.PeerConnection, 0, len(m.connections))
+	for _, pc := range m.connections {
+		connections = append(connections, pc)
+	}
+	m.connections = make(map[string]*pion.PeerConnection)
+	m.dataChans = make(map[string]*pion.DataChannel)
+	m.mu.Unlock()
+	for _, pc := range connections {
 		pc.Close()
-		delete(m.connections, id)
-		delete(m.dataChans, id)
 	}
 }

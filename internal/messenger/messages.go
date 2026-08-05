@@ -60,12 +60,29 @@ func (m *Messenger) processRTCMessages() {
 }
 
 func (m *Messenger) SendMessage(to, text string, filePaths []string, ttlSeconds int) error {
-	go m.sendMessage(to, text, filePaths, ttlSeconds)
+	if !m.async.submit(func() {
+		if err := m.sendMessage(to, text, filePaths, ttlSeconds); err != nil {
+			log.Printf("send message to %s: %v", to, err)
+		}
+	}) {
+		return fmt.Errorf("messenger is shutting down")
+	}
 	return nil
 }
 
 func (m *Messenger) SendMessageSync(to, text string, filePaths []string, ttlSeconds int) error {
-	return m.sendMessage(to, text, filePaths, ttlSeconds)
+	result := make(chan error, 1)
+	if !m.async.submit(func() {
+		result <- m.sendMessage(to, text, filePaths, ttlSeconds)
+	}) {
+		return fmt.Errorf("messenger is shutting down")
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-m.ctx.Done():
+		return m.ctx.Err()
+	}
 }
 
 func (m *Messenger) sendMessage(to, text string, filePaths []string, ttlSeconds int) (err error) {

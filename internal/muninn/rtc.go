@@ -62,9 +62,10 @@ type OnSignalFunc func(sig Signal)
 type OnDisconnectFunc func()
 
 type WSClient struct {
-	mu      sync.RWMutex
-	baseURL string
-	localID string
+	mu        sync.RWMutex
+	connectMu sync.Mutex
+	baseURL   string
+	localID   string
 
 	conn      *websocket.Conn
 	connected bool
@@ -106,6 +107,19 @@ func (c *WSClient) SetOnDisconnect(fn OnDisconnectFunc) {
 }
 
 func (c *WSClient) Connect(ctx context.Context) error {
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+
+	if c.ctx.Err() != nil {
+		return fmt.Errorf("websocket client is closed")
+	}
+	c.mu.RLock()
+	connected := c.connected && c.conn != nil
+	c.mu.RUnlock()
+	if connected {
+		return nil
+	}
+
 	u, err := url.Parse(c.baseURL)
 	if err != nil {
 		return fmt.Errorf("parse base url: %w", err)
@@ -134,6 +148,11 @@ func (c *WSClient) Connect(ctx context.Context) error {
 	}
 
 	c.mu.Lock()
+	if c.ctx.Err() != nil {
+		c.mu.Unlock()
+		conn.Close()
+		return fmt.Errorf("websocket client is closed")
+	}
 	c.conn = conn
 	c.connected = true
 	c.mu.Unlock()
@@ -150,11 +169,16 @@ func (c *WSClient) Connect(ctx context.Context) error {
 
 func (c *WSClient) readLoop(conn *websocket.Conn, onDisconnect OnDisconnectFunc) {
 	defer func() {
-		c.mu.Lock()
-		c.connected = false
-		c.mu.Unlock()
 		conn.Close()
-		if onDisconnect != nil {
+		notifyDisconnect := false
+		c.mu.Lock()
+		if c.conn == conn {
+			c.conn = nil
+			c.connected = false
+			notifyDisconnect = c.ctx.Err() == nil
+		}
+		c.mu.Unlock()
+		if notifyDisconnect && onDisconnect != nil {
 			onDisconnect()
 		}
 	}()
@@ -250,6 +274,8 @@ func (c *WSClient) sendRequest(ctx context.Context, method string, params any) (
 		return nil, fmt.Errorf("send: %w", err)
 	}
 
+	timer := time.NewTimer(rtcRequestTimeout)
+	defer timer.Stop()
 	select {
 	case resp := <-ch:
 		if resp.Error != "" {
@@ -258,7 +284,7 @@ func (c *WSClient) sendRequest(ctx context.Context, method string, params any) (
 		return resp.Result, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-time.After(rtcRequestTimeout):
+	case <-timer.C:
 		return nil, fmt.Errorf("rpc timeout")
 	}
 }
@@ -293,10 +319,12 @@ func (c *WSClient) Close() {
 	c.closeOnce.Do(func() {
 		c.cancel()
 		c.mu.Lock()
-		if c.conn != nil {
-			c.conn.Close()
-		}
+		conn := c.conn
+		c.conn = nil
 		c.connected = false
 		c.mu.Unlock()
+		if conn != nil {
+			conn.Close()
+		}
 	})
 }

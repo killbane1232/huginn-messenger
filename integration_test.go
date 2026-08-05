@@ -206,9 +206,10 @@ type testMuninnServer struct {
 	signals map[string][]muninn.Signal
 	srv     *httptest.Server
 
-	wsMu     sync.Mutex
-	wsConns  map[string]*websocket.Conn
-	upgrader websocket.Upgrader
+	wsMu      sync.Mutex
+	wsWriteMu sync.Mutex
+	wsConns   map[string]*websocket.Conn
+	upgrader  websocket.Upgrader
 }
 
 func newTestMuninnServer() *testMuninnServer {
@@ -246,6 +247,12 @@ func newTestMuninnServer() *testMuninnServer {
 
 func (ts *testMuninnServer) URL() string { return ts.srv.URL }
 func (ts *testMuninnServer) Close()      { ts.srv.Close() }
+
+func (ts *testMuninnServer) writeWebSocket(conn *websocket.Conn, data []byte) error {
+	ts.wsWriteMu.Lock()
+	defer ts.wsWriteMu.Unlock()
+	return conn.WriteMessage(websocket.TextMessage, data)
+}
 
 func (ts *testMuninnServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req muninn.RegisterRequest
@@ -496,7 +503,7 @@ func (ts *testMuninnServer) handleWebSocket(w http.ResponseWriter, r *http.Reque
 			},
 		}
 		notifData, _ := json.Marshal(notif)
-		conn.WriteMessage(websocket.TextMessage, notifData)
+		ts.writeWebSocket(conn, notifData)
 	}
 
 	defer func() {
@@ -533,7 +540,7 @@ func (ts *testMuninnServer) handleWebSocket(w http.ResponseWriter, r *http.Reque
 
 			resp := map[string]any{"id": rpcReq.ID, "result": map[string]string{"status": "relayed"}}
 			respData, _ := json.Marshal(resp)
-			conn.WriteMessage(websocket.TextMessage, respData)
+			ts.writeWebSocket(conn, respData)
 
 			ts.wsMu.Lock()
 			targetConn, ok := ts.wsConns[params.TargetID]
@@ -548,7 +555,7 @@ func (ts *testMuninnServer) handleWebSocket(w http.ResponseWriter, r *http.Reque
 					},
 				}
 				notifData, _ := json.Marshal(notif)
-				targetConn.WriteMessage(websocket.TextMessage, notifData)
+				ts.writeWebSocket(targetConn, notifData)
 			} else {
 				ts.mu.Lock()
 				ts.signals[params.TargetID] = append(ts.signals[params.TargetID], muninn.Signal{From: peerID, Type: "offer", Data: params.Offer})
@@ -568,7 +575,7 @@ func (ts *testMuninnServer) handleWebSocket(w http.ResponseWriter, r *http.Reque
 
 			resp := map[string]any{"id": rpcReq.ID, "result": map[string]string{"status": "relayed"}}
 			respData, _ := json.Marshal(resp)
-			conn.WriteMessage(websocket.TextMessage, respData)
+			ts.writeWebSocket(conn, respData)
 
 			ts.wsMu.Lock()
 			targetConn, ok := ts.wsConns[params.TargetID]
@@ -583,7 +590,7 @@ func (ts *testMuninnServer) handleWebSocket(w http.ResponseWriter, r *http.Reque
 					},
 				}
 				notifData, _ := json.Marshal(notif)
-				targetConn.WriteMessage(websocket.TextMessage, notifData)
+				ts.writeWebSocket(targetConn, notifData)
 			} else {
 				ts.mu.Lock()
 				ts.signals[params.TargetID] = append(ts.signals[params.TargetID], muninn.Signal{From: params.From, Type: params.Type, Data: params.Data})
@@ -593,7 +600,7 @@ func (ts *testMuninnServer) handleWebSocket(w http.ResponseWriter, r *http.Reque
 		default:
 			resp := map[string]any{"id": rpcReq.ID, "error": "unknown method"}
 			respData, _ := json.Marshal(resp)
-			conn.WriteMessage(websocket.TextMessage, respData)
+			ts.writeWebSocket(conn, respData)
 		}
 	}
 }
@@ -621,7 +628,7 @@ func (ts *testMuninnServer) handleSendSignal(w http.ResponseWriter, r *http.Requ
 			},
 		}
 		notifData, _ := json.Marshal(notif)
-		targetConn.WriteMessage(websocket.TextMessage, notifData)
+		ts.writeWebSocket(targetConn, notifData)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

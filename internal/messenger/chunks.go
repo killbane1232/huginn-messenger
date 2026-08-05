@@ -439,7 +439,11 @@ func (m *Messenger) requestMissingChunk(fileID string, chunkIndex int, senderID 
 				FileID: fileID, ChunkIndex: chunkIndex,
 			})
 		} else if pid == senderID {
-			go m.ConnectPeer(pid)
+			m.async.trySubmit(func() {
+				if err := m.ConnectPeer(pid); err != nil {
+					log.Printf("connect to %s for missing chunk: %v", pid, err)
+				}
+			})
 		}
 	}
 }
@@ -462,7 +466,7 @@ func (m *Messenger) getChunkData(rec muninn.ChunkRecord) ([]byte, bool) {
 		})
 	} else {
 		m.ConnectPeer(rec.PeerID)
-		go func() {
+		m.async.trySubmit(func() {
 			for i := 0; i < 50; i++ {
 				select {
 				case <-m.ctx.Done():
@@ -478,7 +482,7 @@ func (m *Messenger) getChunkData(rec muninn.ChunkRecord) ([]byte, bool) {
 				}
 			}
 			log.Printf("getChunkData: failed to connect to %s within 5s", rec.PeerID)
-		}()
+		})
 	}
 
 	return nil, false
@@ -496,8 +500,10 @@ func (m *Messenger) InjectChunk(fileID string, chunkIndex int, data []byte) {
 	if err := m.store.StoreChunk(fileID, chunkIndex, data, 604800); err != nil {
 		log.Printf("inject chunk: %v", err)
 	}
-	go m.checkPendingMessages()
-	go m.checkPendingFileDownloads()
+	m.async.submit(func() {
+		m.checkPendingMessages()
+		m.checkPendingFileDownloads()
+	})
 }
 
 func (m *Messenger) ListFailedChunks() ([]store.FailedChunk, error) {

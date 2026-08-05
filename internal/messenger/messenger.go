@@ -137,9 +137,13 @@ type Messenger struct {
 	fileReadySubs   []chan FileReadyEvent
 	fileReadySubsMu sync.Mutex
 	registeredMap   map[string]bool
+	registeredMu    sync.Mutex
 
 	ctx          context.Context
 	cancel       context.CancelFunc
+	async        *asyncPool
+	backgroundWG sync.WaitGroup
+	shutdownOnce sync.Once
 	peerFlag     muninn.PeerFlag
 	downloadsDir string
 
@@ -276,6 +280,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		appConfig:            appCfg,
 		pollSignal:           o.pollSignal,
 	}
+	m.async = newAsyncPool(ctx, asyncWorkerCount, asyncQueueSize)
 
 	if len(o.iceServers) < 1 {
 		o.iceServers = []pion.ICEServer{
@@ -292,7 +297,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		}
 	}
 	m.rtcManager = webrtc.NewManager(peerID, rtcMsgChan, m.handleChunkStore, m.handleChunkGet,
-		m.handleReloginRequest, m.handleReloginResponse, o.iceServers)
+		m.handleReloginRequest, m.handleReloginResponse, o.iceServers, m.async.submit)
 
 	m.wsClient = muninn.NewWSClient(muninnClient.BaseURL(), peerID)
 	m.wsClient.SetOnSignal(func(sig muninn.Signal) {
@@ -303,14 +308,9 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		}
 	})
 	m.wsClient.SetOnDisconnect(func() {
-		log.Printf("[ws] connection to muninn lost, will reconnect")
-		err := m.wsClient.Connect(m.ctx)
-		if err == nil {
-			log.Printf("[ws] reconnected to muninn")
-		}
-		log.Printf("[ws] reconnect failed: %v", err)
+		log.Printf("[ws] connection to muninn lost, reconnect scheduled")
 	})
-	go m.rtcReconnectLoop()
+	m.startBackground(m.rtcReconnectLoop)
 	storedPeers, _ := st.GetStoredPeers()
 	for _, sp := range storedPeers {
 		munPeer := sp.ToMuninnPeer()
@@ -318,15 +318,23 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		m.peers = append(m.peers, munPeer)
 	}
 
-	go m.heartbeatLoop()   // TODO: переделать на более низкое энергопотребление
-	go m.peerRefreshLoop() // т.к. текущее решение занимает все потоки на всё время
-	go m.signalPollLoop()
-	go m.processRTCMessages()
-	go m.pendingChunkLoop()
-	go m.fileDownloadLoop()
-	go m.chunkCleanupLoop()
+	m.startBackground(m.heartbeatLoop)
+	m.startBackground(m.peerRefreshLoop)
+	m.startBackground(m.signalPollLoop)
+	m.startBackground(m.processRTCMessages)
+	m.startBackground(m.pendingChunkLoop)
+	m.startBackground(m.fileDownloadLoop)
+	m.startBackground(m.chunkCleanupLoop)
 
 	return m, nil
+}
+
+func (m *Messenger) startBackground(fn func()) {
+	m.backgroundWG.Add(1)
+	go func() {
+		defer m.backgroundWG.Done()
+		fn()
+	}()
 }
 
 func (m *Messenger) heartbeatLoop() {
@@ -361,6 +369,8 @@ func (m *Messenger) heartbeatLoop() {
 func (m *Messenger) Register() error {
 	sign := crypto.EncodeKey(m.signPublic)
 	key := m.Username + ":" + sign
+	m.registeredMu.Lock()
+	defer m.registeredMu.Unlock()
 	if m.registeredMap[key] == true {
 		req := &muninn.RefreshRequest{
 			ID:           m.ID,
@@ -583,11 +593,15 @@ func (m *Messenger) SaveConfig(cfg *config.Config) error {
 }
 
 func (m *Messenger) Shutdown() {
-	m.cancel()
-	delCtx, delCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer delCancel()
-	m.muninnClient.Delete(delCtx, m.ID)
-	m.wsClient.Close()
-	m.rtcManager.CloseAll()
-	m.store.Close()
+	m.shutdownOnce.Do(func() {
+		m.cancel()
+		delCtx, delCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer delCancel()
+		m.muninnClient.Delete(delCtx, m.ID)
+		m.wsClient.Close()
+		m.rtcManager.CloseAll()
+		m.backgroundWG.Wait()
+		m.async.wait()
+		m.store.Close()
+	})
 }
