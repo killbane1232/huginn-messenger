@@ -76,6 +76,12 @@ func (m *Messenger) SearchPeers(query string) []muninn.Peer {
 }
 
 func (m *Messenger) upsertPeer(peerID, peerKey, login, encryptionKey, signatureKey string, lastSeen time.Time, isFake bool) {
+	login = (muninn.Peer{
+		ID:           peerID,
+		Login:        login,
+		SignatureKey: signatureKey,
+		IsFake:       isFake,
+	}).DisplayLogin()
 	m.mu.Lock()
 	found := false
 	peer, found := m.peersMap[peerKey]

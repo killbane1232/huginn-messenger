@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -56,7 +57,25 @@ type Peer struct {
 }
 
 func (p Peer) Key() string {
-	return p.Login + ":" + p.SignatureKey
+	login := p.DisplayLogin()
+	if p.IsFake && p.ID != "" {
+		login = p.ID
+	}
+	if p.SignatureKey == "" {
+		return login
+	}
+	return login + ":" + p.SignatureKey
+}
+
+func (p Peer) DisplayLogin() string {
+	login := strings.TrimSpace(p.Login)
+	if p.SignatureKey != "" {
+		login = strings.TrimSuffix(login, ":"+p.SignatureKey)
+	}
+	if separator := strings.IndexByte(login, ':'); separator > 0 {
+		return login[:separator]
+	}
+	return login
 }
 
 type RegisterRequest struct {
