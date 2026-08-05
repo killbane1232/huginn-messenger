@@ -33,6 +33,7 @@ func (m *Messenger) processRTCMessages() {
 
 			cm := ChatMessage{
 				From:      fromLogin,
+				ChatID:    fromKey,
 				Text:      displayText,
 				Timestamp: msg.Timestamp,
 				MsgID:     msg.MsgID,
@@ -41,7 +42,7 @@ func (m *Messenger) processRTCMessages() {
 				cm.Timestamp = time.Now()
 			}
 			jsonData, _ := json.Marshal(cm)
-			if err := m.store.SaveMessage(msg.MsgID, fromKey, fromLogin, fromKey, jsonData, cm.Timestamp); err != nil {
+			if err := m.store.SaveMessage(msg.MsgID, fromKey, fromLogin, cm.ChatID, jsonData, cm.Timestamp); err != nil {
 				log.Printf("save message: %v", err)
 			}
 			m.msgSubsMu.Lock()
@@ -107,9 +108,20 @@ func (m *Messenger) sendMessage(to, text string, filePaths []string, ttlSeconds 
 
 	msgID := uuid.New().String()
 	now := time.Now()
-	cm := ChatMessage{From: m.Username, Text: text, Timestamp: now, MsgID: msgID, Files: files}
+	chatID := peer.Key()
+	if peer.IsFake && peer.ID != "" {
+		chatID = peer.ID
+	}
+	cm := ChatMessage{
+		From:      m.Username,
+		ChatID:    chatID,
+		Text:      text,
+		Timestamp: now,
+		MsgID:     msgID,
+		Files:     files,
+	}
 	jsonData, _ := json.Marshal(cm)
-	if err := m.store.SaveMessage(msgID, peer.Key(), peer.Login, peer.Key(), jsonData, cm.Timestamp); err != nil {
+	if err := m.store.SaveMessage(msgID, peer.Key(), peer.Login, chatID, jsonData, cm.Timestamp); err != nil {
 		log.Printf("save message: %v", err)
 	}
 	m.msgSubsMu.Lock()
@@ -483,9 +495,14 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 		payload.Timestamp = time.Now()
 	}
 
-	chatID := senderPeer.Login
+	chatID := senderPeer.Key()
 	if recipientID != "" && recipientID != m.Key {
-		chatID = recipientID
+		groupUID := strings.SplitN(recipientID, ":", 2)[0]
+		if _, err := m.store.GetGroupChat(groupUID); err == nil {
+			chatID = groupUID
+		} else {
+			chatID = recipientID
+		}
 	}
 
 	displayText := m.checkInviteText(payload.Text)
@@ -496,6 +513,7 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 
 	decryptedMsg := ChatMessage{
 		From:      senderPeer.Login,
+		ChatID:    chatID,
 		Text:      displayText,
 		Timestamp: payload.Timestamp,
 		MsgID:     msgID,

@@ -28,6 +28,7 @@ import (
 
 type ChatMessage struct {
 	From      string     `json:"from"`
+	ChatID    string     `json:"chat_id,omitempty"`
 	Text      string     `json:"text"`
 	Timestamp time.Time  `json:"timestamp"`
 	MsgID     string     `json:"msg_id,omitempty"`

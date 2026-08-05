@@ -15,7 +15,17 @@ func (s *SQLiteStore) SaveMessage(msg_uid string, login string, senderLogin stri
 func (s *SQLiteStore) GetMessages(peerID string) ([][]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query("SELECT data FROM messages WHERE login = ? order by created_at asc", peerID)
+	rows, err := s.db.Query(`
+		SELECT data
+		FROM messages
+		WHERE chat_id = ?
+			OR login = ?
+			OR (instr(?, ':') = 0 AND (
+				substr(chat_id, 1, length(?) + 1) = ? || ':'
+				OR substr(login, 1, length(?) + 1) = ? || ':'
+			))
+		ORDER BY created_at ASC`,
+		peerID, peerID, peerID, peerID, peerID, peerID, peerID)
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +44,18 @@ func (s *SQLiteStore) GetMessages(peerID string) ([][]byte, error) {
 func (s *SQLiteStore) GetMessagesDesc(peerID string, limit, offset int) ([][]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query("SELECT data FROM messages WHERE login = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", peerID, limit, offset)
+	rows, err := s.db.Query(`
+		SELECT data
+		FROM messages
+		WHERE chat_id = ?
+			OR login = ?
+			OR (instr(?, ':') = 0 AND (
+				substr(chat_id, 1, length(?) + 1) = ? || ':'
+				OR substr(login, 1, length(?) + 1) = ? || ':'
+			))
+		ORDER BY created_at DESC
+		LIMIT ? OFFSET ?`,
+		peerID, peerID, peerID, peerID, peerID, peerID, peerID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
