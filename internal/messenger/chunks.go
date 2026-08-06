@@ -371,7 +371,14 @@ func (m *Messenger) sendFileChunks(recipientID, filePath string, ttlSeconds int)
 	}
 
 	log.Printf("file %s sent as %s (%d chunks)", filename, fileID, len(chunks))
-	return &FileMeta{FileID: fileID, FileHash: fileHashB64, DecryptionKey: crypto.EncodeKey(aesKey), TotalChunks: len(chunks), Filename: filename}, nil
+	return &FileMeta{
+		FileID:        fileID,
+		FileHash:      fileHashB64,
+		DecryptionKey: crypto.EncodeKey(aesKey),
+		TotalChunks:   len(chunks),
+		Filename:      filename,
+		FilePath:      filePath,
+	}, nil
 }
 
 func (m *Messenger) retryFailedChunks(recipientID string) {

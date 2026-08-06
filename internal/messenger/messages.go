@@ -207,7 +207,7 @@ func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSecond
 
 	now := time.Now()
 
-	payload := MessagePayload{Text: text, Timestamp: now, Files: files}
+	payload := MessagePayload{Text: text, Timestamp: now, Files: withoutLocalFilePaths(files)}
 	payloadData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
@@ -538,6 +538,7 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 	if payload.Timestamp.IsZero() {
 		payload.Timestamp = time.Now()
 	}
+	payload.Files = withoutLocalFilePaths(payload.Files)
 
 	chatID := senderPeer.Key()
 	if recipientID != "" && recipientID != m.Key {
@@ -579,6 +580,19 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 	m.msgSubsMu.Unlock()
 
 	log.Printf("message %s delivered from %s", msgID, records[0].SenderID)
+}
+
+func withoutLocalFilePaths(files []FileMeta) []FileMeta {
+	if len(files) == 0 {
+		return nil
+	}
+
+	result := make([]FileMeta, len(files))
+	copy(result, files)
+	for i := range result {
+		result[i].FilePath = ""
+	}
+	return result
 }
 
 func (m *Messenger) MarkMessageRead(msgID string) error {

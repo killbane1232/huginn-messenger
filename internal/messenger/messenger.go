@@ -41,6 +41,7 @@ type FileMeta struct {
 	DecryptionKey string `json:"decryption_key"`
 	TotalChunks   int    `json:"total_chunks"`
 	Filename      string `json:"filename,omitempty"`
+	FilePath      string `json:"file_path,omitempty"`
 }
 
 type pendingFileDownload struct {
