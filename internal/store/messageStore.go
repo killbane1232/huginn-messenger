@@ -1,7 +1,6 @@
 package store
 
 import (
-	"strings"
 	"time"
 )
 
@@ -11,36 +10,11 @@ const messageHistorySelect = `
 			SELECT message_uid, data, created_at
 			FROM messages
 			WHERE chat_id = ?
-			UNION
-			SELECT message_uid, data, created_at
-			FROM messages
-			WHERE login = ?
-			UNION
-			SELECT message_uid, data, created_at
-			FROM messages
-			WHERE chat_id >= ? AND chat_id < ?
-			UNION
-			SELECT message_uid, data, created_at
-			FROM messages
-			WHERE login >= ? AND login < ?
 		)`
 
 func messageHistoryArgs(peerID string) []any {
-	legacyPrefix := peerID + ":"
-	legacyUpperBound := peerID + ";"
-	if strings.Contains(peerID, ":") {
-		// Equal lower and upper bounds disable legacy prefix lookup for a fully
-		// qualified peer key while keeping the SQL query shape stable.
-		legacyPrefix = peerID
-		legacyUpperBound = peerID
-	}
 	return []any{
 		peerID,
-		peerID,
-		legacyPrefix,
-		legacyUpperBound,
-		legacyPrefix,
-		legacyUpperBound,
 	}
 }
 
