@@ -1,12 +1,98 @@
 package store
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestMessageHistoryOrdersTimestampsByInstantAcrossTimeZones(t *testing.T) {
+	s, err := New(filepath.Join(t.TempDir(), "message-timezones.db"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	moscow := time.FixedZone("MSK", 3*60*60)
+	earlier := time.Date(2026, time.August, 6, 12, 0, 0, 0, moscow)
+	later := time.Date(2026, time.August, 6, 10, 0, 0, 0, time.UTC)
+
+	if err := s.SaveMessage("sent", "peer", "me", "peer", []byte("sent"), earlier); err != nil {
+		t.Fatalf("SaveMessage(sent): %v", err)
+	}
+	if err := s.SaveMessage("received", "peer", "peer", "peer", []byte("received"), later); err != nil {
+		t.Fatalf("SaveMessage(received): %v", err)
+	}
+
+	got, err := s.GetMessages("peer")
+	if err != nil {
+		t.Fatalf("GetMessages: %v", err)
+	}
+	want := [][]byte{[]byte("sent"), []byte("received")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetMessages() = %q, want %q", got, want)
+	}
+
+	got, err = s.GetMessagesDesc("peer", 2, 0)
+	if err != nil {
+		t.Fatalf("GetMessagesDesc: %v", err)
+	}
+	want = [][]byte{[]byte("received"), []byte("sent")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetMessagesDesc() = %q, want %q", got, want)
+	}
+}
+
+func TestMessageTimestampMigrationNormalizesExistingRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "message-timezone-migration.db")
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	moscow := time.FixedZone("MSK", 3*60*60)
+	timestamp := time.Date(2026, time.August, 6, 12, 0, 0, 123456000, moscow)
+	data, err := json.Marshal(map[string]any{"timestamp": timestamp})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if _, err := s.db.Exec(
+		"INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		"legacy", "peer", "me", "peer", data, timestamp,
+	); err != nil {
+		t.Fatalf("insert legacy message: %v", err)
+	}
+	if _, err := s.db.Exec("DELETE FROM schema_version WHERE id = '008'"); err != nil {
+		t.Fatalf("reset migration: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s, err = New(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	var storageType string
+	var createdAt int64
+	if err := s.db.QueryRow(
+		"SELECT typeof(created_at), created_at FROM messages WHERE message_uid = ?",
+		"legacy",
+	).Scan(&storageType, &createdAt); err != nil {
+		t.Fatalf("read migrated timestamp: %v", err)
+	}
+	if storageType != "integer" {
+		t.Fatalf("typeof(created_at) = %q, want integer", storageType)
+	}
+	if createdAt != timestamp.UnixMicro() {
+		t.Fatalf("created_at = %d, want %d", createdAt, timestamp.UnixMicro())
+	}
+}
 
 func TestGetMessagesUsesChatIDAndReadsLegacyGroupRows(t *testing.T) {
 	s, err := New(filepath.Join(t.TempDir(), "messages.db"))

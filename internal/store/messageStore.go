@@ -22,7 +22,7 @@ func (s *SQLiteStore) SaveMessage(msg_uid string, login string, senderLogin stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-		msg_uid, login, senderLogin, chatID, data, created_at)
+		msg_uid, login, senderLogin, chatID, data, created_at.UnixMicro())
 	return err
 }
 

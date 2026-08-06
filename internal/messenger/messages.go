@@ -25,6 +25,10 @@ func (m *Messenger) processRTCMessages() {
 		select {
 		case msg := <-m.rtcMsgChan:
 			displayText := m.checkInviteText(msg.Text)
+			receivedAt := msg.Timestamp.UTC()
+			if msg.Timestamp.IsZero() {
+				receivedAt = time.Now().UTC()
+			}
 
 			fromKey := msg.From
 			fromLogin := strings.SplitN(msg.From, ":", 2)[0]
@@ -37,11 +41,8 @@ func (m *Messenger) processRTCMessages() {
 				From:      fromLogin,
 				ChatID:    fromKey,
 				Text:      displayText,
-				Timestamp: msg.Timestamp,
+				Timestamp: receivedAt,
 				MsgID:     msg.MsgID,
-			}
-			if cm.Timestamp.IsZero() {
-				cm.Timestamp = time.Now()
 			}
 			jsonData, _ := json.Marshal(cm)
 			if err := m.store.SaveMessage(msg.MsgID, fromKey, fromLogin, cm.ChatID, jsonData, cm.Timestamp); err != nil {
@@ -126,7 +127,7 @@ func (m *Messenger) sendMessage(to, text string, filePaths []string, ttlSeconds 
 	}
 
 	msgID := uuid.New().String()
-	now := time.Now()
+	sentAt := time.Now().UTC()
 	chatID := peer.Key()
 	if peer.IsFake && peer.ID != "" {
 		chatID = peer.ID
@@ -135,7 +136,7 @@ func (m *Messenger) sendMessage(to, text string, filePaths []string, ttlSeconds 
 		From:      m.Username,
 		ChatID:    chatID,
 		Text:      text,
-		Timestamp: now,
+		Timestamp: sentAt,
 		MsgID:     msgID,
 		Files:     files,
 	}
@@ -169,15 +170,14 @@ func (m *Messenger) sendMessage(to, text string, filePaths []string, ttlSeconds 
 	}
 
 	if directDelivery && m.IsPeerConnected(onlinePeerID) {
-		now := time.Now()
-		if err := m.rtcManager.SendMessage(onlinePeerID, text, now, msgID); err != nil {
-			return m.sendOffline(msgID, text, peer, ttlSeconds, files)
+		if err := m.rtcManager.SendMessage(onlinePeerID, text, sentAt, msgID); err != nil {
+			return m.sendOffline(msgID, text, peer, sentAt, ttlSeconds, files)
 		}
-		_ = m.sendOffline(msgID, text, peer, ttlSeconds, files)
+		_ = m.sendOffline(msgID, text, peer, sentAt, ttlSeconds, files)
 		return nil
 	}
 
-	return m.sendOffline(msgID, text, peer, ttlSeconds, files)
+	return m.sendOffline(msgID, text, peer, sentAt, ttlSeconds, files)
 }
 
 func (m *Messenger) waitForPeerConnection(peerID string, timeout time.Duration) bool {
@@ -202,12 +202,10 @@ func (m *Messenger) waitForPeerConnection(peerID string, timeout time.Duration) 
 	}
 }
 
-func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, ttlSeconds int, files []FileMeta) error {
+func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, timestamp time.Time, ttlSeconds int, files []FileMeta) error {
 	log.Printf("sendOffline[%s]: start peer.ID=%q peer.Key=%q", msgID, peer.ID, peer.Key())
 
-	now := time.Now()
-
-	payload := MessagePayload{Text: text, Timestamp: now, Files: withoutLocalFilePaths(files)}
+	payload := MessagePayload{Text: text, Timestamp: timestamp.UTC(), Files: withoutLocalFilePaths(files)}
 	payloadData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
@@ -536,7 +534,9 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 		payload = MessagePayload{Text: string(plaintext)}
 	}
 	if payload.Timestamp.IsZero() {
-		payload.Timestamp = time.Now()
+		payload.Timestamp = time.Now().UTC()
+	} else {
+		payload.Timestamp = payload.Timestamp.UTC()
 	}
 	payload.Files = withoutLocalFilePaths(payload.Files)
 
