@@ -1,8 +1,48 @@
 package store
 
 import (
+	"strings"
 	"time"
 )
+
+const messageHistorySelect = `
+		SELECT data
+		FROM (
+			SELECT message_uid, data, created_at
+			FROM messages
+			WHERE chat_id = ?
+			UNION
+			SELECT message_uid, data, created_at
+			FROM messages
+			WHERE login = ?
+			UNION
+			SELECT message_uid, data, created_at
+			FROM messages
+			WHERE chat_id >= ? AND chat_id < ?
+			UNION
+			SELECT message_uid, data, created_at
+			FROM messages
+			WHERE login >= ? AND login < ?
+		)`
+
+func messageHistoryArgs(peerID string) []any {
+	legacyPrefix := peerID + ":"
+	legacyUpperBound := peerID + ";"
+	if strings.Contains(peerID, ":") {
+		// Equal lower and upper bounds disable legacy prefix lookup for a fully
+		// qualified peer key while keeping the SQL query shape stable.
+		legacyPrefix = peerID
+		legacyUpperBound = peerID
+	}
+	return []any{
+		peerID,
+		peerID,
+		legacyPrefix,
+		legacyUpperBound,
+		legacyPrefix,
+		legacyUpperBound,
+	}
+}
 
 func (s *SQLiteStore) SaveMessage(msg_uid string, login string, senderLogin string, chatID string, data []byte, created_at time.Time) error {
 	s.mu.Lock()
@@ -15,17 +55,9 @@ func (s *SQLiteStore) SaveMessage(msg_uid string, login string, senderLogin stri
 func (s *SQLiteStore) GetMessages(peerID string) ([][]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`
-		SELECT data
-		FROM messages
-		WHERE chat_id = ?
-			OR login = ?
-			OR (instr(?, ':') = 0 AND (
-				substr(chat_id, 1, length(?) + 1) = ? || ':'
-				OR substr(login, 1, length(?) + 1) = ? || ':'
-			))
+	rows, err := s.db.Query(messageHistorySelect+`
 		ORDER BY created_at ASC`,
-		peerID, peerID, peerID, peerID, peerID, peerID, peerID)
+		messageHistoryArgs(peerID)...)
 	if err != nil {
 		return nil, err
 	}
@@ -44,18 +76,11 @@ func (s *SQLiteStore) GetMessages(peerID string) ([][]byte, error) {
 func (s *SQLiteStore) GetMessagesDesc(peerID string, limit, offset int) ([][]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`
-		SELECT data
-		FROM messages
-		WHERE chat_id = ?
-			OR login = ?
-			OR (instr(?, ':') = 0 AND (
-				substr(chat_id, 1, length(?) + 1) = ? || ':'
-				OR substr(login, 1, length(?) + 1) = ? || ':'
-			))
+	args := append(messageHistoryArgs(peerID), limit, offset)
+	rows, err := s.db.Query(messageHistorySelect+`
 		ORDER BY created_at DESC
 		LIMIT ? OFFSET ?`,
-		peerID, peerID, peerID, peerID, peerID, peerID, peerID, limit, offset)
+		args...)
 	if err != nil {
 		return nil, err
 	}
