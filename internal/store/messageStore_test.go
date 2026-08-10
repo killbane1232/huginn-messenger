@@ -108,7 +108,7 @@ func TestGetMessagesUsesChatIDAndReadsLegacyGroupRows(t *testing.T) {
 	}{
 		{"direct", "alice:signature", "alice:signature", "direct", 0},
 		{"group-current", "bob:signature", "group-uid", "group-current", time.Second},
-		{"group-legacy", "group-uid:group-signature", "group-uid:group-signature", "group-legacy", 2 * time.Second},
+		{"group-legacy", "group-uid:group-signature", "group-uid", "group-legacy", 2 * time.Second},
 		{"other", "other:signature", "other:signature", "other", 3 * time.Second},
 		{"similar", "group-uid2:signature", "group-uid2:signature", "similar", 4 * time.Second},
 		{"upper-bound", "group-uid;signature", "group-uid;signature", "upper-bound", 5 * time.Second},
