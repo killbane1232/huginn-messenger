@@ -42,7 +42,17 @@ type ReloginRequest struct {
 }
 
 type ReloginResponse struct {
-	KeysData string `json:"keys_data"`
+	KeysData   string `json:"keys_data,omitempty"`
+	TransferID string `json:"transfer_id,omitempty"`
+	ChunkCount int    `json:"chunk_count,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+type ReloginChunk struct {
+	TransferID string `json:"transfer_id"`
+	Index      int    `json:"index"`
+	Data       []byte `json:"data"`
 }
 
 type envelope struct {
@@ -58,21 +68,23 @@ const (
 	MsgTypeChunkData       = "chunk_data"
 	MsgTypeReloginRequest  = "relogin_request"
 	MsgTypeReloginResponse = "relogin_response"
+	MsgTypeReloginChunk    = "relogin_chunk"
 )
 
 type Manager struct {
-	mu          sync.RWMutex
-	connections map[string]*pion.PeerConnection
-	dataChans   map[string]*pion.DataChannel
-	negMu       sync.Mutex
-	negotiation map[string]*sync.Mutex
-	chatMsgChan chan ChatMessage
-	chunkStore  func(peerID string, req ChunkStoreRequest)
-	chunkGet    func(peerID string, req ChunkGetRequest) ([]byte, bool)
-	reloginReq  func(peerID string, req ReloginRequest)
-	reloginResp func(peerID string, resp ReloginResponse)
-	submit      func(func()) bool
-	localID     string
+	mu           sync.RWMutex
+	connections  map[string]*pion.PeerConnection
+	dataChans    map[string]*pion.DataChannel
+	negMu        sync.Mutex
+	negotiation  map[string]*sync.Mutex
+	chatMsgChan  chan ChatMessage
+	chunkStore   func(peerID string, req ChunkStoreRequest)
+	chunkGet     func(peerID string, req ChunkGetRequest) ([]byte, bool)
+	reloginReq   func(peerID string, req ReloginRequest)
+	reloginResp  func(peerID string, resp ReloginResponse)
+	reloginChunk func(peerID string, chunk ReloginChunk)
+	submit       func(func()) bool
+	localID      string
 
 	config pion.Configuration
 }
@@ -82,20 +94,22 @@ func NewManager(localID string, chatMsgChan chan ChatMessage,
 	chunkGet func(peerID string, req ChunkGetRequest) ([]byte, bool),
 	reloginReq func(peerID string, req ReloginRequest),
 	reloginResp func(peerID string, resp ReloginResponse),
+	reloginChunk func(peerID string, chunk ReloginChunk),
 	iceServers []pion.ICEServer,
 	submit func(func()) bool) *Manager {
 
 	return &Manager{
-		connections: make(map[string]*pion.PeerConnection),
-		dataChans:   make(map[string]*pion.DataChannel),
-		negotiation: make(map[string]*sync.Mutex),
-		chatMsgChan: chatMsgChan,
-		chunkStore:  chunkStore,
-		chunkGet:    chunkGet,
-		reloginReq:  reloginReq,
-		reloginResp: reloginResp,
-		submit:      submit,
-		localID:     localID,
+		connections:  make(map[string]*pion.PeerConnection),
+		dataChans:    make(map[string]*pion.DataChannel),
+		negotiation:  make(map[string]*sync.Mutex),
+		chatMsgChan:  chatMsgChan,
+		chunkStore:   chunkStore,
+		chunkGet:     chunkGet,
+		reloginReq:   reloginReq,
+		reloginResp:  reloginResp,
+		reloginChunk: reloginChunk,
+		submit:       submit,
+		localID:      localID,
 		config: pion.Configuration{
 			ICEServers: iceServers,
 		},
@@ -185,7 +199,7 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		}
 		var req ReloginRequest
 		if json.Unmarshal(env.Data, &req) == nil {
-			m.reloginReq(remoteID, req)
+			m.submitAsync(func() { m.reloginReq(remoteID, req) })
 		}
 	case MsgTypeReloginResponse:
 		if m.reloginResp == nil {
@@ -195,26 +209,37 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		if json.Unmarshal(env.Data, &resp) == nil {
 			m.reloginResp(remoteID, resp)
 		}
+	case MsgTypeReloginChunk:
+		if m.reloginChunk == nil {
+			return
+		}
+		var chunk ReloginChunk
+		if json.Unmarshal(env.Data, &chunk) == nil {
+			m.reloginChunk(remoteID, chunk)
+		}
 	}
 }
 
-func (m *Manager) sendEnvelope(remoteID, msgType string, v any) {
+func (m *Manager) sendEnvelope(remoteID, msgType string, v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
-		return
+		return fmt.Errorf("marshal %s payload: %w", msgType, err)
 	}
 	env := envelope{Type: msgType, Data: data}
 	raw, err := json.Marshal(env)
 	if err != nil {
-		return
+		return fmt.Errorf("marshal %s envelope: %w", msgType, err)
 	}
 	m.mu.RLock()
 	dc, ok := m.dataChans[remoteID]
 	m.mu.RUnlock()
 	if !ok || dc == nil {
-		return
+		return fmt.Errorf("no data channel to %s", remoteID)
 	}
-	dc.Send(raw)
+	if dc.ReadyState() != pion.DataChannelStateOpen {
+		return fmt.Errorf("data channel to %s is not open", remoteID)
+	}
+	return dc.Send(raw)
 }
 
 func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, error) {
@@ -426,12 +451,26 @@ func (m *Manager) SendChunkGet(remoteID string, req ChunkGetRequest) error {
 	return dc.Send(raw)
 }
 
-func (m *Manager) SendReloginRequest(remoteID string, req ReloginRequest) {
-	m.sendEnvelope(remoteID, MsgTypeReloginRequest, req)
+func (m *Manager) SendReloginRequest(remoteID string, req ReloginRequest) error {
+	return m.sendEnvelope(remoteID, MsgTypeReloginRequest, req)
 }
 
-func (m *Manager) SendReloginResponse(remoteID string, resp ReloginResponse) {
-	m.sendEnvelope(remoteID, MsgTypeReloginResponse, resp)
+func (m *Manager) SendReloginResponse(remoteID string, resp ReloginResponse) error {
+	return m.sendEnvelope(remoteID, MsgTypeReloginResponse, resp)
+}
+
+func (m *Manager) SendReloginChunk(remoteID string, chunk ReloginChunk) error {
+	return m.sendEnvelope(remoteID, MsgTypeReloginChunk, chunk)
+}
+
+func (m *Manager) BufferedAmount(remoteID string) (uint64, bool) {
+	m.mu.RLock()
+	dc, ok := m.dataChans[remoteID]
+	m.mu.RUnlock()
+	if !ok || dc == nil || dc.ReadyState() != pion.DataChannelStateOpen {
+		return 0, false
+	}
+	return dc.BufferedAmount(), true
 }
 
 func (m *Manager) IsConnected(remoteID string) bool {

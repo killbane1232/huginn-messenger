@@ -42,11 +42,13 @@ type FileMeta struct {
 	TotalChunks   int    `json:"total_chunks"`
 	Filename      string `json:"filename,omitempty"`
 	FilePath      string `json:"file_path,omitempty"`
+	SourcePeerID  string `json:"source_peer_id,omitempty"`
 }
 
 type pendingFileDownload struct {
-	fileMeta FileMeta
-	senderID string
+	fileMeta        FileMeta
+	senderID        string
+	preferredPeerID string
 }
 
 type FileReadyEvent struct {
@@ -154,10 +156,10 @@ type Messenger struct {
 	processingMsg map[string]bool
 	processingMu  sync.Mutex
 
-	appConfig   *config.Config
-	reloginMu   sync.Mutex
-	reloginKeys string
-	pollSignal  bool
+	appConfig       *config.Config
+	reloginMu       sync.Mutex
+	reloginTransfer *reloginTransferState
+	pollSignal      bool
 }
 
 func New(username string, muninnClient *muninn.Client, dbPath string, opts ...MessengerOption) (*Messenger, error) {
@@ -298,7 +300,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		}
 	}
 	m.rtcManager = webrtc.NewManager(peerID, rtcMsgChan, m.handleChunkStore, m.handleChunkGet,
-		m.handleReloginRequest, m.handleReloginResponse, o.iceServers, m.async.submit)
+		m.handleReloginRequest, m.handleReloginResponse, m.handleReloginChunk, o.iceServers, m.async.submit)
 
 	m.wsClient = muninn.NewWSClient(muninnClient.BaseURL(), peerID)
 	m.wsClient.SetOnSignal(func(sig muninn.Signal) {
@@ -326,6 +328,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	m.startBackground(m.pendingChunkLoop)
 	m.startBackground(m.fileDownloadLoop)
 	m.startBackground(m.chunkCleanupLoop)
+	m.async.trySubmit(m.resumeReplicatedFileDownloads)
 
 	return m, nil
 }
@@ -396,6 +399,10 @@ func (m *Messenger) Register() error {
 }
 
 func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {
+	m.processReceivedFileFromPeer(f, senderID, "")
+}
+
+func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredPeerID string) {
 	if !m.tryProcessMsg("file:" + f.FileID) {
 		return
 	}
@@ -408,14 +415,18 @@ func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {
 
 	if len(chunkMap) < f.TotalChunks {
 		log.Printf("file %s: have %d/%d chunks, requesting missing from peers", f.FileID, len(chunkMap), f.TotalChunks)
+		m.pendingMu.Lock()
+		m.pendingFileDownloads[f.FileID] = &pendingFileDownload{
+			fileMeta:        f,
+			senderID:        senderID,
+			preferredPeerID: preferredPeerID,
+		}
+		m.pendingMu.Unlock()
 		for i := 0; i < f.TotalChunks; i++ {
 			if _, ok := chunkMap[i]; !ok {
-				m.requestMissingChunk(f.FileID, i, senderID)
+				m.requestMissingChunkFromPeer(f.FileID, i, senderID, preferredPeerID)
 			}
 		}
-		m.pendingMu.Lock()
-		m.pendingFileDownloads[f.FileID] = &pendingFileDownload{fileMeta: f, senderID: senderID}
-		m.pendingMu.Unlock()
 		return
 	}
 
@@ -446,16 +457,20 @@ func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {
 		envelopes[i] = env
 	}
 
-	senderPeer := m.findPeerByKey(senderID)
-	if senderPeer == nil {
-		log.Printf("sender %s not found for file %s", senderID, f.FileID)
-		return
-	}
+	senderSignKey := m.signPublic
+	if senderID != m.Key {
+		senderPeer := m.findPeerByKey(senderID)
+		if senderPeer == nil {
+			log.Printf("sender %s not found for file %s", senderID, f.FileID)
+			return
+		}
 
-	senderSignKey, err := crypto.DecodeKey(senderPeer.SignatureKey)
-	if err != nil {
-		log.Printf("decode sender sign key for file %s: %v", f.FileID, err)
-		return
+		var err error
+		senderSignKey, err = crypto.DecodeKey(senderPeer.SignatureKey)
+		if err != nil {
+			log.Printf("decode sender sign key for file %s: %v", f.FileID, err)
+			return
+		}
 	}
 
 	aesKey, err := crypto.DecodeKey(f.DecryptionKey)
@@ -522,7 +537,7 @@ func (m *Messenger) checkPendingFileDownloads() {
 		if !ok {
 			continue
 		}
-		m.processReceivedFile(pd.fileMeta, pd.senderID)
+		m.processReceivedFileFromPeer(pd.fileMeta, pd.senderID, pd.preferredPeerID)
 	}
 }
 

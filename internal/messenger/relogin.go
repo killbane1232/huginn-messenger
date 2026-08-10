@@ -15,6 +15,8 @@ import (
 	//"runtime/debug"
 )
 
+const reloginTimeout = 2 * time.Minute
+
 func (m *Messenger) GenerateReloginSignature() (string, error) {
 	challenge := make([]byte, 32)
 	if _, err := rand.Read(challenge); err != nil {
@@ -76,41 +78,67 @@ func (m *Messenger) ApplyReloginSignature(signature string) error {
 		return fmt.Errorf("timed out waiting for WebRTC connection to %s", peerID)
 	}
 
-	m.reloginMu.Lock()
-	m.reloginKeys = ""
-	m.reloginMu.Unlock()
-
-	m.rtcManager.SendReloginRequest(peerID, webrtc.ReloginRequest{Signature: signature})
-
-	for i := 0; i < 300; i++ {
-		m.reloginMu.Lock()
-		data := m.reloginKeys
-		m.reloginMu.Unlock()
-		if data != "" {
-			if err := m.store.SaveKeysJSON(data); err != nil {
-				return fmt.Errorf("save keys: %w", err)
-			}
-			m.signPublic, m.signPrivate, m.encPrivate, m.encPublic, err = crypto.ParseKeyFile([]byte(data))
-			if err != nil {
-				return fmt.Errorf("parse relogin keys: %w", err)
-			}
-			m.Key = peer.Key()
-			peerUsername := peer.Login
-			m.Username = peerUsername
-
-			if m.appConfig == nil {
-				m.appConfig = &config.Config{}
-			}
-			m.appConfig.Username = peerUsername
-			m.appConfig.PeerID = peer.ID
-			if err := m.store.SaveAppConfig(m.appConfig); err != nil {
-				return fmt.Errorf("save config: %w", err)
-			}
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
+	resultChannel := make(chan reloginResult, 1)
+	transfer := &reloginTransferState{
+		expectedPeerID: peerID,
+		result:         resultChannel,
 	}
-	return fmt.Errorf("relogin: timed out waiting for response from %s", peerID)
+	m.reloginMu.Lock()
+	if m.reloginTransfer != nil {
+		m.reloginMu.Unlock()
+		return fmt.Errorf("relogin is already in progress")
+	}
+	m.reloginTransfer = transfer
+	m.reloginMu.Unlock()
+	defer m.clearReloginTransfer(transfer)
+
+	if err := m.rtcManager.SendReloginRequest(peerID, webrtc.ReloginRequest{Signature: signature}); err != nil {
+		return fmt.Errorf("send relogin request: %w", err)
+	}
+
+	timer := time.NewTimer(reloginTimeout)
+	defer timer.Stop()
+	var result reloginResult
+	select {
+	case result = <-resultChannel:
+	case <-timer.C:
+		return fmt.Errorf("relogin: timed out waiting for replication from %s", peerID)
+	case <-m.ctx.Done():
+		return fmt.Errorf("relogin: %w", m.ctx.Err())
+	}
+	if result.err != nil {
+		return result.err
+	}
+	if result.keysData == "" {
+		return fmt.Errorf("relogin: source returned empty keys")
+	}
+
+	if err := m.store.SaveKeysJSON(result.keysData); err != nil {
+		return fmt.Errorf("save keys: %w", err)
+	}
+	m.signPublic, m.signPrivate, m.encPrivate, m.encPublic, err = crypto.ParseKeyFile([]byte(result.keysData))
+	if err != nil {
+		return fmt.Errorf("parse relogin keys: %w", err)
+	}
+	targetPeerID := m.ID
+	m.Key = peer.Key()
+	peerUsername := peer.Login
+	m.Username = peerUsername
+
+	if m.appConfig == nil {
+		m.appConfig = &config.Config{}
+	}
+	m.appConfig.Username = peerUsername
+	m.appConfig.PeerID = targetPeerID
+	if err := m.store.SaveAppConfig(m.appConfig); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+
+	m.reloadReplicatedPeers()
+	if result.snapshot.Version == reloginSnapshotVersion {
+		m.queueReplicatedFiles(result.snapshot.Messages, peerID, peerUsername)
+	}
+	return nil
 }
 
 func (m *Messenger) handleReloginRequest(peerID string, req webrtc.ReloginRequest) {
@@ -138,13 +166,50 @@ func (m *Messenger) handleReloginRequest(peerID string, req webrtc.ReloginReques
 	keysData, err := m.store.GetKeysJSON()
 	if err != nil {
 		log.Printf("relogin: read keys from db: %v", err)
+		_ = m.rtcManager.SendReloginResponse(peerID, webrtc.ReloginResponse{Error: "read source keys"})
 		return
 	}
-	m.rtcManager.SendReloginResponse(peerID, webrtc.ReloginResponse{KeysData: keysData})
+	replica, replicaHash, err := m.buildReloginReplica()
+	if err != nil {
+		log.Printf("relogin: build replication snapshot: %v", err)
+		_ = m.rtcManager.SendReloginResponse(peerID, webrtc.ReloginResponse{Error: "build replication snapshot"})
+		return
+	}
+	transferID := newReloginTransferID()
+	chunkCount := (len(replica) + reloginChunkSize - 1) / reloginChunkSize
+	response := webrtc.ReloginResponse{
+		KeysData:   keysData,
+		TransferID: transferID,
+		ChunkCount: chunkCount,
+		SHA256:     replicaHash,
+	}
+	if err := m.rtcManager.SendReloginResponse(peerID, response); err != nil {
+		log.Printf("relogin: send response to %s: %v", peerID, err)
+		return
+	}
+	for index := 0; index < chunkCount; index++ {
+		if err := m.waitForReloginSendCapacity(peerID); err != nil {
+			log.Printf("relogin: wait for send capacity to %s: %v", peerID, err)
+			return
+		}
+		start := index * reloginChunkSize
+		end := min(start+reloginChunkSize, len(replica))
+		if err := m.rtcManager.SendReloginChunk(peerID, webrtc.ReloginChunk{
+			TransferID: transferID,
+			Index:      index,
+			Data:       replica[start:end],
+		}); err != nil {
+			log.Printf("relogin: send replication chunk %d/%d to %s: %v", index+1, chunkCount, peerID, err)
+			return
+		}
+	}
+	log.Printf("relogin: sent %d replication chunks to %s", chunkCount, peerID)
 }
 
 func (m *Messenger) handleReloginResponse(peerID string, resp webrtc.ReloginResponse) {
-	m.reloginMu.Lock()
-	m.reloginKeys = resp.KeysData
-	m.reloginMu.Unlock()
+	m.acceptReloginResponse(peerID, resp)
+}
+
+func (m *Messenger) handleReloginChunk(peerID string, chunk webrtc.ReloginChunk) {
+	m.acceptReloginChunk(peerID, chunk)
 }
