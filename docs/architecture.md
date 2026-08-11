@@ -1,661 +1,457 @@
-# Huginn Messenger — архитектура передачи сообщений
+# Huginn Messenger — архитектура Go-ядра
 
-## 1. Регистрация пира и heartbeat
+Документ описывает текущую реализацию Go-приложения и native-ядра Huginn.
+Standalone web UI и Flutter — два разных адаптера одного `Messenger`:
 
-```mermaid
-sequenceDiagram
-    participant A as Alice (huginn)
-    participant M as Muninn Server
-    participant B as Bob (huginn)
+- standalone-процесс запускается через `main.go` и поднимает локальный HTTP API;
+- Flutter загружает shared library и вызывает экспортированный C ABI из
+  `bridge.go`.
 
-    A->>M: POST /api/v1/peers (Register)
-    M-->>A: 201 Created
-    Note over A: keys.conf загружены/сгенерированы
-    Note over A: свой ID и username = "alice"
+Muninn хранит directory-записи, сигналы и метаданные чанков. Открытый текст и
+содержимое файлов в Muninn не отправляются.
 
-    loop Каждые 15s
-        A->>M: POST /api/v1/peers/alice/heartbeat
-        M-->>A: 200 OK
-    end
-
-    B->>M: POST /api/v1/peers (Register)
-    M-->>B: 201 Created
-```
-
-Каждый экземпляр Huginn при старте регистрируется на Muninn-сервере, передавая свои публичные ключи (encryption + signing), метаданные и TTL (120s). Каждые 15 секунд отправляется heartbeat, продлевающий регистрацию. Если heartbeat не пришёл вовремя — пир считается офлайн.
-
----
-
-## 2. Поиск пиров
-
-```mermaid
-sequenceDiagram
-    participant UI as Browser (app.js)
-    participant API as Go HTTP Server
-    participant DB as SQLite (stored_peers)
-    participant M as Muninn Server
-
-    UI->>API: GET /api/peers/search?q=alice
-    API->>DB: SELECT FROM stored_peers WHERE peer_id LIKE '%alice%'
-    DB-->>API: [StoredPeer{peer_id:"alice", ...}]
-    API->>M: GET /api/v1/peers (List all)
-    M-->>API: [Peer{id:"alice", ...}, Peer{id:"bob", ...}]
-    Note over API: merge по peer_id,<br/>при дубляже Muninn побеждает
-    API-->>UI: [{id:"alice", online:true, ...}]
-```
-
-Поиск работает в два слоя: сначала SQLite (`stored_peers` — пиры, с которыми уже было взаимодействие), затем Muninn (все зарегистрированные пиры). Результаты мержатся по `peer_id`.
-
----
-
-## 3. WebRTC Signaling (установка P2P-канала)
-
-WebRTC-соединение устанавливается через сигнальный обмен offer/answer. Есть два механизма: новый — через постоянное WebRTC-соединение с Muninn (рекомендуемый), и старый — через HTTP polling (fallback).
-
-### 3a. WebRTC-to-Muninn (новый, основной)
-
-```mermaid
-sequenceDiagram
-    participant A as Alice (huginn)
-    participant MA as Muninn (WebRTC)
-    participant MB as Muninn (WebRTC)
-    participant B as Bob (huginn)
-
-    Note over A: Bootstrap WebRTC к Muninn
-    A->>MA: POST /api/v1/webrtc/bootstrap (SDP offer)
-    MA-->>A: SDP answer
-    Note over A,MA: DataChannel "muninn-rpc" установлен
-
-    Note over B: Bootstrap WebRTC к Muninn
-    B->>MB: POST /api/v1/webrtc/bootstrap (SDP offer)
-    MB-->>B: SDP answer
-    Note over B,MB: DataChannel "muninn-rpc" установлен
-
-    Note over A: Alice хочет соединиться с Bob
-    A->>A: CreateOffer() → pion.SessionDescription
-    A->>MA: RPC "connect_to_peer" {target:"bob", offer:"..."}
-    MA->>MB: RPC notify "incoming_signal" {from:"alice", type:"offer", data:"..."}
-    MB->>B: RPC notify "incoming_signal"
-    B->>B: HandleOffer() → CreateAnswer()
-    B->>MB: RPC "signal_relay" {target:"alice", type:"answer", data:"..."}
-    MB->>MA: RPC notify "incoming_signal" {from:"bob", type:"answer", data:"..."}
-    MA->>A: RPC notify "incoming_signal"
-    A->>A: SetRemoteDescription(answer)
-    Note over A,B: P2P WebRTC DataChannel установлен
-```
-
-Клиент при старте устанавливает постоянное WebRTC-соединение с сервером Muninn (bootstrap через одноразовый HTTP-запрос). Все последующие сигналы обмена offer/answer передаются мгновенно через это соединение в виде RPC-сообщений, без HTTP polling.
-
-### 3b. HTTP Polling (старый, fallback)
-
-```mermaid
-sequenceDiagram
-    participant A as Alice
-    participant M as Muninn (HTTP)
-    participant B as Bob
-
-    Note over A: Alice хочет отправить<br/>сообщение Bob (он онлайн)
-    A->>A: CreateOffer() → pion.SessionDescription
-    A->>M: POST /api/v1/peers/bob/signals {from:"alice", type:"offer", data:"..."}
-    Note over M: сигнал хранится в очереди Bob
-    loop Polling каждые 500ms
-        B->>M: GET /api/v1/peers/bob/signals
-        M-->>B: [{from:"alice", type:"offer", data:"..."}]
-    end
-    B->>B: HandleOffer() → CreateAnswer()
-    B->>M: POST /api/v1/peers/alice/signals {from:"bob", type:"answer", data:"..."}
-    Note over M: сигнал хранится в очереди Alice
-    loop Polling каждые 500ms
-        A->>M: GET /api/v1/peers/alice/signals
-        M-->>A: [{from:"bob", type:"answer", data:"..."}]
-    end
-    A->>A: SetRemoteDescription(answer)
-    Note over A,B: WebRTC DataChannel установлен
-```
-
-Если WebRTC-соединение с Muninn недоступно, клиент автоматически переключается на HTTP polling (каждые 500ms) для обмена сигналами. Сервер Muninn при получении RPC-сигнала для пира, не подключённого через WebRTC, сохраняет сигнал в Store — пир заберёт его через HTTP.
-
----
-
-## 4. Онлайн-доставка (WebRTC)
-
-```mermaid
-sequenceDiagram
-    participant A as Alice
-    participant DC as WebRTC DataChannel
-    participant B as Bob
-    participant A_DB as Alice SQLite
-    participant B_DB as Bob SQLite
-
-    Note over A,B: DataChannel уже открыт
-    A->>A_DB: SaveMessage(chat_id=bob, ...)
-    A->>DC: send({type:"chat", from:"alice", text:"hello", ...})
-    DC-->>B: message received
-    B->>B_DB: SaveMessage(chat_id=alice, ...)
-    B->>B_DB: StorePeer(alice, enc_key, sign_key)
-    Note over B: trigger SSE event "message"
-    B-->>A: (no ack — fire-and-forget)
-```
-
-Если WebRTC-канал открыт, сообщение отправляется напрямую через DataChannel. Отправитель сохраняет сообщение у себя в БД, получатель — у себя. Никаких подтверждений доставки не предусмотрено (fire-and-forget).
-
----
-
-## 5. Офлайн-доставка (Chunks)
-
-```mermaid
-sequenceDiagram
-    participant A as Alice (sender)
-    participant A_DB as Alice SQLite
-    participant M as Muninn
-    participant SP as Storage Peers
-    participant B as Bob (recipient)
-    participant B_DB as Bob SQLite
-
-    Note over A: Bob офлайн или канал не открылся
-    A->>A: SplitAndEncrypt(msg) → []Envelope
-    Note over A: каждая часть 16 байт (1 блок AES),<br/>AES-256-GCM + Ed25519 signature
-
-    loop For each envelope
-        A->>A_DB: StoreChunk(msgID, index, data)
-    end
-
-    A->>M: GET /api/v1/peers/best?n=10
-    M-->>A: [Peer{charley}, Peer{dave}, ...]
-
-    Note over A: подключение к storage peers
-    loop For each connected storage peer
-        A->>SP: SendChunkStoreBatch (WebRTC batch)
-        SP-->>SP: StoreChunk(msgID, index, data)
-    end
-
-    A->>M: POST /api/v1/alice/chunks (RegisterChunks batch)
-    Note over M: ChunkRecord{fileID, chunkIndex,<br/>sender, recipient, hash, sig, peerID}
-
-    A->>A_DB: StorePendingChunk(placed=true/false)
-    Note over A: placed=true если хотя бы<br/>один storage peer получил чанк
-
-    A->>A_DB: SaveMessage + StorePeer
-
-    Note over B: позже, Bob заходит онлайн
-    B->>M: GET /api/v1/recipient/bob/chunks
-    M-->>B: [ChunkRecord{fileID, peerID, ...}, ...]
-
-    Note over B: сборка чанков от разных storage peers
-    B->>SP: SendChunkGet (WebRTC)
-    SP-->>B: ChunkData
-
-    B->>B: AssembleAndDecrypt(envelopes) → plaintext
-    B->>B_DB: SaveMessage
-    B->>M: DELETE /api/v1/recipient/bob/chunks/{msgID}
-```
-
-Если P2P-канал не открылся (пир офлайн), сообщение разбивается на 1KB-зашифрованные чанки. Каждый чанк сохраняется локально и реплицируется на соседние онлайн-пиры (storage peers). Метаданные о местоположении чанков регистрируются на Muninn. Получатель периодически опрашивает Muninn о новых чанках для себя, собирает их со storage peers и дешифрует.
-
----
-
-## 6. Фоновая репликация чанков
-
-```mermaid
-flowchart LR
-    subgraph "Каждые 15s (peerRefreshLoop)"
-        A[checkPendingMessages] --> B[poll Muninn chunks]
-        B --> C[collectAndProcessMessage]
-
-        D[replicatePendingChunks] --> E[list chunk files from SQLite]
-        E --> F{connected peers exist?}
-        F -->|yes| G[SendChunkStoreBatch per peer]
-        F -->|no| H[skip]
-
-        I[processPendingSignals] --> J[poll Muninn signals]
-    end
-```
-
-В цикле `peerRefreshLoop` (15s) выполняются три задачи:
-- **checkPendingMessages** — опрос Muninn на предмет новых чанков, адресованных нам
-- **replicatePendingChunks** — распространение локально хранящихся чанков на подключённых пиров
-- **processPendingSignals** — обработка WebRTC-сигналов (offer/answer)
-
----
-
-## 7. Фоновая отправка неразмещённых чанков
+## 1. Компоненты
 
 ```mermaid
 flowchart TB
-    subgraph "Каждые 30s (pendingChunkLoop)"
-        A[GetUnplacedChunks from SQLite] --> B{есть неразмещённые?}
-        B -->|no| C[return]
-        B -->|yes| D[Group by recipientID]
-
-        D --> E[For each recipient]
-        E --> F[GetBestPeers from Muninn]
-        F --> G[Connect to storage peers]
-        G --> H[Round-robin: chunk i → peer i % M]
-        H --> I[SendChunkStoreBatch per peer]
-        I --> J[RegisterChunks per file per peer]
-        J --> K[MarkChunkPlaced in SQLite]
-    end
-```
-
-Отдельная горутина `pendingChunkLoop` (30s) обрабатывает чанки, которые не удалось разместить при первой отправке (`placed=false`). Чанки группируются по получателю, затем распределяются по доступным storage peers по кругу (round-robin), отправляются батчами через WebRTC и регистрируются на Muninn.
-
----
-
-## 8. Жизненный цикл pending_chunk
-
-```mermaid
-stateDiagram-v2
-    [*] --> Created: sendOffline
-    Created --> Placed: SendChunkStoreBatch успешен
-    Created --> Pending: нет доступных пиров
-    Pending --> Placed: pendingChunkLoop разместил
-    Placed --> [*]: получатель подтвердил доставку<br/>(ещё не реализовано)
-
-    note right of Pending
-        Хранится в SQLite pending_chunks,
-        placed=false, пока не разместится
-        на хотя бы одном storage peer
-    end note
-```
-
-Чанк создаётся в `sendOffline`. Если хотя бы один storage peer его получил — `placed=true`. Если нет — `placed=false`, и фоновый процесс будет пытаться разместить его навсегда (пока не появится механизм подтверждения доставки).
-
----
-
-## 9. SSE-события (real-time UI)
-
-```mermaid
-sequenceDiagram
-    participant UI as Browser
-    participant S as Go HTTP Server (SSE)
-    participant M as Messenger
-    participant DB as SQLite
-
-    UI->>S: GET /api/events (SSE)
-    Note over S: SubscribePeers + SubscribeMessages
-
-    alt Новый пир
-        M->>M: сигнал/рефреш пиров
-        M->>S: peerCh chan struct{}
-        S->>M: GetPeers()
-        M->>DB: (peers in memory)
-        S-->>UI: event: peers\n[{id, online, ...}]
+    subgraph Adapters[UI adapters]
+        Web[Standalone web UI<br/>HTTP + SSE]
+        Flutter[Flutter<br/>Dart FFI]
     end
 
-    alt Новое сообщение
-        M->>S: msgCh chan ChatMessage
-        S-->>UI: event: message\n{from, text, timestamp}
-        UI->>UI: fetchMessages(activePeer) → re-render
+    subgraph Huginn[Huginn Go process or shared library]
+        UIAPI[internal/ui]
+        ABI[bridge.go C ABI]
+        Core[internal/messenger]
+        Store[(SQLite)]
+        RTC[internal/webrtc]
+        MC[internal/muninn]
     end
 
-    Note over S: keepalive каждые 10s
+    Muninn[Muninn service<br/>REST + WebSocket]
+    Peers[Huginn peers<br/>WebRTC DataChannel]
+
+    Web <--> UIAPI
+    Flutter <--> ABI
+    UIAPI <--> Core
+    ABI <--> Core
+    Core <--> Store
+    Core <--> RTC
+    Core <--> MC
+    MC <--> Muninn
+    RTC <--> Peers
 ```
 
----
+Основные каталоги:
 
-## 10. Пользовательский поиск (UI → API)
+| Каталог | Назначение |
+|---|---|
+| `internal/messenger` | Жизненный цикл, доставка, группы, файлы и relogin |
+| `internal/muninn` | REST-клиент и signaling WebSocket-клиент |
+| `internal/webrtc` | P2P PeerConnection и DataChannel protocol |
+| `internal/chunk` | Разбиение, шифрование, подпись и сборка чанков |
+| `internal/store` | SQLite, миграции и локальные снимки |
+| `internal/ui` | Standalone HTTP API, embedded web UI и SSE |
+| `bridge.go` | Экспортированный C ABI и очередь событий для Flutter |
+
+## 2. Идентичность, регистрация и heartbeat
+
+Устройство имеет два связанных идентификатора:
+
+- `Messenger.ID` — UUID конкретного WebRTC endpoint;
+- `Messenger.Key` — пользовательский ключ `login:signature_public_key`.
+
+Несколько устройств после relogin могут иметь один пользовательский ключ, но
+разные endpoint ID.
 
 ```mermaid
 sequenceDiagram
-    participant U as User
-    participant UI as Browser
-    participant API as Go Server
+    participant H as Huginn
     participant DB as SQLite
     participant M as Muninn
 
-    U->>UI: ввод "alice" в search
-    UI->>UI: debounce 200ms
-    UI->>API: GET /api/peers/search?q=alice
+    H->>DB: загрузить или создать keys и peer_id
+    H->>H: Key = username + ":" + signPublic
+    H->>M: POST /api/v1/peers
+    Note over H,M: id, login, encryption_key,<br/>signature_key, ttl_seconds, peer_flag
+    M-->>H: 200 OK
 
-    API->>DB: SearchStoredPeers("alice")
-    DB-->>API: [{peer_id:"alice", ...}]
-
-    API->>M: GET /api/v1/peers
-    M-->>API: [{id:"alice", ...}, {id:"bob", ...}]
-
-    Note over API: merge + enrich online status
-    API-->>UI: [{id:"alice", online:true, ...}]
-
-    UI->>UI: renderPeerList()
+    loop каждые 15 секунд
+        H->>M: POST /api/v1/peers/{endpointID}/heartbeat
+        M-->>H: актуальная запись Peer
+    end
 ```
 
-Поиск на фронтенде с дебаунсом (200ms). При пустом запросе — возвращается полный список через стандартный `/api/peers`. При непустом — `/api/peers/search?q=...` с поиском по локальному SQLite + Muninn.
+Первичная регистрация использует TTL 120 секунд. Текущая реализация heartbeat
+передаёт `ttl_seconds=15`; Muninn обновляет `last_seen` и принимает переданный
+TTL. Если Muninn отвечает `peer not found`, клиент повторяет полную регистрацию.
 
----
-
-## 11. WebRTC RPC Protocol (клиент-серверный канал с Muninn)
-
-Для замены HTTP polling сигналов используется постоянное WebRTC-соединение между каждым клиентом Huginn и сервером Muninn. Поверх DataChannel работает RPC-протокол.
-
-### Bootstrap (HTTP → WebRTC)
-
-```
-POST /api/v1/webrtc/bootstrap
-Headers: X-Peer-ID: <peer_id>
-Body: pion.SessionDescription (SDP offer)
-Response: pion.SessionDescription (SDP answer)
-```
-
-Одноразовый HTTP-запрос для начального handshake. Клиент создаёт `PeerConnection` и DataChannel `"muninn-rpc"`, отправляет SDP offer. Сервер создаёт answer. После этого всё общение идёт через WebRTC DataChannel.
-
-### Протокол сообщений (DataChannel)
-
-Все сообщения — JSON. Есть три типа:
-
-**Request** (клиент → сервер):
-```json
-{"id": "uuid", "method": "method_name", "params": {...}}
-```
-
-**Response** (сервер → клиент):
-```json
-{"id": "uuid", "result": {...}, "error": ""}
-```
-
-**Notification** (сервер → клиент):
-```json
-{"method": "method_name", "params": {...}}
-```
-
-### RPC-методы
-
-| Метод | Направление | Описание |
-|-------|-------------|----------|
-| `connect_to_peer` | client → server | Запрос на соединение с другим пиром. Server проверяет, подключён ли target через WebRTC; если да — шлёт notification, если нет — сохраняет сигнал в Store |
-| `signal_relay` | client → server | Релей сигнала (offer/answer) целевому пиру |
-| `incoming_signal` | server → client (notify) | Входящий сигнал от другого пира |
-
-### Параметры методов
-
-**connect_to_peer:**
-```json
-{"target_id": "bob", "offer": "SDP_offer_string"}
-```
-
-**signal_relay:**
-```json
-{"target_id": "bob", "from": "alice", "type": "answer", "data": "SDP_answer_string"}
-```
-
-**incoming_signal (notification):**
-```json
-{"from": "alice", "type": "offer", "data": "SDP_offer_string"}
-```
-
-### Обработка на сервере (Muninn)
-
-Сервер (`internal/webrtc/handler.go`) поддерживает `map[string]*peerConn` — активные WebRTC-подключения пиров.
-
-При получении `connect_to_peer` или `signal_relay`:
-1. Проверить, есть ли target в `peers` (подключён через WebRTC)
-2. Если да — отправить notification напрямую через DataChannel target'а
-3. Если нет — сохранить сигнал в `store.Store.SetSignal()`, откуда target заберёт его через HTTP polling
-
-При отключении пира — автоматический cleanup из map.
-
-### Клиентская часть (Huginn)
-
-Клиент (`internal/muninn/rtc.go` → `WSClient`):
-- Управляет `PeerConnection` к Muninn
-- Отправляет RPC-запросы и сопоставляет ответы по UUID
-- Принимает notification'ы через колбэк `OnSignal`
-- Автоматический reconnect при обрыве (каждые 5s, в `rtcReconnectLoop`)
-- Fallback на HTTP polling, если WebRTC недоступен
-
----
-
-## Сводка протоколов обмена
-
-| Сценарий | Протокол | Частота | Размер данных |
-|----------|----------|---------|---------------|
-| Регистрация | HTTP REST (Muninn) | При старте | ~500 bytes |
-| Heartbeat | HTTP REST (Muninn) | Каждые 15s | ~50 bytes |
-| Пинг сигналов | **WebRTC RPC** (Muninn DataChannel) | Push (мгновенно) | ~100 bytes |
-| Пинг сигналов (fallback) | HTTP REST (Muninn) | Каждые 500ms | ~100 bytes |
-| Bootstrap WebRTC-to-Muninn | HTTP REST (однократно) | При старте | ~2-5KB |
-| Поиск пиров | HTTP REST (Muninn) | По запросу | зависит от N пиров |
-| WebRTC Offer/Answer | **WebRTC RPC** (Muninn DataChannel) | Однократно при коннекте | ~2-5KB |
-| WebRTC Offer/Answer (fallback) | HTTP REST (Muninn signals) | Однократно при коннекте | ~2-5KB |
-| Онлайн-сообщение | WebRTC DataChannel (P2P) | Однократно | произвольный |
-| Офлайн-чанк | WebRTC DataChannel (batch) | ~ раз в 30s | ~1KB × N чанков |
-| Регистрация чанков | HTTP REST (Muninn, batch) | При отправке | ~200 bytes × N |
-| Репликация чанков | WebRTC DataChannel (batch) | Каждые 15s | ~1KB × N |
-| SSE события | HTTP Server-Sent Events | Постоянно | ~1-5KB |
-| Поиск пользователей | HTTP REST (local API) | При вводе | ~100-500 bytes |
-
----
-
-## 12. Групповые чаты (Group Chats)
-
-### 12.1. Модель группы
-
-Групповой чат — это виртуальный пир на Muninn. Каждая группа имеет:
-
-- **UID** — UUID, используется как `peer_id` на сервере
-- **Name** — человекочитаемое имя группы
-- **Encryption keys** — пара X25519 (EncPrivate/EncPublic) для шифрования сообщений группы
-- **Signing keys** — пара Ed25519 (SignPrivate/SignPublic) для подписи сообщений группы
-
-Группа регистрируется на Muninn с флагом `PeerFlag = "very_thick"` и TTL 86400s (24h). В отличие от обычных пиров, группа **не отправляет heartbeat** — её регистрация обновляется только явным вызовом `groupHeartbeatLoop`.
-
-```go
-// internal/messenger/messenger.go:1484-1496
-req := &muninn.RegisterRequest{
-    ID:            uid,
-    Keys:          []muninn.Key{{Login: name, Signature: "huginn-v1"}},
-    EncryptionKey: gc.EncPublic,
-    SignatureKey:  gc.SignPublic,
-    Metadata:      map[string]string{"username": name, "type": "huginn-group"},
-    TTLSeconds:    86400,
-    PeerFlag:      muninn.PeerFlag("very_thick"),
-}
-```
-
-### 12.2. Создание группы
+## 3. Поиск пиров
 
 ```mermaid
 sequenceDiagram
-    participant UI as Browser
-    participant API as Go HTTP Server
-    participant M as Messenger
-    participant DB as SQLite
-    participant Mu as Muninn
+    participant UI as Web UI or Flutter
+    participant H as Messenger
+    participant DB as SQLite stored_peers
+    participant M as Muninn
 
-    UI->>API: POST /api/groups/create {name:"team"}
-    API->>M: CreateGroupChat("team")
-    M->>M: GenerateEncryptionKey() → X25519 keypair
-    M->>M: GenerateSigningKey() → Ed25519 keypair
-    M->>DB: CreateGroupChat(gc) — сохраняет ключи
-    M->>Mu: POST /api/v1/peers (Register как very_thick)
-    M->>M: upsertPeer(uid, encPublic, signPublic)
-    API-->>UI: {uid, name, created_at}
+    UI->>H: SearchPeers(query)
+    H->>DB: SearchStoredPeers(query)
+    DB-->>H: локальные контакты
+    H->>M: GET /api/v1/peers
+    M-->>H: активные endpoint-записи
+    H->>H: merge по user key
+    H-->>UI: список Peer
 ```
 
-Ключи группы генерируются на стороне создателя. Закрытые ключи хранятся **только на клиенте создателя** и никуда не отправляются. Чтобы добавить участника, создатель отправляет инвайт (см. 12.3).
+Локальные контакты позволяют показывать ранее известных пользователей, даже
+если они сейчас недоступны. Активные записи Muninn обновляют endpoint ID, ключи,
+`last_seen` и TTL. Собственный пользовательский ключ исключается из результата.
 
-### 12.3. Приглашение в группу (Invite)
+## 4. Сигналинг WebRTC
+
+Muninn не является WebRTC peer. Основной signaling transport между Huginn и
+Muninn — обычный WebSocket.
+
+### 4.1. WebSocket — основной путь
 
 ```mermaid
 sequenceDiagram
-    participant A as Alice (creator)
-    participant A_DB as Alice SQLite
+    participant A as Alice
+    participant M as Muninn /api/v1/ws
     participant B as Bob
-    participant B_DB as Bob SQLite
 
-    A->>A: InviteToGroup(groupUID, bobID)
-    Note over A: формирует invitePayload с ключами группы
-    Note over A: text = "__group_invite__:" + json(payload)
-    A->>A: SendMessage(bobID, inviteText) — обычное DM
-    Note over A: сообщение проходит через sendOffline или RTC
-    B->>B: получает сообщение
-    B->>B: checkInviteText(text) — detects "__group_invite__:" prefix
-    B->>B: ParseInvitePayload → groupInvitePayload
-    B->>B_DB: CreateGroupChat(gc) — сохраняет ключи группы
-    B->>B: registerGroupPeer(gc) — регистрируется как storage peer
-    B->>B_DB: DeleteChunks(msgID) — удаляет чанки инвайта
-    Note over B: в UI показывается "You were invited to group chat: team"
+    A->>M: WebSocket connect ?peer_id=aliceEndpoint
+    B->>M: WebSocket connect ?peer_id=bobEndpoint
+
+    A->>A: CreateOffer(bobEndpoint)
+    A->>M: connect_to_peer {target_id, offer}
+    M-->>B: incoming_signal {from, type:"offer", data}
+    B->>B: HandleOffer + CreateAnswer
+    B->>M: signal_relay {target_id, from, type:"answer", data}
+    M-->>A: incoming_signal {from, type:"answer", data}
+    A->>A: SetRemoteDescription(answer)
+    Note over A,B: P2P DataChannel открыт
 ```
 
-Механизм инвайта работает через обычное DM-сообщение с префиксом `__group_invite__:`. Отправитель сериализует все ключи группы (включая закрытые) в JSON и отправляет их как обычный текст. Получатель детектит префикс в `checkInviteText()`, парсит payload и сохраняет группу в свою БД. После этого он регистрируется как storage peer для этой группы (см. 12.5).
+WebSocket URL строится из адреса Muninn:
 
-**Payload инвайта:**
+```text
+http  -> ws://host/api/v1/ws?peer_id=<endpointID>
+https -> wss://host/api/v1/ws?peer_id=<endpointID>
+```
+
+Клиент пытается восстановить WebSocket каждые пять секунд. Muninn держит map
+активных соединений по endpoint ID. Если target не подключён, сигнал сохраняется
+в Store и будет доставлен при следующем WebSocket connect или HTTP polling.
+
+### 4.2. HTTP polling — fallback
+
+```mermaid
+sequenceDiagram
+    participant A as Alice
+    participant M as Muninn
+    participant B as Bob
+
+    A->>M: POST /api/v1/peers/{bobID}/signals
+    loop каждые 500 ms
+        B->>M: GET /api/v1/peers/{bobID}/signals
+        M-->>B: offer/answer queue
+    end
+```
+
+Polling включается опцией `WithPoll`. Даже без него цикл каждые 500 мс
+обрабатывает сигналы, уже доставленные из WebSocket callback в локальный канал.
+
+### 4.3. RPC-формат
+
+Все signaling-сообщения сейчас являются JSON text frames.
+
+Request:
+
 ```json
-{
-  "uid": "group-uuid",
-  "name": "team",
-  "enc_private": "base64...",
-  "enc_public": "base64...",
-  "sign_private": "base64...",
-  "sign_public": "base64..."
-}
+{"id":"uuid","method":"connect_to_peer","params":{"target_id":"bob","offer":"..."}}
 ```
 
-### 12.4. Отправка сообщения в группу
+Response:
+
+```json
+{"id":"uuid","result":{},"error":""}
+```
+
+Notification:
+
+```json
+{"method":"incoming_signal","params":{"from":"alice","type":"offer","data":"..."}}
+```
+
+Поддерживаемые методы:
+
+| Метод | Направление | Назначение |
+|---|---|---|
+| `connect_to_peer` | client → Muninn | Передать начальный offer |
+| `signal_relay` | client → Muninn | Передать offer/answer целевому endpoint |
+| `incoming_signal` | Muninn → client | Push входящего сигнала |
+
+## 5. Отправка сообщения
+
+Публичный `Messenger.SendMessage` не ждёт завершения доставки: задача помещается
+в bounded worker pool из восьми workers и очереди на 128 задач. Синхронный
+вариант `SendMessageSync` используется там, где вызывающей стороне нужен итог
+выполнения.
+
+```mermaid
+flowchart TB
+    A[SendMessage] --> B[enqueue async task]
+    B --> C[find peer or local group]
+    C --> D[save outgoing message in SQLite]
+    D --> E{Direct text delivery allowed?}
+    E -->|text, direct peer| F[ConnectPeer and wait up to 5 s]
+    F --> G{DataChannel open?}
+    G -->|yes| H[Send direct WebRTC chat]
+    G -->|no| I[sendOffline]
+    H --> J[sendOffline as delivery fallback]
+    E -->|file or group| I
+```
+
+Прямая WebRTC-структура содержит текст, UTC timestamp и `msg_id`, но не
+метаданные файлов. Поэтому сообщения с файлами всегда проходят через chunk
+delivery. Входящие прямые сообщения сохраняются в SQLite и публикуются
+подписчикам ядра.
+
+## 6. Офлайн-доставка чанками
+
+`chunk.ChunkSize` равен 1024 байтам. Каждый envelope шифруется с помощью
+X25519/AES-256-GCM и подписывается Ed25519.
 
 ```mermaid
 sequenceDiagram
-    participant A as Alice (member)
-    participant A_DB as Alice SQLite
+    participant A as Sender
+    participant ADB as Sender SQLite
     participant M as Muninn
-    participant SP as Storage Peers
-    participant B as Bob (member)
+    participant S as Storage peers
+    participant B as Recipient
 
-    Note over A: Alice отправляет сообщение в группу
-    A->>A_DB: GetGroupChat(groupUID) → gc (ключи группы)
-    A->>A: SplitAndEncrypt(msg, groupUID, gc.EncPublic)
-    Note over A: шифруется групповым публичным ключом
-
-    loop For each envelope
-        A->>A_DB: StoreChunk(msgID, index, data)
-    end
-
+    A->>A: serialize MessagePayload
+    A->>A: SplitAndEncrypt, 1 KiB chunks
+    A->>ADB: StoreChunk + StorePendingChunk(placed=false)
+    A->>M: POST /api/v1/files/{msgID}/chunks
+    Note over A,M: metadata for sender itself
     A->>M: GET /api/v1/peers/best?n=10
-    A->>M: POST .../chunks (RegisterChunks batch)
-    Note over A: RecipientID = groupUID, PeerID = Alice
+    M-->>A: ranked peers
+    A->>S: WebRTC chunk_store_batch
+    A->>M: POST /api/v1/files/{msgID}/chunks
+    Note over A,M: holder peer metadata
+    A->>ADB: MarkChunkPlaced
 
-    A->>SP: SendChunkStoreBatch (WebRTC)
-    A->>M: RegisterChunks(PеерID = storage_peer)
-
-    A->>A_DB: StorePendingChunk(RecipientID=groupUID)
-    A->>A_DB: SaveMessage(chat_id=groupUID)
-```
-
-Ключевое отличие от DM:
-- **RecipientID** = groupUID (не ID пользователя)
-- **Encryption** = групповым публичным ключом (любой участник может расшифровать своим закрытым)
-- **TTL** = 604800 (1 неделя), фиксированный
-- Файлы не поддерживаются (files=nil)
-
-### 12.5. Получение сообщения из группы
-
-Каждый участник группы регистрируется как storage peer для этой группы:
-
-```go
-// registerGroupPeer — вызывается при старте и после получения инвайта
-func (m *Messenger) registerGroupPeer(gc *store.GroupChat) {
-    // регистрирует себя (m.ID) как storage peer для groupUID на Muninn
-    m.muninnClient.RegisterAsPeer(m.ctx, groupUID, m.ID)
-}
-```
-
-Это гарантирует, что при опросе чанков для группы Muninn вернёт и этого участника как владельца чанков.
-
-Получение:
-
-```mermaid
-sequenceDiagram
-    participant B as Bob (member)
-    participant B_DB as Bob SQLite
-    participant M as Muninn
-    participant A as Alice (sender)
-
-    Note over B: peerRefreshLoop (15s)
-    B->>B: checkPendingMessages()
-    B->>B: checkRecipientMessages(groupUID)
-    B->>M: GET /api/v1/recipient/{groupUID}/chunks
-    M-->>B: [ChunkRecord{fileID, chunkIndex, PeerID, ...}]
-
-    Note over B: перебор записей
-    loop For each unique chunk_index
-        B->>B_DB: GetChunk(fileID, index) — локально?
-        alt Найдено локально
-            Note over B: чанк уже есть в БД
-        else Не найдено
-            B->>A: SendChunkGet(WebRTC) — запрос к владельцу
-            A-->>B: ChunkData
-            B->>B_DB: InjectChunk → StoreChunk
-        end
+    loop recipient polling every 15 s
+        B->>M: GET /api/v1/recipient/chunks?recipient_id=...&date_from=...
+        M-->>B: ChunkRecord[]
     end
-
-    Note over B: все чанки собраны
-    B->>B: AssembleAndDecrypt(envelopes, gc.EncPrivate, ...)
-    Note over B: расшифровка групповым закрытым ключом
-    B->>B_DB: SaveMessage(chat_id=groupUID, ...)
-    Note over B: чанки НЕ удаляются (нужны другим участникам)
+    B->>S: WebRTC chunk_get
+    S-->>B: encrypted envelopes
+    B->>B: verify hash and signature, decrypt, assemble
 ```
 
-Критическое отличие от DM: чанки **не удаляются** после успешной расшифровки (см. `collectAndProcessMessage`, строка 1400), так как они нужны другим участникам группы, которые ещё не получили сообщение.
+Muninn хранит только `ChunkRecord`: file ID, index, sender/recipient keys,
+expected hash, holder endpoint, флаги, timestamps и TTL. Фактические байты
+остаются в SQLite Huginn-пиров.
 
-### 12.6. Жизненный цикл группового сообщения
+Подпись манифеста строится по payload:
+
+```text
+muninn/expected/v1
+{file_id}
+{chunk_index}
+{normalized_hash}
+```
+
+Storage-пир перед сохранением может отправить подписанный отчёт о полученном
+чанке. Muninn проверяет отчёт и обновляет quality score source peer.
+
+## 7. Получение и восстановление
+
+Клиент опрашивает один endpoint для личного пользовательского ключа и по одному
+ключу `groupUID:groupSignPublic` для каждой локальной группы:
+
+```text
+GET /api/v1/recipient/chunks?recipient_id=<key>&date_from=<unix>
+```
+
+Записи группируются по `file_id`. Для каждого уникального индекса ядро сначала
+проверяет локальный SQLite, затем запрашивает holder peer по WebRTC. После
+получения полного набора проверяются registered hash и подпись отправителя,
+payload расшифровывается и сохраняется как `ChatMessage`.
+
+`date_from` основан на локальном `last_chunk_check`, но клиент передаёт
+`lastCheck-1`, чтобы не потерять записи с одинаковым Unix timestamp.
+
+Mark-as-read является отдельной операцией:
+
+```text
+POST /api/v1/chunks/read
+payload = "muninn/read/v1\n{file_id}"
+```
+
+## 8. Pending chunks и TTL
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Sent: SendGroupMessage
-    Sent --> Registered: RegisterChunks на Muninn
-    Registered --> Distributed: SendChunkStoreBatch на storage peers
-    Distributed --> Received: первый участник расшифровал
-    Received --> Available: чанки остаются у отправителя и storage peers
-    Available --> Received: следующий участник расшифровал
-    Available --> Expired: TTL истёк (>5min chunkCleanupLoop)
-
-    note right of Available
-        Пока хотя бы один пир хранит чанки,
-        любой участник группы может их получить
-    end note
-
-    note right of Expired
-        DeleteChunksWithMessage() раз в 5 минут
-        удаляет чанки, для которых уже есть
-        запись в messages
-    end note
+    [*] --> Pending: StorePendingChunk, placed=false
+    Pending --> Placed: batch accepted by storage peer
+    Pending --> Expired: TTL elapsed
+    Placed --> Expired: TTL elapsed
+    Expired --> [*]: cleanup
 ```
 
-Отправитель и storage peers хранят чанки до истечения TTL или до очистки `chunkCleanupLoop` (каждые 5 минут, `DeleteChunksWithMessage` удаляет чанки, уже сохранённые в `messages`). Это создаёт окно доставки: если участник группы не зайдёт онлайн в течение ~5 минут, он может не успеть скачать чанки.
+`pendingChunkLoop` каждые десять секунд выбирает неразмещённые чанки, группирует
+их по recipient key, подключается к quality-ranked пирам и отправляет batch.
+Pending-записи не повторяются бесконечно: `chunkCleanupLoop` удаляет истёкшие
+чанки и pending records в соответствии с TTL.
 
-### 12.7. Group Heartbeat Loop
+## 9. Фоновые процессы
 
-Группы не отправляют heartbeat сами по себе (нет своей горутины heartbeat). Вместо этого каждый участник в `groupHeartbeatLoop` обновляет регистрацию групп, участником которых он является:
+| Процесс | Интервал | Работа |
+|---|---:|---|
+| `heartbeatLoop` | 15 s | Heartbeat endpoint и повторная регистрация при 404 |
+| `peerRefreshLoop` | 15 s | Репликация локальных чанков и поиск входящих сообщений |
+| `signalPollLoop` | 500 ms | HTTP fallback и обработка WebSocket signals |
+| `rtcReconnectLoop` | 5 s | Восстановление signaling WebSocket |
+| `pendingChunkLoop` | 10 s | Размещение `placed=false` чанков |
+| `fileDownloadLoop` | 15 s | Повторная загрузка ожидающих файлов |
+| `chunkCleanupLoop` | 5 min | Очистка истёкших, завершённых и failed chunks |
 
-```go
-func (m *Messenger) groupHeartbeatLoop() {
-    ticker := time.NewTicker(5 * time.Minute)
-    for {
-        select {
-        case <-ticker.C:
-            groups, _ := m.store.GetGroupChats()
-            for _, g := range groups {
-                m.muninnClient.Register(m.ctx, registerReq)
-            }
-        }
-    }
-}
+Все циклы завершаются через общий `context.Context`. При shutdown ядро отменяет
+context, закрывает signaling и WebRTC, ждёт background goroutines и worker pool,
+после чего закрывает SQLite.
+
+## 10. UI adapters и события
+
+### 10.1. Standalone web UI
+
+Web UI запускается только при ненулевом `--ui-port`. Актуальные local endpoints
+определены в `internal/ui/server.go`:
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| `GET` | `/api/me` | Текущий пользователь |
+| `GET` | `/api/peers` | Известные пиры |
+| `GET` | `/api/peers/search?q=` | Поиск |
+| `GET` | `/api/messages/{peer}` | История |
+| `POST` | `/api/send` | Текстовое сообщение |
+| `POST` | `/api/send-file` | Файл |
+| `GET` | `/api/events` | SSE `peers` и `message` |
+| `GET`, `POST` | `/api/config` | Конфигурация |
+| `GET`, `POST` | `/api/groups` | Список и создание групп |
+| `POST` | `/api/groups/{uid}/invite` | Приглашение |
+| `POST` | `/api/groups/{uid}/send` | Сообщение группе |
+| `POST` | `/api/groups/{uid}/send-file` | Файл группе |
+
+SSE держит постоянное соединение и отправляет keepalive каждые десять секунд.
+
+### 10.2. Flutter C ABI
+
+`bridge.go` хранит native-инстансы по числовому handle. Сложные ответы
+возвращаются JSON-строками; вызывающая сторона освобождает их через
+`messenger_free_string`.
+
+Основные группы экспортов:
+
+| Операция | C ABI |
+|---|---|
+| Lifecycle | `messenger_create`, `messenger_destroy` |
+| Identity/config | `messenger_get_me`, `messenger_get_config`, `messenger_save_config` |
+| Peers/history | `messenger_get_peers`, `messenger_search_peers`, `messenger_get_messages_paginated` |
+| Send | `messenger_send_message`, `messenger_send_file` |
+| Groups | `messenger_create_group`, `messenger_get_groups`, `messenger_invite_to_group` |
+| Events | `messenger_get_event` |
+| Read state | `messenger_mark_read` |
+| Relogin | `messenger_generate_relogin_signature`, `messenger_apply_relogin_signature` |
+| Files | `messenger_set_downloads_dir`, `messenger_get_downloads_dir`, `messenger_get_file_path` |
+
+Go event loop подписывается на `peers`, `message` и `file_ready` и складывает
+события в очередь ёмкостью 100. При переполнении новое событие отбрасывается.
+Flutter восстанавливает полное состояние отдельными history/peer вызовами.
+
+## 11. Групповые чаты
+
+### 11.1. Модель
+
+Группа хранится локально как:
+
+```text
+uid, name,
+enc_private, enc_public,
+sign_private, sign_public,
+created_at
 ```
 
-### 12.8. API (C-bridge)
+`uid` используется в UI как `chat_id`, а chunk recipient key имеет вид
+`uid:sign_public`. Групповые ключи общие для участников.
 
-Для интеграции с UI (C API) доступны четыре функции:
-
-| Функция | Описание |
-|---------|----------|
-| `messenger_create_group` | Создать группу: `(name) → {uid, name}` |
-| `messenger_get_groups` | Получить список групп: `() → [{uid, name}]` |
-| `messenger_invite_to_group` | Пригласить пользователя: `(groupUID, peerID) → error` |
-| `messenger_send_group_message` | Отправить сообщение: `(groupUID, text) → error` |
-
-### 12.9. UI Flow
+### 11.2. Создание и приглашение
 
 ```mermaid
 sequenceDiagram
+    participant A as Creator
+    participant DB as SQLite
+    participant B as Invitee
+
+    A->>A: Generate group X25519 and Ed25519 keys
+    A->>DB: CreateGroupChat
+    A->>B: direct message "__group_invite__:" + JSON keys
+    B->>B: checkInviteText
+    B->>DB: CreateGroupChat if missing
+    B->>B: publish readable invitation message
+```
+
+Invite payload содержит закрытые групповые ключи, но проходит через обычный
+зашифрованный direct-message transport. Его нельзя логировать или передавать в
+открытом виде.
+
+### 11.3. Отправка и получение
+
+Отдельной функции `SendGroupMessage` нет. UI вызывает обычный
+`SendMessage(groupUID, ...)`; ядро находит группу в SQLite, подставляет её ключи
+и использует chunk delivery. Файлы в группах поддерживаются тем же
+`SendMessage(..., filePaths, ...)`.
+
+Получатель опрашивает Muninn по `groupUID:signPublic`, расшифровывает envelope
+групповым private key и сохраняет сообщение с `chat_id=groupUID`.
+
+Отдельных `groupHeartbeatLoop` и `RegisterAsPeer` в текущей реализации нет.
+Группа не является самостоятельным WebRTC endpoint.
+
+## 12. Файлы
+
+Файл сначала разбивается на 1 KiB chunks и шифруется случайным симметричным
+ключом. `FileMeta` в сообщении содержит:
+
+- `file_id`, hash и decryption key;
+- количество чанков и имя;
+- локальный путь только на устройстве, где файл уже существует;
+- optional `source_peer_id` для фоновой загрузки после relogin.
+
+Локальные пути удаляются из сетевого payload. После получения сообщения
+`processReceivedFile` запрашивает недостающие части, восстанавливает файл в
+downloads directory и публикует `file_ready`.
+
+## 13. Relogin
+
+Relogin переносит пользовательские ключи и согласованный снимок локального
+состояния, сохраняя endpoint ID целевого устройства.
+
+### 13.1. Авторизация
+
+Формат ключа:
+
+```text
+sourceEndpointID:base64(32-byte challenge).base64(ed25519 signature)
+```
+
+Цель находит endpoint источника через Muninn и проверяет подпись его публичным
+ключом. Источник повторно проверяет тот же challenge собственным публичным
+ключом перед выдачей данных.
     participant U as User
     participant UI as Browser
     participant API as Go HTTP Server
@@ -696,10 +492,47 @@ Relogin копирует с одного устройства на другое 
 
 Локальные пути и содержимое файлов в снимок не входят. Для каждого вложения передаются только метаданные (`file_id`, hash, ключ расшифровки, число чанков, имя и peer ID исходного устройства). Целевое устройство сохраняет такой указатель и загружает чанки в фоне с исходного устройства или storage-пиров.
 
-### 13.2. Схема работы
+### 13.2. Репликация
 
 ```mermaid
 sequenceDiagram
+    participant T as Target
+    participant S as Source
+
+    T->>S: relogin_request {signature}
+    S->>S: verify challenge signature
+    S->>S: export keys + replication snapshot
+    S->>S: strip local file paths, gzip, SHA-256
+    S-->>T: relogin_response {keys_data, transfer_id, chunk_count, sha256}
+    loop chunks up to 32 KiB
+        S-->>T: relogin_chunk {transfer_id, index, data}
+    end
+    T->>T: verify SHA-256 and snapshot version
+    T->>T: transactional import
+    T->>T: save source identity, preserve own endpoint ID
+    T->>T: queue file downloads from source/storage peers
+```
+
+Снимок версии 1 включает сообщения, direct contacts и группы. Физические файлы
+не копируются внутри snapshot: передаются только безопасные metadata pointers,
+а содержимое догружается асинхронно.
+
+Одна операция relogin имеет timeout две минуты. DataChannel backpressure
+ограничивает накопленный send buffer значением 512 KiB.
+
+## 14. Сводка transport-протоколов
+
+| Назначение | Transport | Формат |
+|---|---|---|
+| Регистрация, peers, chunk metadata | HTTP(S) Muninn | JSON |
+| Основной signaling | WS(S) `/api/v1/ws` | JSON text frames |
+| Fallback signaling | HTTP(S) signals endpoints | JSON |
+| P2P text/chunks/files/relogin | WebRTC DataChannel | binary frame с JSON envelope/payload |
+| Standalone live UI | local HTTP SSE | text/event-stream + JSON data |
+| Flutter integration | in-process C ABI | UTF-8 JSON strings |
+
+Маршруты Muninn всегда следует сверять с соседним
+`muninn/internal/api/server.go`, а C ABI — с экспортами в `bridge.go`.
     participant A as Alice (source)
     participant B as Bob (target)
     participant M as Muninn
