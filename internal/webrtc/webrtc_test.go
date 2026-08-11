@@ -6,7 +6,7 @@ import (
 )
 
 func TestCloseDoesNotHoldManagerLockWhileClosingPeer(t *testing.T) {
-	m := NewManager("local", make(chan ChatMessage, 1), nil, nil, nil, nil, nil, nil)
+	m := NewManager("local", make(chan ChatMessage, 1), nil, nil, nil, nil, nil, nil, nil)
 	if _, err := m.NewPeerConnection("remote"); err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestCloseDoesNotHoldManagerLockWhileClosingPeer(t *testing.T) {
 }
 
 func TestCloseAllDoesNotHoldManagerLockWhileClosingPeers(t *testing.T) {
-	m := NewManager("local", make(chan ChatMessage, 1), nil, nil, nil, nil, nil, nil)
+	m := NewManager("local", make(chan ChatMessage, 1), nil, nil, nil, nil, nil, nil, nil)
 	for _, remoteID := range []string{"first", "second"} {
 		if _, err := m.NewPeerConnection(remoteID); err != nil {
 			t.Fatal(err)

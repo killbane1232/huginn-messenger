@@ -50,6 +50,12 @@ func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest
 		return
 	}
 	log.Printf("stored chunk %s/%d from %s", req.FileID, req.ChunkIndex, peerID)
+	m.pendingMu.Lock()
+	_, waitingForFile := m.pendingFileDownloads[req.FileID]
+	m.pendingMu.Unlock()
+	if waitingForFile {
+		m.async.trySubmit(m.checkPendingFileDownloads)
+	}
 }
 
 func (m *Messenger) handleChunkGet(peerID string, req webrtc.ChunkGetRequest) ([]byte, bool) {
@@ -451,6 +457,48 @@ func (m *Messenger) requestMissingChunk(fileID string, chunkIndex int, senderID 
 					log.Printf("connect to %s for missing chunk: %v", pid, err)
 				}
 			})
+		}
+	}
+}
+
+func (m *Messenger) requestMissingChunkFromPeer(fileID string, chunkIndex int, senderID, preferredPeerID string) {
+	if preferredPeerID != "" && m.IsPeerConnected(preferredPeerID) {
+		_ = m.rtcManager.SendChunkGet(preferredPeerID, webrtc.ChunkGetRequest{
+			FileID: fileID, ChunkIndex: chunkIndex,
+		})
+	} else if preferredPeerID != "" && chunkIndex == 0 {
+		m.async.trySubmit(func() {
+			if err := m.ConnectPeer(preferredPeerID); err != nil {
+				log.Printf("connect to relogin source %s for file %s: %v", preferredPeerID, fileID, err)
+				return
+			}
+			for attempt := 0; attempt < 50; attempt++ {
+				select {
+				case <-m.ctx.Done():
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
+				if m.IsPeerConnected(preferredPeerID) {
+					_ = m.rtcManager.SendChunkGet(preferredPeerID, webrtc.ChunkGetRequest{
+						FileID: fileID, ChunkIndex: chunkIndex,
+					})
+					return
+				}
+			}
+		})
+	}
+
+	m.requestMissingChunk(fileID, chunkIndex, senderID)
+	records, err := m.muninnClient.GetChunksByFileID(m.ctx, fileID)
+	if err != nil {
+		return
+	}
+	for _, record := range records {
+		if record.ChunkIndex != chunkIndex {
+			continue
+		}
+		if _, ok := m.getChunkData(record); ok {
+			return
 		}
 	}
 }

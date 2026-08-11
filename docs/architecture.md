@@ -692,7 +692,9 @@ UI отображает группы в отдельной секции сайд
 
 ### 13.1. Назначение
 
-Relogin позволяет скопировать ключи (`keys.conf`) с одного пира на другой. После relogin целевой пир получает те же ключи шифрования и подписи, что и пир-источник, и может выступать от его имени.
+Relogin копирует с одного устройства на другое идентичность и локальное состояние пользователя: ключи, историю сообщений, direct-контакты и групповые чаты. После relogin целевой пир получает те же ключи шифрования и подписи, что и пир-источник, и может выступать от его имени.
+
+Локальные пути и содержимое файлов в снимок не входят. Для каждого вложения передаются только метаданные (`file_id`, hash, ключ расшифровки, число чанков, имя и peer ID исходного устройства). Целевое устройство сохраняет такой указатель и загружает чанки в фоне с исходного устройства или storage-пиров.
 
 ### 13.2. Схема работы
 
@@ -718,10 +720,17 @@ sequenceDiagram
     A->>A: Verify signature against own public key
     Note over A: Proves Alice herself created the challenge
     A->>A: Read keys.conf
-    A->>B: WebRTC relogin_response {keys_data}
+    A->>A: Build SQLite snapshot
+    A->>A: Remove local file paths, gzip + SHA-256
+    A->>B: relogin_response {keys_data, transfer_id, chunk_count, sha256}
+    loop Snapshot chunks
+        A->>B: relogin_chunk {transfer_id, index, data}
+    end
 
+    B->>B: Verify SHA-256 and import snapshot transactionally
     B->>B: Write keys.conf (overwrite)
-    Note over B: Now Bob has Alice's identity
+    B->>B: Queue file pointers for background download
+    Note over B: Bob keeps its endpoint peer ID and now has Alice's identity/state
 ```
 
 ### 13.3. Формат подписи
@@ -746,20 +755,23 @@ crypto.Verify(m.signPublic, challenge, sig) // true только если под
 
 Сторона-цель (Bob) также верифицирует подпись перед подключением к Alice — это подтверждает, что signature была создана именно Alice.
 
-### 13.5. Передача ключей
+### 13.5. Передача ключей и данных
 
-После верификации подписи Alice читает `keys.conf` и отправляет его содержимое Bob'у через WebRTC DataChannel. Канал уже защищён DTLS-шифрованием, дополнительное шифрование не требуется.
+После верификации подписи Alice читает `keys.conf`, строит согласованный снимок таблиц `messages`, `stored_peers` и `group_chats`, удаляет из сообщений локальные `file_path`, затем сжимает снимок gzip. Канал WebRTC уже защищён DTLS-шифрованием, дополнительное шифрование не требуется.
 
-Bob перезаписывает свой `keys.conf` полученными данными. После этого Bob может перезапустить мессенджер — он будет использовать ключи Alice.
+Сжатый снимок разбивается на сообщения размером не более 32 KiB. Bob собирает их по `transfer_id`, проверяет SHA-256 и импортирует снимок одной SQLite-транзакцией. Импорт идемпотентно объединяет записи по их первичным ключам и не удаляет локальные записи целевого устройства. Только после успешного импорта Bob сохраняет новые ключи и конфигурацию.
+
+Физический `peer_id` Bob не заменяется на `peer_id` Alice: устройства остаются отдельными WebRTC endpoints с одной пользовательской криптографической идентичностью. Это также позволяет Bob после пересоздания Go-инстанса продолжить фоновую загрузку файлов непосредственно с Alice.
 
 ### 13.6. Протокол WebRTC
 
-Два новых типа сообщений в `internal/webrtc/webrtc.go`:
+Типы сообщений relogin в `internal/webrtc/webrtc.go`:
 
 | Тип | Направление | Структура |
 |-----|-------------|-----------|
 | `relogin_request` | Bob → Alice | `{signature: "alice:challenge.sig"}` |
-| `relogin_response` | Alice → Bob | `{keys_data: "json-content-of-keys.conf"}` |
+| `relogin_response` | Alice → Bob | `{keys_data, transfer_id, chunk_count, sha256, error?}` |
+| `relogin_chunk` | Alice → Bob | `{transfer_id, index, data}` |
 
 ### 13.7. C-bridge API
 
@@ -772,5 +784,5 @@ Bob перезаписывает свой `keys.conf` полученными д�
 
 - **Relogin не требует хранения состояния.** Alice не запоминает созданные challenge'и — верификация подписи доказывает, что она сама её создала.
 - **После relogin старые ключи Bob'а теряются.** Если Bob не сохранил их отдельно, он не сможет восстановить свою старую идентичность.
-- **Peer ID (username) не меняется.** Relogin меняет только криптографические ключи. Чтобы сменить username, нужно пересоздать аккаунт.
-- **После relogin требуется перерегистрация на Muninn.** Мессенджер нужно перезапустить, чтобы новые ключи вступили в силу.
+- **Endpoint peer ID не меняется.** Relogin меняет пользовательский login и криптографические ключи, но сохраняет уникальный ID устройства.
+- **После relogin Flutter пересоздаёт Go-инстанс.** Новый экземпляр регистрируется на Muninn с прежним endpoint `peer_id`, новым login/ключами и возобновляет фоновые загрузки по сохранённым файловым указателям.

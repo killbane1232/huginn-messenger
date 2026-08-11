@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1500,9 +1502,67 @@ func TestReloginFlow(t *testing.T) {
 	}
 	t.Log("OK: bob's keys unchanged after all failure cases")
 
+	archiveKey := "archive:archive-signature"
+	archivePayload := make([]byte, 96*1024)
+	if _, err := rand.Read(archivePayload); err != nil {
+		t.Fatal(err)
+	}
+	archiveText := base64.StdEncoding.EncodeToString(archivePayload)
+	archiveMessage := messenger.ChatMessage{
+		From:      "archive",
+		ChatID:    archiveKey,
+		Text:      archiveText,
+		Timestamp: time.Now().UTC(),
+		MsgID:     "replicated-message",
+		Files: []messenger.FileMeta{{
+			FileID:        "replicated-file",
+			FileHash:      "hash",
+			DecryptionKey: "key",
+			TotalChunks:   1,
+			Filename:      "archive.txt",
+			FilePath:      "/source-only/archive.txt",
+		}},
+	}
+	archiveData, err := json.Marshal(archiveMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceStore, err := store.New(aliceDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceStore.SaveMessage(
+		archiveMessage.MsgID,
+		archiveKey,
+		archiveMessage.From,
+		archiveKey,
+		archiveData,
+		archiveMessage.Timestamp,
+	); err != nil {
+		sourceStore.Close()
+		t.Fatal(err)
+	}
+	if err := sourceStore.StorePeer(
+		"archive",
+		archiveKey,
+		"archive-encryption-key",
+		"archive-signature",
+		archiveMessage.Timestamp,
+		false,
+	); err != nil {
+		sourceStore.Close()
+		t.Fatal(err)
+	}
+	if err := sourceStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	replicatedGroup, err := alice.CreateGroupChat("Replicated group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPeerIDBefore := bob.ID
+
 	t.Run("successful_relogin", func(t *testing.T) {
-		//skip test
-		return
 		sig, err := alice.GenerateReloginSignature()
 		if err != nil {
 			t.Fatal(err)
@@ -1549,6 +1609,59 @@ func TestReloginFlow(t *testing.T) {
 		}
 		if ak.EncPrivate != bk.EncPrivate {
 			t.Fatal("encryption private keys do not match")
+		}
+		if bob.ID != targetPeerIDBefore {
+			t.Fatalf("target peer ID changed from %s to %s", targetPeerIDBefore, bob.ID)
+		}
+		if bob.Config().PeerID != targetPeerIDBefore {
+			t.Fatalf("stored target peer ID = %s, want %s", bob.Config().PeerID, targetPeerIDBefore)
+		}
+
+		messages := bob.GetMessages(archiveKey)
+		if len(messages) != 1 {
+			t.Fatalf("replicated message count = %d, want 1", len(messages))
+		}
+		if messages[0].Text != archiveText {
+			t.Fatalf("replicated text length = %d, want %d", len(messages[0].Text), len(archiveText))
+		}
+		if len(messages[0].Files) != 1 {
+			t.Fatalf("replicated files = %+v", messages[0].Files)
+		}
+		if messages[0].Files[0].FilePath != "" {
+			t.Fatalf("replicated local file path = %q, want empty", messages[0].Files[0].FilePath)
+		}
+		if messages[0].Files[0].SourcePeerID != alice.ID {
+			t.Fatalf("replicated file source = %q, want %q", messages[0].Files[0].SourcePeerID, alice.ID)
+		}
+
+		groups, err := bob.GetGroupChats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		foundGroup := false
+		for _, group := range groups {
+			if group.UID == replicatedGroup.UID {
+				foundGroup = true
+				break
+			}
+		}
+		if !foundGroup {
+			t.Fatalf("replicated group %s not found in %+v", replicatedGroup.UID, groups)
+		}
+
+		contacts, err := bob.GetContacts()
+		if err != nil {
+			t.Fatal(err)
+		}
+		foundContact := false
+		for _, contact := range contacts {
+			if contact.PeerID == archiveKey {
+				foundContact = true
+				break
+			}
+		}
+		if !foundContact {
+			t.Fatalf("replicated contact %s not found in %+v", archiveKey, contacts)
 		}
 		t.Log("OK: all four keys match between alice and bob")
 	})
