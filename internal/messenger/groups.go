@@ -104,26 +104,46 @@ func (m *Messenger) GetGroupChats() ([]store.GroupChat, error) {
 
 func (m *Messenger) registerGroupPeer(gc store.GroupChat) {
 	fake := true
-	key := gc.UID + ":" + gc.SignPublic
-	m.registeredMu.Lock()
-	defer m.registeredMu.Unlock()
-	if m.registeredMap[key] != true {
-		req := &muninn.RegisterRequest{
-			ID:            gc.UID,
-			Login:         gc.UID,
-			EncryptionKey: gc.EncPublic,
-			SignatureKey:  gc.SignPublic,
-			TTLSeconds:    86400,
-			PeerFlag:      muninn.PeerFlag("very_thick"),
-			Fake:          &fake,
-		}
-		if err := m.muninnClient.Register(m.ctx, req); err != nil {
-			log.Printf("register group peer %s (%s): %v", gc.Name, gc.UID, err)
-		} else {
-			m.registeredMap[key] = true
+	req := &muninn.RegisterRequest{
+		ID:            gc.UID,
+		Login:         gc.UID,
+		EncryptionKey: gc.EncPublic,
+		SignatureKey:  gc.SignPublic,
+		TTLSeconds:    groupPeerTTLSeconds,
+		PeerFlag:      muninn.PeerFlagVeryThick,
+		Fake:          &fake,
+	}
+	if err := m.muninnClient.Register(m.ctx, req); err != nil {
+		log.Printf("register group peer %s (%s): %v", gc.Name, gc.UID, err)
+	}
+}
+
+func (m *Messenger) registerStoredGroupPeers() {
+	if m.store == nil {
+		return
+	}
+	groups, err := m.store.GetGroupChats()
+	if err != nil {
+		log.Printf("load group peers for registration: %v", err)
+		return
+	}
+	for _, group := range groups {
+		m.registerGroupPeer(group)
+	}
+}
+
+func (m *Messenger) groupRefreshLoop() {
+	m.registerStoredGroupPeers()
+	ticker := time.NewTicker(groupRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			m.registerStoredGroupPeers()
+		case <-m.ctx.Done():
+			return
 		}
 	}
-
 }
 
 func (m *Messenger) InviteToGroupChat(groupUID, memberID string) error {

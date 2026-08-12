@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"time"
 )
+
+var ErrPeerNotFound = errors.New("peer not found")
 
 type PeerFlag string
 
@@ -267,6 +270,9 @@ func (c *Client) Refresh(ctx context.Context, req *RefreshRequest) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("refresh failed (status %d): %w: %s", resp.StatusCode, ErrPeerNotFound, string(b))
+		}
 		return fmt.Errorf("refresh failed (status %d): %s", resp.StatusCode, string(b))
 	}
 	return nil
@@ -372,6 +378,9 @@ func (c *Client) Heartbeat(ctx context.Context, id string, ttlSeconds int) error
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("heartbeat failed (status %d): %w: %s", resp.StatusCode, ErrPeerNotFound, string(b))
+		}
 		return fmt.Errorf("heartbeat failed (status %d): %s", resp.StatusCode, string(b))
 	}
 	return nil
