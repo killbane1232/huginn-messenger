@@ -10,7 +10,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -65,6 +64,13 @@ type MessagePayload struct {
 }
 
 type MessengerOption func(*messengerOpts)
+
+const (
+	peerHeartbeatInterval = 15 * time.Second
+	peerTTLSeconds        = 120
+	groupPeerTTLSeconds   = 24 * 60 * 60
+	groupRefreshInterval  = 12 * time.Hour
+)
 
 type messengerOpts struct {
 	iceServers []pion.ICEServer
@@ -322,6 +328,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	}
 
 	m.startBackground(m.heartbeatLoop)
+	m.startBackground(m.groupRefreshLoop)
 	m.startBackground(m.peerRefreshLoop)
 	m.startBackground(m.signalPollLoop)
 	m.startBackground(m.processRTCMessages)
@@ -342,23 +349,22 @@ func (m *Messenger) startBackground(fn func()) {
 }
 
 func (m *Messenger) heartbeatLoop() {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(peerHeartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			if err := m.muninnClient.Heartbeat(m.ctx, m.ID, 15); err != nil {
-				if strings.Contains(err.Error(), "peer not found") {
+			if !m.isCurrentPeerRegistered() {
+				if err := m.Register(); err != nil {
+					log.Printf("register peer error: %v", err)
+				}
+				continue
+			}
+			if err := m.muninnClient.Heartbeat(m.ctx, m.ID, peerTTLSeconds); err != nil {
+				if errors.Is(err, muninn.ErrPeerNotFound) {
 					log.Printf("heartbeat error: %v, registering peer", err)
 					if err := m.Register(); err != nil {
 						log.Printf("register peer error: %v", err)
-					}
-					groups, err := m.store.GetGroupChats()
-					if err != nil {
-						continue
-					}
-					for _, g := range groups {
-						m.registerGroupPeer(g)
 					}
 				} else {
 					log.Printf("heartbeat error: %v", err)
@@ -370,32 +376,54 @@ func (m *Messenger) heartbeatLoop() {
 	}
 }
 
+func (m *Messenger) isCurrentPeerRegistered() bool {
+	key := m.Username + ":" + crypto.EncodeKey(m.signPublic)
+	m.registeredMu.Lock()
+	defer m.registeredMu.Unlock()
+	return m.registeredMap[key]
+}
+
 func (m *Messenger) Register() error {
 	sign := crypto.EncodeKey(m.signPublic)
 	key := m.Username + ":" + sign
 	m.registeredMu.Lock()
-	defer m.registeredMu.Unlock()
+	var err error
 	if m.registeredMap[key] == true {
 		req := &muninn.RefreshRequest{
 			ID:           m.ID,
 			Login:        m.Username,
 			SignatureKey: sign,
 		}
-		return m.muninnClient.Refresh(m.ctx, req)
+		err = m.muninnClient.Refresh(m.ctx, req)
+		if err == nil {
+			m.registeredMu.Unlock()
+			m.registerStoredGroupPeers()
+			return nil
+		}
+		if !errors.Is(err, muninn.ErrPeerNotFound) {
+			m.registeredMu.Unlock()
+			return err
+		}
+		delete(m.registeredMap, key)
 	}
 	req := &muninn.RegisterRequest{
 		ID:            m.ID,
 		Login:         m.Username,
 		EncryptionKey: crypto.EncodeKey(m.encPublic),
 		SignatureKey:  sign,
-		TTLSeconds:    120,
+		TTLSeconds:    peerTTLSeconds,
 		PeerFlag:      m.peerFlag,
 	}
-	err := m.muninnClient.Register(m.ctx, req)
+	err = m.muninnClient.Register(m.ctx, req)
 	if err == nil {
 		m.registeredMap[key] = true
 	}
-	return err
+	m.registeredMu.Unlock()
+	if err != nil {
+		return err
+	}
+	m.registerStoredGroupPeers()
+	return nil
 }
 
 func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {
