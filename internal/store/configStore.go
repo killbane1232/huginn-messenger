@@ -7,23 +7,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/killbane1232/huginn-messenger/internal/config"
 )
 
 const (
-	ConfigCryptoKeys  = "crypto_keys"
-	ConfigUsername    = "username"
-	ConfigMuninn      = "muninn"
-	ConfigPeerID      = "peer_id"
-	ConfigChunkTTL    = "chunk_ttl"
-	ConfigPeerFlag    = "peer_flag"
-	ConfigTurnAddr    = "turn_addr"
-	ConfigTurnUser    = "turn_user"
-	ConfigTurnPass    = "turn_pass"
-	ConfigUIPort      = "ui_port"
-	ConfigStartServer = "start_server"
+	ConfigCryptoKeys = "crypto_keys"
+	ConfigUsername   = "username"
+	ConfigMuninn     = "muninn"
+	ConfigPeerID     = "peer_id"
+	ConfigChunkTTL   = "chunk_ttl"
+	ConfigPeerFlag   = "peer_flag"
+	ConfigTurnAddr   = "turn_addr"
+	ConfigTurnUser   = "turn_user"
+	ConfigTurnPass   = "turn_pass"
 )
 
 var ErrConfigNotFound = errors.New("config value not found")
@@ -94,19 +91,6 @@ func (s *SQLiteStore) LoadAppConfig() (*config.Config, error) {
 		cfg.TurnPassword = v
 		hasValue = true
 	}
-	if v, err := s.GetConfigValue(ConfigUIPort); err == nil {
-		if port, err := strconv.Atoi(v); err == nil {
-			cfg.UIPort = port
-			hasValue = true
-		}
-	}
-	if v, err := s.GetConfigValue(ConfigStartServer); err == nil {
-		if start, err := strconv.ParseBool(v); err == nil {
-			cfg.StartServer = start
-			hasValue = true
-		}
-	}
-
 	if !hasValue {
 		return nil, ErrConfigNotFound
 	}
@@ -156,14 +140,6 @@ func (s *SQLiteStore) SaveAppConfig(cfg *config.Config) error {
 		if err := s.SetConfigValue(ConfigTurnPass, cfg.TurnPassword); err != nil {
 			return err
 		}
-	}
-	if cfg.UIPort != 0 {
-		if err := s.SetConfigValue(ConfigUIPort, strconv.Itoa(cfg.UIPort)); err != nil {
-			return err
-		}
-	}
-	if err := s.SetConfigValue(ConfigStartServer, strconv.FormatBool(cfg.StartServer)); err != nil {
-		return err
 	}
 	return nil
 }

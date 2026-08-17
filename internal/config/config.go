@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"strings"
+
 	"github.com/google/uuid"
 )
 
@@ -14,14 +14,12 @@ type Config struct {
 	MuninnAddr   string `json:"muninn"`
 	Username     string `json:"username"`
 	PeerID       string `json:"peer_id,omitempty"`
-	UIPort       int    `json:"ui_port"`
 	DBPath       string `json:"-"`
 	ChunkTTL     string `json:"chunk_ttl"`
 	PeerFlag     string `json:"peer_flag"`
 	TurnAddr     string `json:"turn_addr"`
 	TurnUsername string `json:"turn_user"`
 	TurnPassword string `json:"turn_pass"`
-	StartServer  bool   `json:"start_server"`
 }
 
 const configPath = "config.conf"
@@ -42,7 +40,6 @@ func Parse() *Config {
 
 	flag.StringVar(&c.MuninnAddr, "muninn", c.MuninnAddr, "muninn server address")
 	flag.StringVar(&c.Username, "username", c.Username, "your username (required)")
-	flag.IntVar(&c.UIPort, "ui-port", c.UIPort, "web UI port (default: random)")
 	flag.StringVar(&c.DBPath, "db", c.DBPath, "path to SQLite database")
 	flag.StringVar(&c.ChunkTTL, "chunk-ttl", c.ChunkTTL, "chunk TTL (1d, 1w, 1m)")
 	flag.StringVar(&c.PeerFlag, "peer-flag", c.PeerFlag, "peer flag: thin, thick, very_thick")
@@ -50,10 +47,6 @@ func Parse() *Config {
 
 	if c.Username == "" {
 		c.Username = uuid.New().String()
-	}
-	c.StartServer = true
-	if c.UIPort == 0 {
-		c.StartServer = false
 	}
 	return c
 }
@@ -77,13 +70,4 @@ func (c *Config) Save() error {
 		return err
 	}
 	return os.WriteFile(configPath, data, 0644)
-}
-
-func findFreePort() int {
-	l, err := net.Listen("tcp", ":0")
-	if err != nil {
-		return 0
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
 }
