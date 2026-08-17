@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ["v*.*.*"]
   pull_request: {}
 
 jobs:
@@ -14,6 +15,81 @@ jobs:
         with:
           go-version: "1.26"
       - run: go test ./...
+
+  library:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build shared library
+        run: |
+          mkdir -p dist/root
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --target library \
+            --output type=local,dest=dist/root \
+            .
+
+      - name: Package shared library
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          test -f dist/root/libhuginn_messenger.so
+          test -f dist/root/libhuginn_messenger.h
+          tar -C dist/root -czf \
+            "dist/huginn-messenger_${version}_linux_${{ matrix.arch }}.tar.gz" \
+            libhuginn_messenger.so libhuginn_messenger.h
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huginn-messenger-linux-${{ matrix.arch }}
+          path: dist/huginn-messenger_*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: library
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: huginn-messenger-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          test "$version" = "$GITHUB_REF_NAME"
+          cd dist
+          sha256sum huginn-messenger_*.tar.gz > SHA256SUMS
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              huginn-messenger_*.tar.gz SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              huginn-messenger_*.tar.gz SHA256SUMS \
+              --verify-tag \
+              --generate-notes \
+              --title "Huginn Messenger $GITHUB_REF_NAME"
+          fi
 
   publish:
     needs: test
@@ -42,6 +118,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
             type=sha,prefix=sha-
 
       - uses: docker/build-push-action@v6
