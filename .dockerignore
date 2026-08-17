@@ -1,0 +1,8 @@
+.git
+dist
+test_dir
+*.db
+*.db-shm
+*.db-wal
+libhuginn_messenger.h
+libhuginn_messenger.so

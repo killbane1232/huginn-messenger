@@ -59,6 +59,15 @@ func removeInstance(handle int64) {
 
 //export messenger_create
 func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass *C.char) C.long {
+	return createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass, "")
+}
+
+//export messenger_create_with_peer_flag
+func messenger_create_with_peer_flag(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass, peerFlag *C.char) C.long {
+	return createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass, C.GoString(peerFlag))
+}
+
+func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass *C.char, requestedPeerFlag string) C.long {
 	goUser := C.GoString(username)
 	goMuninn := C.GoString(muninnAddr)
 	goDB := C.GoString(dbPath)
@@ -79,6 +88,10 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 	if goTTL == "" {
 		goTTL = "1w"
 	}
+	peerFlag, ok := parsePeerFlag(requestedPeerFlag)
+	if !ok {
+		return -3
+	}
 
 	absDB, err := filepath.Abs(goDB)
 	if err == nil {
@@ -90,7 +103,7 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 		MuninnAddr:   goMuninn,
 		DBPath:       goDB,
 		ChunkTTL:     goTTL,
-		PeerFlag:     "thin",
+		PeerFlag:     string(peerFlag),
 		TurnAddr:     goTurnAddr,
 		TurnUsername: goTurnUser,
 		TurnPassword: goTurnPass,
@@ -99,7 +112,7 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 	mc := muninn.NewClient(cfg.MuninnAddr)
 
 	mOpts := []messenger.MessengerOption{
-		messenger.WithPeerFlag(muninn.PeerFlag(cfg.PeerFlag)),
+		messenger.WithPeerFlag(peerFlag),
 		messenger.WithTURN(cfg.TurnAddr, cfg.TurnUsername, cfg.TurnPassword),
 	}
 	m, err := messenger.New(cfg.Username, mc, cfg.DBPath, mOpts...)
@@ -118,7 +131,7 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 	if storedCfg.ChunkTTL != "" {
 		cfg.ChunkTTL = storedCfg.ChunkTTL
 	}
-	if storedCfg.PeerFlag != "" {
+	if storedCfg.PeerFlag != "" && requestedPeerFlag == "" {
 		cfg.PeerFlag = storedCfg.PeerFlag
 	}
 	if storedCfg.TurnAddr != "" {
@@ -145,6 +158,9 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 	if goTTL != "" && goTTL != "1w" {
 		cfg.ChunkTTL = goTTL
 	}
+	if requestedPeerFlag != "" {
+		cfg.PeerFlag = string(peerFlag)
+	}
 	if err := m.SaveConfig(cfg); err != nil {
 		log.Printf("save config to db: %v", err)
 	}
@@ -166,6 +182,19 @@ func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser
 	go inst.eventLoop()
 
 	return C.long(storeInstance(inst))
+}
+
+func parsePeerFlag(value string) (muninn.PeerFlag, bool) {
+	if value == "" {
+		return muninn.PeerFlagThin, true
+	}
+	flag := muninn.PeerFlag(value)
+	switch flag {
+	case muninn.PeerFlagThin, muninn.PeerFlagThick, muninn.PeerFlagVeryThick:
+		return flag, true
+	default:
+		return "", false
+	}
 }
 
 func (inst *instance) eventLoop() {
