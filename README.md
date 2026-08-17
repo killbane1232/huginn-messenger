@@ -168,7 +168,13 @@ make library
 ```
 
 Результат находится в `dist/linux_<arch>/`. `make package-library` дополнительно
-создаёт версионированный архив с `.so`, C-заголовком и `SHA256SUMS`.
+создаёт версионированный архив с `.so`, C-заголовком и `SHA256SUMS`. Android
+вариант можно собрать установленным NDK:
+
+```bash
+ANDROID_NDK_HOME=/path/to/ndk \
+  scripts/build-android-library.sh arm64-v8a dist/android_arm64-v8a
+```
 
 Контрактом служат экспортированные функции в `bridge.go`. При его изменении
 нужно синхронно обновить C-заголовок и Dart FFI-обёртку родительского
@@ -178,11 +184,12 @@ Flutter-проекта.
 
 Версия библиотеки хранится в `VERSION`. Push тега с тем же значением запускает
 GitHub Actions, который собирает glibc-библиотеки для `linux/amd64` и
-`linux/arm64` и публикует их вместе с `SHA256SUMS` в GitHub Release:
+`linux/arm64`, Android-библиотеки для `arm64-v8a`, `armeabi-v7a`, `x86_64` и
+`x86` и публикует их вместе с `SHA256SUMS` в GitHub Release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 Перед следующим выпуском сначала измените `VERSION`. Обычные push и pull request
