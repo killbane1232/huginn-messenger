@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -10,7 +9,6 @@ import (
 	"github.com/killbane1232/huginn-messenger/internal/config"
 	"github.com/killbane1232/huginn-messenger/internal/messenger"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
-	"github.com/killbane1232/huginn-messenger/internal/ui"
 )
 
 func main() {
@@ -32,20 +30,6 @@ func main() {
 	if err := m.Register(); err != nil {
 		log.Printf("warning: register failed: %v", err)
 	}
-	var uiSrv *ui.Server
-
-	if (cfg.StartServer) {
-		uiSrv = ui.NewServer(cfg, m)
-		go func() {
-			log.Printf("web UI started at http://localhost:%d", cfg.UIPort)
-			log.Printf("connect to muninn: %s", cfg.MuninnAddr)
-			if err := uiSrv.Start(); err != nil {
-				log.Fatalf("UI server error: %v", err)
-			}
-		}()
-
-		fmt.Printf("\n  Open http://localhost:%d in your browser\n\n", cfg.UIPort)
-	}
 
 	log.Printf("started: username=%s muninn=%s db=%s", cfg.Username, cfg.MuninnAddr, cfg.DBPath)
 
@@ -54,8 +38,5 @@ func main() {
 	<-sigCh
 
 	log.Println("shutting down...")
-	if (cfg.StartServer) {
-		uiSrv.Shutdown()
-	}
 	m.Shutdown()
 }
