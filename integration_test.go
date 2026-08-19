@@ -20,6 +20,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/killbane1232/huginn-messenger/internal/chunk"
+	"github.com/killbane1232/huginn-messenger/internal/config"
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 	"github.com/killbane1232/huginn-messenger/internal/messenger"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
@@ -49,6 +50,57 @@ func iceServers() []pion.ICEServer {
 			},
 		},
 	}
+}
+
+func seedReplicaDatabase(t *testing.T, dbPath, username, peerID, keysJSON string) {
+	t.Helper()
+	st, err := store.New(dbPath)
+	if err != nil {
+		t.Fatalf("open replica database: %v", err)
+	}
+	defer st.Close()
+	if err := st.SaveKeysJSON(keysJSON); err != nil {
+		t.Fatalf("save replica keys: %v", err)
+	}
+	if err := st.SaveAppConfig(&config.Config{
+		Username: username,
+		PeerID:   peerID,
+		ChunkTTL: "1w",
+		PeerFlag: "thin",
+		DBPath:   dbPath,
+	}); err != nil {
+		t.Fatalf("save replica config: %v", err)
+	}
+}
+
+func seedStateSyncMessage(t *testing.T, dbPath string, message messenger.ChatMessage, login, senderLogin string) {
+	t.Helper()
+	data, err := json.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal seeded message: %v", err)
+	}
+	st, err := store.New(dbPath)
+	if err != nil {
+		t.Fatalf("open database for seeded message: %v", err)
+	}
+	defer st.Close()
+	if err := st.SaveMessage(message.MsgID, login, senderLogin, message.ChatID, data, message.Timestamp); err != nil {
+		t.Fatalf("save seeded message: %v", err)
+	}
+}
+
+func lastStateCheckFromDB(t *testing.T, dbPath, peerID string) time.Time {
+	t.Helper()
+	st, err := store.New(dbPath)
+	if err != nil {
+		t.Fatalf("open database for state cursor: %v", err)
+	}
+	defer st.Close()
+	checkedAt, err := st.GetLastStateCheck(peerID)
+	if err != nil {
+		t.Fatalf("get state cursor: %v", err)
+	}
+	return checkedAt
 }
 
 func TestCryptoRoundtrip(t *testing.T) {
@@ -775,6 +827,140 @@ func TestThreeUserOfflineWithStoragePeer(t *testing.T) {
 		t.Fatal("message id is empty")
 	}
 	t.Logf("OK: offline message delivered via charley, id=%s", lastMsg.MsgID)
+}
+
+func TestEquivalentPeersConnectAndReplicateMessagesAtStartup(t *testing.T) {
+	mn := newTestMuninnServer()
+	defer mn.Close()
+	mc := muninn.NewClient(mn.URL())
+
+	primaryDB := filepath.Join(t.TempDir(), "primary.db")
+	replicaDB := filepath.Join(t.TempDir(), "replica.db")
+	primary, err := messenger.New("alice", mc, primaryDB,
+		messenger.WithICEServers(iceServers()), messenger.WithPoll())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Shutdown()
+
+	keysJSON, err := keysJSONFromDB(t, primaryDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedReplicaDatabase(t, replicaDB, "alice", "alice-replica", string(keysJSON))
+	replica, err := messenger.New("alice", mc, replicaDB,
+		messenger.WithICEServers(iceServers()), messenger.WithPoll())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Shutdown()
+	if primary.Key != replica.Key {
+		t.Fatalf("replica keys differ: primary=%q replica=%q", primary.Key, replica.Key)
+	}
+	if primary.ID == replica.ID {
+		t.Fatalf("replica endpoints share physical peer id %q", primary.ID)
+	}
+
+	base := time.Now().UTC().Add(-time.Minute)
+	seedStateSyncMessage(t, primaryDB, messenger.ChatMessage{
+		From: "alice", ChatID: "shared-chat", Text: "from primary",
+		Timestamp: base, MsgID: "primary-only",
+	}, primary.Key, "alice")
+	seedStateSyncMessage(t, replicaDB, messenger.ChatMessage{
+		From: "alice", ChatID: "shared-chat", Text: "from replica",
+		Timestamp: base.Add(time.Second), MsgID: "replica-only",
+	}, replica.Key, "alice")
+
+	if err := primary.Register(); err != nil {
+		t.Fatalf("register primary: %v", err)
+	}
+	if err := replica.Register(); err != nil {
+		t.Fatalf("register replica: %v", err)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		primaryMessages := primary.GetMessages("shared-chat")
+		replicaMessages := replica.GetMessages("shared-chat")
+		if primary.IsPeerConnected(replica.ID) && replica.IsPeerConnected(primary.ID) &&
+			len(primaryMessages) == 2 && len(replicaMessages) == 2 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	primaryMessages := primary.GetMessages("shared-chat")
+	replicaMessages := replica.GetMessages("shared-chat")
+	if len(primaryMessages) != 2 {
+		t.Fatalf("primary has %d synchronized messages, want 2: %#v", len(primaryMessages), primaryMessages)
+	}
+	if len(replicaMessages) != 2 {
+		t.Fatalf("replica has %d synchronized messages, want 2: %#v", len(replicaMessages), replicaMessages)
+	}
+	if !primary.IsPeerConnected(replica.ID) || !replica.IsPeerConnected(primary.ID) {
+		t.Fatal("equivalent peers did not keep an automatically established WebRTC connection")
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	var primaryCursor, replicaCursor time.Time
+	for time.Now().Before(deadline) {
+		primaryCursor = lastStateCheckFromDB(t, primaryDB, replica.ID)
+		replicaCursor = lastStateCheckFromDB(t, replicaDB, primary.ID)
+		if !primaryCursor.IsZero() && !replicaCursor.IsZero() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if primaryCursor.IsZero() || replicaCursor.IsZero() {
+		t.Fatalf("state cursors were not acknowledged: primary=%s replica=%s", primaryCursor, replicaCursor)
+	}
+
+	primary.DisconnectPeer(replica.ID)
+	replica.DisconnectPeer(primary.ID)
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && (primary.IsPeerConnected(replica.ID) || replica.IsPeerConnected(primary.ID)) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if primary.IsPeerConnected(replica.ID) || replica.IsPeerConnected(primary.ID) {
+		t.Fatal("equivalent peers did not disconnect before incremental sync")
+	}
+
+	for !time.Now().UTC().After(primaryCursor) {
+		time.Sleep(time.Millisecond)
+	}
+	incrementalTimestamp := time.Now().UTC()
+	seedStateSyncMessage(t, primaryDB, messenger.ChatMessage{
+		From: "alice", ChatID: "shared-chat", Text: "incremental",
+		Timestamp: incrementalTimestamp, MsgID: "primary-incremental",
+	}, primary.Key, "alice")
+	if err := primary.ConnectPeer(replica.ID); err != nil {
+		t.Fatalf("reconnect replicas: %v", err)
+	}
+
+	deadline = time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(replica.GetMessages("shared-chat")) == 3 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := replica.GetMessages("shared-chat"); len(got) != 3 {
+		t.Fatalf("replica has %d messages after incremental sync, want 3: %#v", len(got), got)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	cursorAdvanced := false
+	for time.Now().Before(deadline) {
+		updated := lastStateCheckFromDB(t, primaryDB, replica.ID)
+		if updated.After(primaryCursor) {
+			cursorAdvanced = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !cursorAdvanced {
+		t.Fatal("primary state cursor did not advance after incremental sync")
+	}
 }
 
 func TestFileSendAndReceive(t *testing.T) {
