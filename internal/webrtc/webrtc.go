@@ -55,36 +55,68 @@ type ReloginChunk struct {
 	Data       []byte `json:"data"`
 }
 
+type StateSyncRequest struct{}
+
+type StateSyncManifest struct {
+	TransferID string `json:"transfer_id,omitempty"`
+	Checkpoint int64  `json:"checkpoint,omitempty"`
+	ChunkCount int    `json:"chunk_count,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+type StateSyncChunk struct {
+	TransferID string `json:"transfer_id"`
+	Index      int    `json:"index"`
+	Data       []byte `json:"data"`
+}
+
+type StateSyncAck struct {
+	TransferID string `json:"transfer_id"`
+	Checkpoint int64  `json:"checkpoint"`
+	Error      string `json:"error,omitempty"`
+}
+
 type envelope struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data"`
 }
 
 const (
-	MsgTypeChat            = "chat"
-	MsgTypeChunkStore      = "chunk_store"
-	MsgTypeChunkStoreBatch = "chunk_store_batch"
-	MsgTypeChunkGet        = "chunk_get"
-	MsgTypeChunkData       = "chunk_data"
-	MsgTypeReloginRequest  = "relogin_request"
-	MsgTypeReloginResponse = "relogin_response"
-	MsgTypeReloginChunk    = "relogin_chunk"
+	MsgTypeChat              = "chat"
+	MsgTypeChunkStore        = "chunk_store"
+	MsgTypeChunkStoreBatch   = "chunk_store_batch"
+	MsgTypeChunkGet          = "chunk_get"
+	MsgTypeChunkData         = "chunk_data"
+	MsgTypeReloginRequest    = "relogin_request"
+	MsgTypeReloginResponse   = "relogin_response"
+	MsgTypeReloginChunk      = "relogin_chunk"
+	MsgTypeStateSyncRequest  = "state_sync_request"
+	MsgTypeStateSyncManifest = "state_sync_manifest"
+	MsgTypeStateSyncChunk    = "state_sync_chunk"
+	MsgTypeStateSyncAck      = "state_sync_ack"
 )
 
 type Manager struct {
-	mu           sync.RWMutex
-	connections  map[string]*pion.PeerConnection
-	dataChans    map[string]*pion.DataChannel
-	negMu        sync.Mutex
-	negotiation  map[string]*sync.Mutex
-	chatMsgChan  chan ChatMessage
-	chunkStore   func(peerID string, req ChunkStoreRequest)
-	chunkGet     func(peerID string, req ChunkGetRequest) ([]byte, bool)
-	reloginReq   func(peerID string, req ReloginRequest)
-	reloginResp  func(peerID string, resp ReloginResponse)
-	reloginChunk func(peerID string, chunk ReloginChunk)
-	submit       func(func()) bool
-	localID      string
+	mu                sync.RWMutex
+	connections       map[string]*pion.PeerConnection
+	dataChans         map[string]*pion.DataChannel
+	negMu             sync.Mutex
+	negotiation       map[string]*sync.Mutex
+	chatMsgChan       chan ChatMessage
+	chunkStore        func(peerID string, req ChunkStoreRequest)
+	chunkGet          func(peerID string, req ChunkGetRequest) ([]byte, bool)
+	reloginReq        func(peerID string, req ReloginRequest)
+	reloginResp       func(peerID string, resp ReloginResponse)
+	reloginChunk      func(peerID string, chunk ReloginChunk)
+	stateSyncReq      func(peerID string, req StateSyncRequest)
+	stateSyncManifest func(peerID string, manifest StateSyncManifest)
+	stateSyncChunk    func(peerID string, chunk StateSyncChunk)
+	stateSyncAck      func(peerID string, ack StateSyncAck)
+	peerConnected     func(peerID string)
+	peerDisconnected  func(peerID string)
+	submit            func(func()) bool
+	localID           string
 
 	config pion.Configuration
 }
@@ -95,21 +127,33 @@ func NewManager(localID string, chatMsgChan chan ChatMessage,
 	reloginReq func(peerID string, req ReloginRequest),
 	reloginResp func(peerID string, resp ReloginResponse),
 	reloginChunk func(peerID string, chunk ReloginChunk),
+	stateSyncReq func(peerID string, req StateSyncRequest),
+	stateSyncManifest func(peerID string, manifest StateSyncManifest),
+	stateSyncChunk func(peerID string, chunk StateSyncChunk),
+	stateSyncAck func(peerID string, ack StateSyncAck),
+	peerConnected func(peerID string),
+	peerDisconnected func(peerID string),
 	iceServers []pion.ICEServer,
 	submit func(func()) bool) *Manager {
 
 	return &Manager{
-		connections:  make(map[string]*pion.PeerConnection),
-		dataChans:    make(map[string]*pion.DataChannel),
-		negotiation:  make(map[string]*sync.Mutex),
-		chatMsgChan:  chatMsgChan,
-		chunkStore:   chunkStore,
-		chunkGet:     chunkGet,
-		reloginReq:   reloginReq,
-		reloginResp:  reloginResp,
-		reloginChunk: reloginChunk,
-		submit:       submit,
-		localID:      localID,
+		connections:       make(map[string]*pion.PeerConnection),
+		dataChans:         make(map[string]*pion.DataChannel),
+		negotiation:       make(map[string]*sync.Mutex),
+		chatMsgChan:       chatMsgChan,
+		chunkStore:        chunkStore,
+		chunkGet:          chunkGet,
+		reloginReq:        reloginReq,
+		reloginResp:       reloginResp,
+		reloginChunk:      reloginChunk,
+		stateSyncReq:      stateSyncReq,
+		stateSyncManifest: stateSyncManifest,
+		stateSyncChunk:    stateSyncChunk,
+		stateSyncAck:      stateSyncAck,
+		peerConnected:     peerConnected,
+		peerDisconnected:  peerDisconnected,
+		submit:            submit,
+		localID:           localID,
 		config: pion.Configuration{
 			ICEServers: iceServers,
 		},
@@ -217,7 +261,50 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		if json.Unmarshal(env.Data, &chunk) == nil {
 			m.reloginChunk(remoteID, chunk)
 		}
+	case MsgTypeStateSyncRequest:
+		if m.stateSyncReq == nil {
+			return
+		}
+		var req StateSyncRequest
+		if json.Unmarshal(env.Data, &req) == nil {
+			m.submitAsync(func() { m.stateSyncReq(remoteID, req) })
+		}
+	case MsgTypeStateSyncManifest:
+		if m.stateSyncManifest == nil {
+			return
+		}
+		var manifest StateSyncManifest
+		if json.Unmarshal(env.Data, &manifest) == nil {
+			m.stateSyncManifest(remoteID, manifest)
+		}
+	case MsgTypeStateSyncChunk:
+		if m.stateSyncChunk == nil {
+			return
+		}
+		var chunk StateSyncChunk
+		if json.Unmarshal(env.Data, &chunk) == nil {
+			m.stateSyncChunk(remoteID, chunk)
+		}
+	case MsgTypeStateSyncAck:
+		if m.stateSyncAck == nil {
+			return
+		}
+		var ack StateSyncAck
+		if json.Unmarshal(env.Data, &ack) == nil {
+			m.submitAsync(func() { m.stateSyncAck(remoteID, ack) })
+		}
 	}
+}
+
+func (m *Manager) installDataChannelHandlers(remoteID string, dc *pion.DataChannel) {
+	dc.OnOpen(func() {
+		if m.peerConnected != nil {
+			m.submitAsync(func() { m.peerConnected(remoteID) })
+		}
+	})
+	dc.OnMessage(func(msg pion.DataChannelMessage) {
+		m.onMessage(remoteID, msg)
+	})
 }
 
 func (m *Manager) sendEnvelope(remoteID, msgType string, v any) error {
@@ -276,9 +363,7 @@ func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, erro
 		}
 		m.mu.Unlock()
 
-		dc.OnMessage(func(msg pion.DataChannelMessage) {
-			m.onMessage(remoteID, msg)
-		})
+		m.installDataChannelHandlers(remoteID, dc)
 	})
 
 	pc.OnConnectionStateChange(func(s pion.PeerConnectionState) {
@@ -290,6 +375,9 @@ func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, erro
 				delete(m.dataChans, remoteID)
 			}
 			m.mu.Unlock()
+			if m.peerDisconnected != nil {
+				m.submitAsync(func() { m.peerDisconnected(remoteID) })
+			}
 		}
 	})
 
@@ -321,9 +409,7 @@ func (m *Manager) CreateOffer(remoteID string) (pion.SessionDescription, error) 
 	}
 	m.mu.Unlock()
 
-	dc.OnMessage(func(msg pion.DataChannelMessage) {
-		m.onMessage(remoteID, msg)
-	})
+	m.installDataChannelHandlers(remoteID, dc)
 
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
@@ -461,6 +547,22 @@ func (m *Manager) SendReloginResponse(remoteID string, resp ReloginResponse) err
 
 func (m *Manager) SendReloginChunk(remoteID string, chunk ReloginChunk) error {
 	return m.sendEnvelope(remoteID, MsgTypeReloginChunk, chunk)
+}
+
+func (m *Manager) SendStateSyncRequest(remoteID string, req StateSyncRequest) error {
+	return m.sendEnvelope(remoteID, MsgTypeStateSyncRequest, req)
+}
+
+func (m *Manager) SendStateSyncManifest(remoteID string, manifest StateSyncManifest) error {
+	return m.sendEnvelope(remoteID, MsgTypeStateSyncManifest, manifest)
+}
+
+func (m *Manager) SendStateSyncChunk(remoteID string, chunk StateSyncChunk) error {
+	return m.sendEnvelope(remoteID, MsgTypeStateSyncChunk, chunk)
+}
+
+func (m *Manager) SendStateSyncAck(remoteID string, ack StateSyncAck) error {
+	return m.sendEnvelope(remoteID, MsgTypeStateSyncAck, ack)
 }
 
 func (m *Manager) BufferedAmount(remoteID string) (uint64, bool) {

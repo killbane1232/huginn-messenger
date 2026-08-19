@@ -163,10 +163,15 @@ type Messenger struct {
 	processingMsg map[string]bool
 	processingMu  sync.Mutex
 
-	appConfig       *config.Config
-	reloginMu       sync.Mutex
-	reloginTransfer *reloginTransferState
-	pollSignal      bool
+	appConfig          *config.Config
+	reloginMu          sync.Mutex
+	reloginTransfer    *reloginTransferState
+	stateSyncMu        sync.Mutex
+	stateSyncRequested map[string]bool
+	stateSyncIncoming  map[string]*stateSyncIncomingTransfer
+	stateSyncOutgoing  map[string]*stateSyncOutgoingTransfer
+	replicaPeers       map[string]bool
+	pollSignal         bool
 }
 
 func New(username string, muninnClient *muninn.Client, dbPath string, opts ...MessengerOption) (*Messenger, error) {
@@ -288,6 +293,10 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		pendingFileDownloads: make(map[string]*pendingFileDownload),
 		processingMsg:        make(map[string]bool),
 		appConfig:            appCfg,
+		stateSyncRequested:   make(map[string]bool),
+		stateSyncIncoming:    make(map[string]*stateSyncIncomingTransfer),
+		stateSyncOutgoing:    make(map[string]*stateSyncOutgoingTransfer),
+		replicaPeers:         make(map[string]bool),
 		pollSignal:           o.pollSignal,
 	}
 	m.async = newAsyncPool(ctx, asyncWorkerCount, asyncQueueSize)
@@ -307,7 +316,9 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		}
 	}
 	m.rtcManager = webrtc.NewManager(peerID, rtcMsgChan, m.handleChunkStore, m.handleChunkGet,
-		m.handleReloginRequest, m.handleReloginResponse, m.handleReloginChunk, o.iceServers, m.async.submit)
+		m.handleReloginRequest, m.handleReloginResponse, m.handleReloginChunk,
+		m.handleStateSyncRequest, m.handleStateSyncManifest, m.handleStateSyncChunk, m.handleStateSyncAck,
+		m.handlePeerConnected, m.handlePeerDisconnected, o.iceServers, m.async.submit)
 
 	m.wsClient = muninn.NewWSClient(muninnClient.BaseURL(), peerID)
 	m.wsClient.SetOnSignal(func(sig muninn.Signal) {
@@ -399,6 +410,7 @@ func (m *Messenger) Register() error {
 		if err == nil {
 			m.registeredMu.Unlock()
 			m.registerStoredGroupPeers()
+			m.scheduleReplicaConnections()
 			return nil
 		}
 		if !errors.Is(err, muninn.ErrPeerNotFound) {
@@ -424,7 +436,14 @@ func (m *Messenger) Register() error {
 		return err
 	}
 	m.registerStoredGroupPeers()
+	m.scheduleReplicaConnections()
 	return nil
+}
+
+func (m *Messenger) scheduleReplicaConnections() {
+	if m.async != nil {
+		m.async.trySubmit(m.refreshReplicaConnections)
+	}
 }
 
 func (m *Messenger) processReceivedFile(f FileMeta, senderID string) {

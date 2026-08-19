@@ -155,23 +155,26 @@ func (s *SQLiteStore) ImportReplicationSnapshot(snapshot ReplicationSnapshot) er
 		return fmt.Errorf("begin replication import: %w", err)
 	}
 	defer tx.Rollback()
+	importedAt := time.Now().UTC().UnixMicro()
 
 	for _, message := range snapshot.Messages {
 		if _, err := tx.Exec(`
-			INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at, state_updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(message_uid) DO UPDATE SET
 				login = excluded.login,
 				sender_login = excluded.sender_login,
 				chat_id = excluded.chat_id,
 				data = excluded.data,
-				created_at = excluded.created_at`,
+				created_at = excluded.created_at,
+				state_updated_at = MAX(messages.state_updated_at, excluded.state_updated_at)`,
 			message.MessageUID,
 			message.Login,
 			message.SenderLogin,
 			message.ChatID,
 			message.Data,
 			message.CreatedAt,
+			importedAt,
 		); err != nil {
 			return fmt.Errorf("import message %s: %w", message.MessageUID, err)
 		}

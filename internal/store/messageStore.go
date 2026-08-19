@@ -21,8 +21,10 @@ func messageHistoryArgs(peerID string) []any {
 func (s *SQLiteStore) SaveMessage(msg_uid string, login string, senderLogin string, chatID string, data []byte, created_at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec("INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-		msg_uid, login, senderLogin, chatID, data, created_at.UnixMicro())
+	_, err := s.db.Exec(`
+		INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at, state_updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		msg_uid, login, senderLogin, chatID, data, created_at.UnixMicro(), time.Now().UTC().UnixMicro())
 	return err
 }
 

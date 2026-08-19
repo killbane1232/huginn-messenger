@@ -455,14 +455,72 @@ sequenceDiagram
 Одна операция relogin имеет timeout две минуты. DataChannel backpressure
 ограничивает накопленный send buffer значением 512 KiB.
 
-## 14. Сводка transport-протоколов
+## 14. Репликация состояния между устройствами
+
+После успешного `Register` клиент запрашивает в Muninn все активные endpoints с
+тем же точным пользовательским ключом `login:signature`. Для каждого endpoint,
+кроме собственного `Messenger.ID`, автоматически создаётся WebRTC-соединение.
+Входящее соединение допускается к репликации только после повторной проверки,
+что удалённый endpoint зарегистрирован с тем же ключом и его TTL не истёк.
+
+При открытии DataChannel обе стороны отправляют `state_sync_request` и независимо
+передают свою дельту. Таблица
+`last_state_check(peer_id, last_check_datetime)` хранит для каждого физического
+endpoint верхнюю границу последней подтверждённой исходящей синхронизации.
+Экспорт выбирает сообщения из всех чатов за интервал
+`[last_check_datetime, checkpoint]`, поэтому включает как полученные, так и
+отправленные сообщения.
+Граница сравнивается с локальным `messages.state_updated_at`, который ставится
+при вставке записи, а не с исходным timestamp сообщения. Поэтому сообщение,
+доставленное офлайн с давним `created_at`, всё равно попадёт в следующую дельту.
+Нижняя граница включена намеренно: запись на том же такте часов может быть
+отправлена повторно, но не будет потеряна; `message_uid` делает импорт
+идемпотентным.
+
+```mermaid
+sequenceDiagram
+    participant A as Endpoint A
+    participant B as Endpoint B
+
+    A->>B: state_sync_request
+    B->>A: state_sync_request
+    A->>A: export [last_check[B], checkpoint A]
+    B->>B: export [last_check[A], checkpoint B]
+    A-->>B: state_sync_manifest + state_sync_chunk(s)
+    B-->>A: state_sync_manifest + state_sync_chunk(s)
+    A->>A: verify SHA-256 and insert absent messages
+    B->>B: verify SHA-256 and insert absent messages
+    A-->>B: state_sync_ack(checkpoint B)
+    B-->>A: state_sync_ack(checkpoint A)
+    A->>A: persist last_check[A-side peer]
+    B->>B: persist last_check[B-side peer]
+```
+
+Дельта версии 1 сериализуется в JSON, сжимается gzip, проверяется SHA-256 и
+передаётся чанками до 32 KiB с тем же ограничением DataChannel backpressure,
+что и relogin. Импорт выполняется транзакционно и добавляет только отсутствующие
+`message_uid`: существующая локальная запись не перезаписывается, поскольку она
+может содержать путь к уже загруженному файлу. В передаваемых сообщениях
+`file_path` удаляется, а `source_peer_id` указывает endpoint-источник. Курсор
+продвигается только после успешного импорта и `state_sync_ack`; после обрыва
+неподтверждённая дельта будет безопасно отправлена повторно.
+
+| Тип | Назначение |
+|---|---|
+| `state_sync_request` | Запросить дельту удалённого endpoint |
+| `state_sync_manifest` | Передать `transfer_id`, checkpoint, число чанков и SHA-256 |
+| `state_sync_chunk` | Передать часть gzip-дельты |
+| `state_sync_ack` | Подтвердить импорт или вернуть ошибку |
+
+## 15. Сводка transport-протоколов
 
 | Назначение | Transport | Формат |
 |---|---|---|
 | Регистрация, peers, chunk metadata | HTTP(S) Muninn | JSON |
 | Основной signaling | WS(S) `/api/v1/ws` | JSON text frames |
 | Fallback signaling | HTTP(S) signals endpoints | JSON |
-| P2P text/chunks/files/relogin | WebRTC DataChannel | binary frame с JSON envelope/payload |
+| P2P text/chunks/files/relogin/state sync | WebRTC DataChannel | binary frame с JSON envelope/payload |
+| Standalone live UI | local HTTP SSE | text/event-stream + JSON data |
 | Flutter integration | in-process C ABI | UTF-8 JSON strings |
 
 Маршруты Muninn всегда следует сверять с соседним
