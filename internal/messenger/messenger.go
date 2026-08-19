@@ -70,6 +70,7 @@ const (
 	peerTTLSeconds        = 120
 	groupPeerTTLSeconds   = 24 * 60 * 60
 	groupRefreshInterval  = 12 * time.Hour
+	fileDownloadTTL       = 7 * 24 * time.Hour
 )
 
 type messengerOpts struct {
@@ -454,6 +455,10 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 		return
 	}
 	defer m.releaseProcessMsg("file:" + f.FileID)
+	state, proceed := m.prepareFileDownload(f, senderID)
+	if !proceed {
+		return
+	}
 	chunkMap, err := m.store.ListChunks(f.FileID)
 	if err != nil {
 		log.Printf("list chunks for file %s: %v", f.FileID, err)
@@ -461,6 +466,16 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 	}
 
 	if len(chunkMap) < f.TotalChunks {
+		if state.StoppedAt != nil || !time.Now().Before(state.ExpiresAt) {
+			if state.StoppedAt == nil {
+				if err := m.store.MarkFileDownloadStopped(f.FileID, time.Now()); err != nil {
+					log.Printf("stop expired file download %s: %v", f.FileID, err)
+				}
+				log.Printf("file %s download expired after %s; stopping with %d/%d chunks", f.FileID, fileDownloadTTL, len(chunkMap), f.TotalChunks)
+			}
+			m.removePendingFileDownload(f.FileID)
+			return
+		}
 		log.Printf("file %s: have %d/%d chunks, requesting missing from peers", f.FileID, len(chunkMap), f.TotalChunks)
 		m.pendingMu.Lock()
 		m.pendingFileDownloads[f.FileID] = &pendingFileDownload{
@@ -544,22 +559,16 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 		outputName = f.FileID
 	}
 	fp := filepath.Join(m.downloadsDir, outputName)
-	if _, err := os.Stat(fp); err == nil {
-		log.Printf("file %s already exists at %s, skipping", f.FileID, fp)
-		m.pendingMu.Lock()
-		delete(m.pendingFileDownloads, f.FileID)
-		m.pendingMu.Unlock()
-		return
-	}
 	if err := os.WriteFile(fp, plaintext, 0644); err != nil {
 		log.Printf("save file %s: %v", fp, err)
 		return
 	}
 	log.Printf("file saved: %s (%d bytes)", fp, len(plaintext))
 
-	m.pendingMu.Lock()
-	delete(m.pendingFileDownloads, f.FileID)
-	m.pendingMu.Unlock()
+	if err := m.store.MarkFileDownloadCompleted(f.FileID, fp, time.Now()); err != nil {
+		log.Printf("persist completed file %s: %v", f.FileID, err)
+	}
+	m.removePendingFileDownload(f.FileID)
 
 	m.notifyFileReady(FileReadyEvent{
 		FileID:   f.FileID,
@@ -567,6 +576,83 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 		Filename: f.Filename,
 		SenderID: senderID,
 	})
+}
+
+func (m *Messenger) prepareFileDownload(f FileMeta, senderID string) (store.FileDownloadState, bool) {
+	state, err := m.store.EnsureFileDownload(f.FileID, time.Now(), fileDownloadTTL)
+	if err != nil {
+		log.Printf("track file download %s: %v", f.FileID, err)
+		return store.FileDownloadState{}, false
+	}
+
+	if state.CompletedAt != nil {
+		if fileMatchesMeta(state.LocalPath, f.FileHash, false) {
+			m.removePendingFileDownload(f.FileID)
+			m.notifyFileReady(FileReadyEvent{
+				FileID:   f.FileID,
+				FilePath: state.LocalPath,
+				Filename: f.Filename,
+				SenderID: senderID,
+			})
+			return state, false
+		}
+		if err := m.store.ResetFileDownloadCompletion(f.FileID); err != nil {
+			log.Printf("reset missing completed file %s: %v", f.FileID, err)
+			return state, false
+		}
+		state.CompletedAt = nil
+		state.LocalPath = ""
+	}
+
+	outputName := f.Filename
+	if outputName == "" {
+		outputName = f.FileID
+	}
+	candidate := filepath.Join(m.downloadsDir, outputName)
+	if fileMatchesMeta(candidate, f.FileHash, true) {
+		if err := m.store.MarkFileDownloadCompleted(f.FileID, candidate, time.Now()); err != nil {
+			log.Printf("persist existing completed file %s: %v", f.FileID, err)
+			return state, false
+		}
+		state.CompletedAt = new(time.Time)
+		*state.CompletedAt = time.Now()
+		state.LocalPath = candidate
+		m.removePendingFileDownload(f.FileID)
+		m.notifyFileReady(FileReadyEvent{
+			FileID:   f.FileID,
+			FilePath: candidate,
+			Filename: f.Filename,
+			SenderID: senderID,
+		})
+		return state, false
+	}
+
+	if state.StoppedAt != nil {
+		m.removePendingFileDownload(f.FileID)
+		return state, false
+	}
+	return state, true
+}
+
+func fileMatchesMeta(path, expectedHash string, requireHash bool) bool {
+	if path == "" || (requireHash && expectedHash == "") {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	if expectedHash == "" {
+		return true
+	}
+	digest := sha256.Sum256(data)
+	return base64.StdEncoding.EncodeToString(digest[:]) == expectedHash
+}
+
+func (m *Messenger) removePendingFileDownload(fileID string) {
+	m.pendingMu.Lock()
+	delete(m.pendingFileDownloads, fileID)
+	m.pendingMu.Unlock()
 }
 
 func (m *Messenger) checkPendingFileDownloads() {

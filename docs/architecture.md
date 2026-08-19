@@ -1,11 +1,8 @@
 # Huginn Messenger — архитектура Go-ядра
 
-Документ описывает текущую реализацию Go-приложения и native-ядра Huginn.
-Standalone web UI и Flutter — два разных адаптера одного `Messenger`:
-
-- standalone-процесс запускается через `main.go` и поднимает локальный HTTP API;
-- Flutter загружает shared library и вызывает экспортированный C ABI из
-  `bridge.go`.
+Документ описывает текущую реализацию native-ядра Huginn.
+Flutter загружает shared library и вызывает экспортированный C ABI из
+`bridge.go`; отдельного web UI в Go-ядре нет.
 
 Muninn хранит directory-записи, сигналы и метаданные чанков. Открытый текст и
 содержимое файлов в Muninn не отправляются.
@@ -14,13 +11,9 @@ Muninn хранит directory-записи, сигналы и метаданны
 
 ```mermaid
 flowchart TB
-    subgraph Adapters[UI adapters]
-        Web[Standalone web UI<br/>HTTP + SSE]
-        Flutter[Flutter<br/>Dart FFI]
-    end
+    Flutter[Flutter<br/>Dart FFI]
 
-    subgraph Huginn[Huginn Go process or shared library]
-        UIAPI[internal/ui]
+    subgraph Huginn[Huginn Go shared library]
         ABI[bridge.go C ABI]
         Core[internal/messenger]
         Store[(SQLite)]
@@ -31,9 +24,7 @@ flowchart TB
     Muninn[Muninn service<br/>REST + WebSocket]
     Peers[Huginn peers<br/>WebRTC DataChannel]
 
-    Web <--> UIAPI
     Flutter <--> ABI
-    UIAPI <--> Core
     ABI <--> Core
     Core <--> Store
     Core <--> RTC
@@ -51,7 +42,6 @@ flowchart TB
 | `internal/webrtc` | P2P PeerConnection и DataChannel protocol |
 | `internal/chunk` | Разбиение, шифрование, подпись и сборка чанков |
 | `internal/store` | SQLite, миграции и локальные снимки |
-| `internal/ui` | Standalone HTTP API, embedded web UI и SSE |
 | `bridge.go` | Экспортированный C ABI и очередь событий для Flutter |
 
 ## 2. Идентичность, регистрация и heartbeat
@@ -90,7 +80,7 @@ TTL. Если Muninn отвечает `peer not found`, клиент повто�
 
 ```mermaid
 sequenceDiagram
-    participant UI as Web UI or Flutter
+    participant UI as Flutter UI
     participant H as Messenger
     participant DB as SQLite stored_peers
     participant M as Muninn
@@ -325,31 +315,7 @@ Pending-записи не повторяются бесконечно: `chunkCle
 context, закрывает signaling и WebRTC, ждёт background goroutines и worker pool,
 после чего закрывает SQLite.
 
-## 10. UI adapters и события
-
-### 10.1. Standalone web UI
-
-Web UI запускается только при ненулевом `--ui-port`. Актуальные local endpoints
-определены в `internal/ui/server.go`:
-
-| Метод | Путь | Назначение |
-|---|---|---|
-| `GET` | `/api/me` | Текущий пользователь |
-| `GET` | `/api/peers` | Известные пиры |
-| `GET` | `/api/peers/search?q=` | Поиск |
-| `GET` | `/api/messages/{peer}` | История |
-| `POST` | `/api/send` | Текстовое сообщение |
-| `POST` | `/api/send-file` | Файл |
-| `GET` | `/api/events` | SSE `peers` и `message` |
-| `GET`, `POST` | `/api/config` | Конфигурация |
-| `GET`, `POST` | `/api/groups` | Список и создание групп |
-| `POST` | `/api/groups/{uid}/invite` | Приглашение |
-| `POST` | `/api/groups/{uid}/send` | Сообщение группе |
-| `POST` | `/api/groups/{uid}/send-file` | Файл группе |
-
-SSE держит постоянное соединение и отправляет keepalive каждые десять секунд.
-
-### 10.2. Flutter C ABI
+## 10. Flutter C ABI и события
 
 `bridge.go` хранит native-инстансы по числовому handle. Сложные ответы
 возвращаются JSON-строками; вызывающая сторона освобождает их через
@@ -452,37 +418,6 @@ sourceEndpointID:base64(32-byte challenge).base64(ed25519 signature)
 Цель находит endpoint источника через Muninn и проверяет подпись его публичным
 ключом. Источник повторно проверяет тот же challenge собственным публичным
 ключом перед выдачей данных.
-    participant U as User
-    participant UI as Browser
-    participant API as Go HTTP Server
-
-    Note over U,API: Загрузка групп
-    UI->>API: GET /api/groups
-    API-->>UI: [{uid, name}, ...]
-    UI->>UI: renderGroupList — группы в сайдбаре
-
-    Note over U,API: Создание группы
-    U->>UI: нажал "+" → ввод имени
-    UI->>API: POST /api/groups/create {name}
-    API-->>UI: {uid, name}
-    UI->>UI: fetchGroups() → re-render
-
-    Note over U,API: Приглашение
-    U->>UI: выбрал группу → выбрал peer → "Invite"
-    UI->>API: POST /api/groups/{uid}/invite {peer_id}
-    API-->>UI: {status: "ok"}
-
-    Note over U,API: Отправка сообщения
-    U->>UI: выбрал группу → ввод текста
-    UI->>API: POST /api/groups/{uid}/send {text}
-    API-->>UI: {status: "ok"}
-    Note over UI: сообщение приходит через SSE
-    UI->>UI: если activeGroup == uid → appendMessage
-```
-
-UI отображает группы в отдельной секции сайдбара. При выборе группы открывается окно чата, идентичное DM, но с дополнительной кнопкой "Invite" для приглашения участников.
-
----
 
 ## 13. Relogin (перенос идентичности)
 
