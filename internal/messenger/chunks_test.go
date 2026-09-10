@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/killbane1232/huginn-messenger/internal/chunk"
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
 	"github.com/killbane1232/huginn-messenger/internal/store"
@@ -19,7 +20,7 @@ import (
 func TestHandleChunkStoreReportsActualSourcePeer(t *testing.T) {
 	const sourcePeerID = "source-peer-id"
 	const fileID = "file-id"
-	const chunkHash = "deadbeef01234567"
+	chunkHash := chunk.RegisteredHash([]byte("encrypted chunk"))
 
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -75,7 +76,7 @@ func TestHandleChunkStoreReportsActualSourcePeer(t *testing.T) {
 		TTLSeconds:  604800,
 	})
 
-	if _, err := chunkStore.GetChunk(fileID, 0); err != nil {
+	if data, err := chunkStore.GetChunk(fileID, 0); err != nil || len(data) == 0 {
 		t.Fatalf("chunk was not stored after a valid report: %v", err)
 	}
 }

@@ -88,3 +88,10 @@ func (s *SQLiteStore) DeleteExpiredFailedChunks(now int64) error {
 	_, err := s.db.Exec(`DELETE FROM failed_chunks WHERE created_at + ttl_seconds <= ?`, now)
 	return err
 }
+
+func (s *SQLiteStore) DeleteFailedMessage(fileID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("DELETE FROM failed_chunks WHERE file_id = ?", fileID)
+	return err
+}

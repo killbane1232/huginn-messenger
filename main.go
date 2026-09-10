@@ -17,7 +17,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	mc := muninn.NewClient(cfg.MuninnAddr)
+	var mc *muninn.Client
+	if cfg.MuninnAddr != "" {
+		mc = muninn.NewClient(cfg.MuninnAddr)
+	}
 	opts := []messenger.MessengerOption{messenger.WithPeerFlag(muninn.PeerFlag(cfg.PeerFlag))}
 	if cfg.PeerID != "" {
 		opts = append(opts, messenger.WithPeerID(cfg.PeerID))
@@ -31,7 +34,7 @@ func main() {
 		log.Printf("warning: register failed: %v", err)
 	}
 
-	log.Printf("started: username=%s muninn=%s db=%s", cfg.Username, cfg.MuninnAddr, cfg.DBPath)
+	log.Printf("started: username=%s muninn=%s db=%s", cfg.Username, m.Config().MuninnAddr, cfg.DBPath)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

@@ -6,8 +6,8 @@ func (s *SQLiteStore) StorePendingChunk(pc *PendingChunk) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
-		`INSERT OR REPLACE INTO pending_chunks (file_id, chunk_index, recipient_id, sender_id, data, hash, signature, created_at, placed, ttl_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		pc.FileID, pc.ChunkIndex, pc.RecipientID, pc.SenderID, pc.Data, pc.Hash, pc.Signature, pc.CreatedAt, pc.Placed, pc.TTLSeconds)
+		`INSERT OR REPLACE INTO pending_chunks (file_id, chunk_index, recipient_id, sender_id, data, hash, signature, created_at, placed, ttl_seconds, persist) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		pc.FileID, pc.ChunkIndex, pc.RecipientID, pc.SenderID, pc.Data, pc.Hash, pc.Signature, pc.CreatedAt, pc.Placed, pc.TTLSeconds, pc.Persist)
 	return err
 }
 
@@ -15,7 +15,7 @@ func (s *SQLiteStore) GetUnplacedChunks() ([]PendingChunk, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
-		`SELECT file_id, chunk_index, recipient_id, sender_id, data, hash, signature, created_at, placed, ttl_seconds FROM pending_chunks WHERE placed = 0 ORDER BY created_at ASC`)
+		`SELECT file_id, chunk_index, recipient_id, sender_id, data, hash, signature, created_at, placed, ttl_seconds, persist FROM pending_chunks WHERE placed = 0 ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -23,7 +23,7 @@ func (s *SQLiteStore) GetUnplacedChunks() ([]PendingChunk, error) {
 	var chunks []PendingChunk
 	for rows.Next() {
 		var c PendingChunk
-		if err := rows.Scan(&c.FileID, &c.ChunkIndex, &c.RecipientID, &c.SenderID, &c.Data, &c.Hash, &c.Signature, &c.CreatedAt, &c.Placed, &c.TTLSeconds); err != nil {
+		if err := rows.Scan(&c.FileID, &c.ChunkIndex, &c.RecipientID, &c.SenderID, &c.Data, &c.Hash, &c.Signature, &c.CreatedAt, &c.Placed, &c.TTLSeconds, &c.Persist); err != nil {
 			return nil, err
 		}
 		chunks = append(chunks, c)
@@ -42,7 +42,7 @@ func (s *SQLiteStore) GetPendingChunksByMessage(fileID string) ([]PendingChunk, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
-		`SELECT file_id, chunk_index, recipient_id, sender_id, data, hash, signature, created_at, placed, ttl_seconds FROM pending_chunks WHERE file_id = ? ORDER BY chunk_index ASC`, fileID)
+		`SELECT file_id, chunk_index, recipient_id, sender_id, data, hash, signature, created_at, placed, ttl_seconds, persist FROM pending_chunks WHERE file_id = ? ORDER BY chunk_index ASC`, fileID)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +50,7 @@ func (s *SQLiteStore) GetPendingChunksByMessage(fileID string) ([]PendingChunk, 
 	var chunks []PendingChunk
 	for rows.Next() {
 		var c PendingChunk
-		if err := rows.Scan(&c.FileID, &c.ChunkIndex, &c.RecipientID, &c.SenderID, &c.Data, &c.Hash, &c.Signature, &c.CreatedAt, &c.Placed, &c.TTLSeconds); err != nil {
+		if err := rows.Scan(&c.FileID, &c.ChunkIndex, &c.RecipientID, &c.SenderID, &c.Data, &c.Hash, &c.Signature, &c.CreatedAt, &c.Placed, &c.TTLSeconds, &c.Persist); err != nil {
 			return nil, err
 		}
 		chunks = append(chunks, c)
@@ -66,10 +66,5 @@ func (s *SQLiteStore) DeletePendingChunks(fileID string) error {
 }
 
 func (s *SQLiteStore) DeleteExpiredPendingChunks(now time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.db.Exec(
-		"DELETE FROM pending_chunks WHERE CAST((julianday(?) - julianday(created_at)) * 86400 AS INTEGER) > ttl_seconds",
-		now)
-	return err
+	return s.deleteExpiredPayloads("pending_chunks", now)
 }

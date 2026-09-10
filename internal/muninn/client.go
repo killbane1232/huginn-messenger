@@ -141,6 +141,7 @@ type ChunkRecord struct {
 	Confirmed   bool   `json:"confirmed"`
 	Readed      bool   `json:"readed,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
 	TTL         int    `json:"ttl"`
 }
 

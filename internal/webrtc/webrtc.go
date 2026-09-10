@@ -29,7 +29,18 @@ type ChunkStoreRequest struct {
 }
 
 type ChunkStoreBatchRequest struct {
-	Chunks []ChunkStoreRequest `json:"chunks"`
+	RequestID string              `json:"request_id,omitempty"`
+	Chunks    []ChunkStoreRequest `json:"chunks"`
+}
+
+type ChunkStoreAck struct {
+	RequestID string `json:"request_id"`
+	Error     string `json:"error,omitempty"`
+}
+
+type chunkStoreWaiter struct {
+	peerID string
+	result chan ChunkStoreAck
 }
 
 type ChunkGetRequest struct {
@@ -86,6 +97,7 @@ const (
 	MsgTypeChat              = "chat"
 	MsgTypeChunkStore        = "chunk_store"
 	MsgTypeChunkStoreBatch   = "chunk_store_batch"
+	MsgTypeChunkStoreAck     = "chunk_store_ack"
 	MsgTypeChunkGet          = "chunk_get"
 	MsgTypeChunkData         = "chunk_data"
 	MsgTypeReloginRequest    = "relogin_request"
@@ -104,7 +116,9 @@ type Manager struct {
 	negMu             sync.Mutex
 	negotiation       map[string]*sync.Mutex
 	chatMsgChan       chan ChatMessage
-	chunkStore        func(peerID string, req ChunkStoreRequest)
+	chunkStore        func(peerID string, req ChunkStoreRequest) error
+	chunkAckMu        sync.Mutex
+	chunkAcks         map[string]chunkStoreWaiter
 	chunkGet          func(peerID string, req ChunkGetRequest) ([]byte, bool)
 	reloginReq        func(peerID string, req ReloginRequest)
 	reloginResp       func(peerID string, resp ReloginResponse)
@@ -122,7 +136,7 @@ type Manager struct {
 }
 
 func NewManager(localID string, chatMsgChan chan ChatMessage,
-	chunkStore func(peerID string, req ChunkStoreRequest),
+	chunkStore func(peerID string, req ChunkStoreRequest) error,
 	chunkGet func(peerID string, req ChunkGetRequest) ([]byte, bool),
 	reloginReq func(peerID string, req ReloginRequest),
 	reloginResp func(peerID string, resp ReloginResponse),
@@ -142,6 +156,7 @@ func NewManager(localID string, chatMsgChan chan ChatMessage,
 		negotiation:       make(map[string]*sync.Mutex),
 		chatMsgChan:       chatMsgChan,
 		chunkStore:        chunkStore,
+		chunkAcks:         make(map[string]chunkStoreWaiter),
 		chunkGet:          chunkGet,
 		reloginReq:        reloginReq,
 		reloginResp:       reloginResp,
@@ -209,10 +224,12 @@ func (m *Manager) onMessage(remoteID string, msg pion.DataChannelMessage) {
 		}
 		var batch ChunkStoreBatchRequest
 		if json.Unmarshal(env.Data, &batch) == nil {
-			for _, req := range batch.Chunks {
-				req := req
-				m.submitAsync(func() { m.chunkStore(remoteID, req) })
-			}
+			m.submitAsync(func() { m.storeChunkBatch(remoteID, batch) })
+		}
+	case MsgTypeChunkStoreAck:
+		var ack ChunkStoreAck
+		if json.Unmarshal(env.Data, &ack) == nil {
+			m.acceptChunkStoreAck(remoteID, ack)
 		}
 	case MsgTypeChunkGet:
 		if m.chunkGet == nil {

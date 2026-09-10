@@ -8,13 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/killbane1232/huginn-messenger/internal/chunk"
-	"github.com/killbane1232/huginn-messenger/internal/config"
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
-	"github.com/killbane1232/huginn-messenger/internal/store"
-	"github.com/killbane1232/huginn-messenger/internal/webrtc"
 	//"runtime/debug"
 )
 
@@ -47,6 +43,7 @@ func (m *Messenger) processRTCMessages() {
 			jsonData, _ := json.Marshal(cm)
 			if err := m.store.SaveMessage(msg.MsgID, fromKey, fromLogin, cm.ChatID, jsonData, cm.Timestamp); err != nil {
 				log.Printf("save message: %v", err)
+				continue
 			}
 			m.msgSubsMu.Lock()
 			for _, sub := range m.msgSubs {
@@ -62,122 +59,25 @@ func (m *Messenger) processRTCMessages() {
 	}
 }
 
+// SendMessage acknowledges durable local acceptance, not remote delivery.
 func (m *Messenger) SendMessage(to, text string, filePaths []string, ttlSeconds int) error {
-	if !m.async.submit(func() {
-		if err := m.sendMessage(to, text, filePaths, ttlSeconds); err != nil {
-			log.Printf("send message to %s: %v", to, err)
-		}
-	}) {
-		return fmt.Errorf("messenger is shutting down")
+	outgoing, err := m.prepareOutgoing(to, text, filePaths, ttlSeconds)
+	if err != nil {
+		return err
 	}
+	// Queue saturation or shutdown cannot discard an accepted message: the
+	// periodic worker (including after restart) reads the same SQLite outbox.
+	m.async.trySubmit(func() { m.deliverOutgoing(outgoing) })
 	return nil
 }
 
 func (m *Messenger) SendMessageSync(to, text string, filePaths []string, ttlSeconds int) error {
-	result := make(chan error, 1)
-	if !m.async.submit(func() {
-		result <- m.sendMessage(to, text, filePaths, ttlSeconds)
-	}) {
-		return fmt.Errorf("messenger is shutting down")
-	}
-	select {
-	case err := <-result:
+	outgoing, err := m.prepareOutgoing(to, text, filePaths, ttlSeconds)
+	if err != nil {
 		return err
-	case <-m.ctx.Done():
-		return m.ctx.Err()
 	}
-}
-
-func (m *Messenger) sendMessage(to, text string, filePaths []string, ttlSeconds int) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("panic in sendMessageAsync: %v", r)
-			err = fmt.Errorf("panic: %v", r)
-		}
-	}()
-	if ttlSeconds <= 0 {
-		ttlSeconds = config.ChunkTTLSeconds("1w")
-	}
-
-	peer := m.findPeerByKey(to)
-
-	if peer == nil {
-		if gc, err := m.store.GetGroupChat(to); err == nil {
-			peer = &muninn.Peer{
-				ID:            gc.UID,
-				Login:         gc.UID,
-				EncryptionKey: gc.EncPublic,
-				SignatureKey:  gc.SignPublic,
-				IsFake:        true,
-			}
-		}
-	}
-
-	if peer == nil {
-		return fmt.Errorf("peer %s not found", to)
-	}
-
-	var files []FileMeta
-	for _, fp := range filePaths {
-		meta, err := m.sendFileChunks(to, fp, ttlSeconds)
-		if err != nil {
-			return fmt.Errorf("send file %s: %w", fp, err)
-		}
-		files = append(files, *meta)
-	}
-
-	msgID := uuid.New().String()
-	sentAt := time.Now().UTC()
-	chatID := peer.Key()
-	if peer.IsFake && peer.ID != "" {
-		chatID = peer.ID
-	}
-	cm := ChatMessage{
-		From:      m.Username,
-		ChatID:    chatID,
-		Text:      text,
-		Timestamp: sentAt,
-		MsgID:     msgID,
-		Files:     files,
-	}
-	jsonData, _ := json.Marshal(cm)
-	if err := m.store.SaveMessage(msgID, peer.Key(), peer.Login, chatID, jsonData, cm.Timestamp); err != nil {
-		log.Printf("save message: %v", err)
-	}
-	m.msgSubsMu.Lock()
-	for _, sub := range m.msgSubs {
-		select {
-		case sub <- cm:
-		default:
-		}
-	}
-	m.msgSubsMu.Unlock()
-
-	onlinePeerID := peer.ID
-	if onlinePeerID == "" {
-		if p := m.findPeerByKey(to); p != nil {
-			onlinePeerID = p.ID
-		}
-	}
-
-	directDelivery := onlinePeerID != "" && !peer.IsFake && len(files) == 0
-	if directDelivery && !m.IsPeerConnected(onlinePeerID) {
-		if err := m.ConnectPeer(onlinePeerID); err != nil {
-			log.Printf("connect to %s before sending %s: %v", onlinePeerID, msgID, err)
-		} else if !m.waitForPeerConnection(onlinePeerID, peerConnectTimeout) {
-			log.Printf("data channel to %s not ready for %s, using offline delivery", onlinePeerID, msgID)
-		}
-	}
-
-	if directDelivery && m.IsPeerConnected(onlinePeerID) {
-		if err := m.rtcManager.SendMessage(onlinePeerID, text, sentAt, msgID); err != nil {
-			return m.sendOffline(msgID, text, peer, sentAt, ttlSeconds, files)
-		}
-		_ = m.sendOffline(msgID, text, peer, sentAt, ttlSeconds, files)
-		return nil
-	}
-
-	return m.sendOffline(msgID, text, peer, sentAt, ttlSeconds, files)
+	m.deliverOutgoing(outgoing)
+	return nil
 }
 
 func (m *Messenger) waitForPeerConnection(peerID string, timeout time.Duration) bool {
@@ -200,156 +100,6 @@ func (m *Messenger) waitForPeerConnection(peerID string, timeout time.Duration) 
 			}
 		}
 	}
-}
-
-func (m *Messenger) sendOffline(msgID, text string, peer *muninn.Peer, timestamp time.Time, ttlSeconds int, files []FileMeta) error {
-	log.Printf("sendOffline[%s]: start peer.ID=%q peer.Key=%q", msgID, peer.ID, peer.Key())
-
-	payload := MessagePayload{Text: text, Timestamp: timestamp.UTC(), Files: withoutLocalFilePaths(files)}
-	payloadData, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
-	}
-
-	recipientPubKey, err := crypto.DecodeKey(peer.EncryptionKey)
-	if err != nil {
-		return fmt.Errorf("decode recipient enc key: %w", err)
-	}
-
-	envelopes, err := chunk.SplitAndEncrypt(msgID, m.ID, peer.ID, payloadData, recipientPubKey, m.signPrivate)
-	if err != nil {
-		return fmt.Errorf("split encrypt: %w", err)
-	}
-	log.Printf("sendOffline[%s]: split into %d chunks", msgID, len(envelopes))
-
-	if ttlSeconds <= 0 {
-		ttlSeconds = config.ChunkTTLSeconds("1w")
-	}
-
-	type chunkData struct {
-		envData []byte
-		hash    string
-		sig     string
-	}
-	chunks := make([]chunkData, len(envelopes))
-	for i, env := range envelopes {
-		envData, err := chunk.MarshalEnvelope(env)
-		if err != nil {
-			return fmt.Errorf("marshal env %d: %w", i, err)
-		}
-		if err := m.store.StoreChunk(msgID, i, envData, ttlSeconds); err != nil {
-			return fmt.Errorf("store chunk %d: %w", i, err)
-		}
-		chunkHash := chunk.RegisteredHash(envData)
-		expectedPayload := fmt.Sprintf("muninn/expected/v1\n%s\n%d\n%s", msgID, i, chunkHash)
-		sig := crypto.Sign(m.signPrivate, []byte(expectedPayload))
-		chunks[i] = chunkData{envData, chunkHash, crypto.EncodeKey(sig)}
-	}
-	log.Printf("sendOffline[%s]: stored %d chunks locally", msgID, len(chunks))
-
-	for i := range chunks {
-		if err := m.store.StorePendingChunk(&store.PendingChunk{
-			FileID:      msgID,
-			ChunkIndex:  i,
-			RecipientID: peer.Key(),
-			SenderID:    m.Key,
-			Data:        chunks[i].envData,
-			Hash:        chunks[i].hash,
-			Signature:   chunks[i].sig,
-			CreatedAt:   time.Now(),
-			Placed:      false,
-			TTLSeconds:  ttlSeconds,
-		}); err != nil {
-			log.Printf("store pending chunk %s/%d: %v", msgID, i, err)
-		}
-	}
-	log.Printf("sendOffline[%s]: stored pending chunks", msgID)
-
-	localRegBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
-	for i, c := range chunks {
-		localRegBatch[i] = muninn.RegisterChunkBatchEntry{
-			ChunkIndex: i, SenderID: m.Key, RecipientID: peer.Key(),
-			Hash: c.hash, Signature: c.sig, PeerID: m.ID, TTL: ttlSeconds,
-		}
-	}
-	log.Printf("sendOffline[%s]: registering chunks locally...", msgID)
-	if err := m.muninnClient.RegisterChunks(m.ctx, msgID, muninn.RegisterChunkBatchRequest{Chunks: localRegBatch}); err != nil {
-		log.Printf("register batch %s on self: %v", msgID, err)
-	} else {
-		log.Printf("sendOffline[%s]: registered chunks locally", msgID)
-	}
-
-	log.Printf("sendOffline[%s]: getting best peers...", msgID)
-	onlinePeers, err := m.muninnClient.GetBestPeers(m.ctx, 10)
-	if err != nil {
-		log.Printf("sendOffline[%s]: GetBestPeers failed: %v, fallback to local", msgID, err)
-		onlinePeers = m.getOnlinePeers()
-	}
-	log.Printf("sendOffline[%s]: got %d best peers", msgID, len(onlinePeers))
-
-	storagePeers := []string{}
-	for _, p := range onlinePeers {
-		if p.ID == m.ID || (peer.ID != "" && p.ID == peer.ID) {
-			continue
-		}
-		if !m.IsPeerConnected(p.ID) {
-			m.ConnectPeer(p.ID)
-		}
-		storagePeers = append(storagePeers, p.ID)
-	}
-	log.Printf("sendOffline[%s]: connecting to %d storage peers", msgID, len(storagePeers))
-
-	for i := 0; i < 30 && len(storagePeers) > 0; i++ {
-		time.Sleep(100 * time.Millisecond)
-		allConnected := true
-		for _, pid := range storagePeers {
-			if !m.IsPeerConnected(pid) {
-				allConnected = false
-				break
-			}
-		}
-		if allConnected {
-			break
-		}
-	}
-
-	connected := 0
-	for _, pid := range storagePeers {
-		if !m.IsPeerConnected(pid) {
-			continue
-		}
-		connected++
-
-		batch := make([]webrtc.ChunkStoreRequest, len(chunks))
-		regBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
-		for i, c := range chunks {
-			batch[i] = webrtc.ChunkStoreRequest{
-				FileID: msgID, ChunkIndex: i, Data: c.envData,
-				SenderID: m.Key, RecipientID: peer.Key(), Hash: c.hash,
-				Signature: c.sig, TTLSeconds: ttlSeconds,
-			}
-			regBatch[i] = muninn.RegisterChunkBatchEntry{
-				ChunkIndex: i, SenderID: m.Key, RecipientID: peer.Key(),
-				Hash: c.hash, Signature: c.sig, PeerID: pid, TTL: ttlSeconds,
-			}
-		}
-		log.Printf("sendOffline[%s]: registering chunks on peer %s...", msgID, pid)
-		if err := m.muninnClient.RegisterChunks(m.ctx, msgID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
-			log.Printf("register batch %s on %s: %v", msgID, pid, err)
-			continue
-		}
-		log.Printf("sendOffline[%s]: sending chunk batch to %s...", msgID, pid)
-		if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
-			log.Printf("sendOffline[%s]: send chunk batch to %s: %v", msgID, pid, err)
-			continue
-		}
-		for i := range chunks {
-			m.store.MarkChunkPlaced(msgID, i)
-		}
-		log.Printf("sendOffline[%s]: chunks sent to %s", msgID, pid)
-	}
-	log.Printf("sendOffline[%s]: done, connected=%d/%d", msgID, connected, len(storagePeers))
-	return nil
 }
 
 func (m *Messenger) checkPendingMessages() {
@@ -377,16 +127,21 @@ func (m *Messenger) checkRecipientMessages(recipientID string) {
 		return
 	}
 	log.Printf("check %s: got %d chunk records", recipientID, len(chunks))
-	newLastCheck := int64(0)
+	newLastCheck := lastCheck
+	safeToAdvance := true
 	if len(chunks) > 0 {
 		byMsg := make(map[string][]muninn.ChunkRecord)
 		for _, c := range chunks {
+			updated := c.UpdatedAt
+			if updated == 0 {
+				updated = c.CreatedAt
+			}
+			if updated > newLastCheck {
+				newLastCheck = updated
+			}
 			if m.store.IsChunkFailed(c.FileID, c.ChunkIndex) {
 				log.Printf("check %s: skip failed chunk %s/%d", recipientID, c.FileID, c.ChunkIndex)
 				continue
-			}
-			if c.CreatedAt > newLastCheck {
-				newLastCheck = c.CreatedAt
 			}
 			hasMsg, _ := m.store.FindMessageById(c.FileID)
 			if hasMsg {
@@ -398,11 +153,13 @@ func (m *Messenger) checkRecipientMessages(recipientID string) {
 		}
 		log.Printf("check %s: %d unique messages", recipientID, len(byMsg))
 		for msgID, msgChunks := range byMsg {
-			m.collectAndProcessMessage(msgID, msgChunks)
+			if !m.collectAndProcessMessage(msgID, msgChunks) {
+				safeToAdvance = false
+			}
 		}
 	}
 
-	if newLastCheck > lastCheck {
+	if safeToAdvance && newLastCheck > lastCheck {
 		m.store.SetLastChunkCheck(recipientID, newLastCheck)
 	}
 	m.retryFailedChunks(recipientID)
@@ -425,16 +182,26 @@ func (m *Messenger) releaseProcessMsg(msgID string) {
 	m.processingMu.Unlock()
 }
 
-func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.ChunkRecord) {
+func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.ChunkRecord) (tracked bool) {
+	if len(records) == 0 {
+		return false
+	}
 	if !m.tryProcessMsg(msgID) {
 		return
 	}
 	defer m.releaseProcessMsg(msgID)
 	hasMsg, _ := m.store.FindMessageById(msgID)
 	if hasMsg {
-		log.Printf("collecting %s skipped", msgID)
-		return
+		_ = m.store.DeleteFailedMessage(msgID)
+		return true
 	}
+	// Persist retry state before allowing the directory cursor to move past it.
+	for _, record := range records {
+		if err := m.store.StoreFailedChunk(msgID, record.ChunkIndex, record.RecipientID, record.TTL); err != nil {
+			return false
+		}
+	}
+	tracked = true
 	log.Printf("collecting %s (%d chunk records, persist=%v)", msgID, len(records), len(records) > 0 && records[0].Persist)
 
 	seen := make(map[int]bool)
@@ -455,8 +222,8 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 			m.store.StoreFailedChunk(rec.FileID, rec.ChunkIndex, rec.RecipientID, ttl)
 			continue
 		}
-		m.store.DeleteFailedChunk(rec.FileID, rec.ChunkIndex)
 		if rec.Hash != "" && chunk.RegisteredHash(data) != rec.Hash {
+			_ = m.store.DeleteChunk(rec.FileID, rec.ChunkIndex)
 			log.Printf("hash mismatch for chunk %s/%d: got %s, expected %s",
 				rec.FileID, rec.ChunkIndex, chunk.RegisteredHash(data), rec.Hash)
 			continue
@@ -504,6 +271,7 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 	}
 
 	if records[0].Persist {
+		_ = m.store.DeleteFailedMessage(msgID)
 		log.Printf("file chunks %s ready in store (%d envelopes), waiting for message with decryption key", msgID, len(envelopes))
 		return
 	}
@@ -568,7 +336,9 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 	jsonData, _ := json.Marshal(decryptedMsg)
 	if err := m.store.SaveMessage(msgID, senderPeer.Key(), senderPeer.Login, chatID, jsonData, decryptedMsg.Timestamp); err != nil {
 		log.Printf("save message: %v", err)
+		return
 	}
+	_ = m.store.DeleteFailedMessage(msgID)
 
 	m.msgSubsMu.Lock()
 	for _, sub := range m.msgSubs {
@@ -580,6 +350,7 @@ func (m *Messenger) collectAndProcessMessage(msgID string, records []muninn.Chun
 	m.msgSubsMu.Unlock()
 
 	log.Printf("message %s delivered from %s", msgID, records[0].SenderID)
+	return
 }
 
 func withoutLocalFilePaths(files []FileMeta) []FileMeta {

@@ -162,6 +162,7 @@ type Messenger struct {
 
 	processingMsg map[string]bool
 	processingMu  sync.Mutex
+	deliveryMu    sync.Mutex
 
 	appConfig          *config.Config
 	reloginMu          sync.Mutex
@@ -174,6 +175,9 @@ type Messenger struct {
 	pollSignal         bool
 }
 
+var ErrMuninnAddressRequired = errors.New("Muninn address is required")
+
+// New uses the supplied client, or the saved Muninn address when client is nil.
 func New(username string, muninnClient *muninn.Client, dbPath string, opts ...MessengerOption) (*Messenger, error) {
 	var o messengerOpts
 	for _, opt := range opts {
@@ -236,6 +240,15 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	default:
 		log.Printf("messenger: cfgErr=%v, username=%q", cfgErr, username)
 	}
+	if muninnClient == nil {
+		if appCfg.MuninnAddr == "" {
+			st.Close()
+			return nil, ErrMuninnAddressRequired
+		}
+		muninnClient = muninn.NewClient(appCfg.MuninnAddr)
+	}
+	// An explicit address (for example the bot's ENV) overrides saved settings.
+	appCfg.MuninnAddr = muninnClient.BaseURL()
 	if appCfg.ChunkTTL == "" {
 		appCfg.ChunkTTL = "1w"
 	}
