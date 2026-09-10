@@ -3,8 +3,8 @@ package store
 import (
 	"database/sql"
 	"fmt"
-	"time"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -20,11 +20,12 @@ type PendingChunk struct {
 	CreatedAt   time.Time
 	Placed      bool
 	TTLSeconds  int
+	Persist     bool
 }
 
 type SQLiteStore struct {
 	db *sql.DB
-	mu   sync.Mutex
+	mu sync.Mutex
 }
 
 func New(path string) (*SQLiteStore, error) {

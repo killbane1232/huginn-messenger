@@ -19,7 +19,6 @@ func (m *Messenger) peerRefreshLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			m.replicatePendingChunks()
 			m.checkPendingMessages()
 		case <-m.ctx.Done():
 			return

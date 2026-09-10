@@ -185,22 +185,28 @@ Notification:
 
 ## 5. Отправка сообщения
 
-Публичный `Messenger.SendMessage` не ждёт завершения доставки: задача помещается
-в bounded worker pool из восьми workers и очереди на 128 задач. Синхронный
-вариант `SendMessageSync` используется там, где вызывающей стороне нужен итог
-выполнения.
+`Messenger.SendMessage` сначала проверяет получателя, читает и шифрует вложения
+и текст, затем одной транзакцией сохраняет сообщение, `chunks` и
+`pending_chunks`. Ошибка подготовки или записи возвращается сразу. Успех
+означает приём в устойчивую локальную очередь, а не доставку получателю.
+
+После commit доставка запускается через bounded worker pool из восьми workers
+и очереди на 128 задач. Если pool заполнен, данные остаются в SQLite до
+`pendingChunkLoop`. `SendMessageSync` дополнительно выполняет первую попытку
+сетевой доставки до возврата; сетевой отказ оставляет принятую задачу в очереди.
 
 ```mermaid
 flowchart TB
-    A[SendMessage] --> B[enqueue async task]
-    B --> C[find peer or local group]
-    C --> D[save outgoing message in SQLite]
-    D --> E{Direct text delivery allowed?}
+    A[SendMessage] --> B[find peer or local group]
+    B --> C[read files and encrypt all payloads]
+    C --> D[commit message and pending chunks atomically]
+    D --> Q[return success and schedule delivery]
+    Q --> E{Direct text delivery allowed?}
     E -->|text, direct peer| F[ConnectPeer and wait up to 5 s]
     F --> G{DataChannel open?}
     G -->|yes| H[Send direct WebRTC chat]
-    G -->|no| I[sendOffline]
-    H --> J[sendOffline as delivery fallback]
+    G -->|no| I[distribute durable chunks]
+    H --> I
     E -->|file or group| I
 ```
 
@@ -224,14 +230,16 @@ sequenceDiagram
 
     A->>A: serialize MessagePayload
     A->>A: SplitAndEncrypt, 1 KiB chunks
-    A->>ADB: StoreChunk + StorePendingChunk(placed=false)
+    A->>ADB: QueueOutgoing transaction, placed=false
     A->>M: POST /api/v1/files/{msgID}/chunks
     Note over A,M: metadata for sender itself
     A->>M: GET /api/v1/peers/best?n=10
     M-->>A: ranked peers
-    A->>S: WebRTC chunk_store_batch
     A->>M: POST /api/v1/files/{msgID}/chunks
     Note over A,M: holder peer metadata
+    A->>S: WebRTC chunk_store_batch with request_id
+    S->>S: commit chunks to SQLite
+    S-->>A: chunk_store_ack with matching request_id
     A->>ADB: MarkChunkPlaced
 
     loop recipient polling every 15 s
@@ -256,8 +264,15 @@ muninn/expected/v1
 {normalized_hash}
 ```
 
-Storage-пир перед сохранением может отправить подписанный отчёт о полученном
-чанке. Muninn проверяет отчёт и обновляет quality score source peer.
+Storage-пир проверяет хэш и сохраняет чанк перед ACK. Подписанный отчёт о чанке
+отправляется отдельно: отказ Muninn не отменяет запись и подтверждение.
+Muninn проверяет отчёт и обновляет quality score source peer.
+
+Batch содержит не более 16 чанков. ACK относится к конкретному запросу и пиру;
+ошибка записи или таймаут оставляют данные в очереди. Поле `request_id` и
+сообщение `chunk_store_ack` расширяют WebRTC-протокол без изменения C ABI.
+Старые storage-пиры принимают batch, но не подтверждают его: отправитель
+сохраняет исходные данные и продолжает повторы до TTL.
 
 ## 7. Получение и восстановление
 
@@ -273,8 +288,14 @@ GET /api/v1/recipient/chunks?recipient_id=<key>&date_from=<unix>
 получения полного набора проверяются registered hash и подпись отправителя,
 payload расшифровывается и сохраняется как `ChatMessage`.
 
-`date_from` основан на локальном `last_chunk_check`, но клиент передаёт
-`lastCheck-1`, чтобы не потерять записи с одинаковым Unix timestamp.
+До обработки сообщения ядро записывает его в `failed_chunks`. Запись остаётся
+до успешного сохранения сообщения, включая сбои поиска отправителя, проверки
+подписи, расшифровки и SQLite. Повторы читают полный манифест и переживают
+перезапуск. Если запись повтора не удалась, курсор не сдвигается.
+
+`date_from` основан на локальном `last_chunk_check` по `updated_at` манифеста
+(с fallback на `created_at` для старых серверов). Клиент передаёт `lastCheck-1`,
+чтобы не потерять записи с одинаковым Unix timestamp.
 
 Mark-as-read является отдельной операцией:
 
@@ -287,24 +308,32 @@ payload = "muninn/read/v1\n{file_id}"
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Pending: StorePendingChunk, placed=false
-    Pending --> Placed: batch accepted by storage peer
+    [*] --> Pending: QueueOutgoing, placed=false
+    Pending --> Placed: storage ACK after SQLite commit
     Pending --> Expired: TTL elapsed
     Placed --> Expired: TTL elapsed
     Expired --> [*]: cleanup
 ```
 
 `pendingChunkLoop` каждые десять секунд выбирает неразмещённые чанки, группирует
-их по recipient key, подключается к quality-ranked пирам и отправляет batch.
-Pending-записи не повторяются бесконечно: `chunkCleanupLoop` удаляет истёкшие
-чанки и pending records в соответствии с TTL.
+их по recipient key и повторяет регистрацию своей копии в Muninn независимо от
+наличия других пиров. Затем подключается к quality-ranked пирам и отправляет
+batch. Файловые чанки тоже входят в очередь с `persist=true` и пустым recipient.
+Размещение выполняется одним worker за раз; остальные задачи остаются в SQLite.
+
+`chunkCleanupLoop` удаляет истёкшие чанки и pending records по исходному TTL;
+повтор передаёт только оставшееся время. Наличие исходящего сообщения в истории
+не позволяет удалить его чанки раньше TTL, даже после размещения на другом пире.
+При отсутствии основной копии `GetChunk` восстанавливает данные из pending.
+Миграция 011 сбрасывает старые отметки `placed` и курсоры получения для повторной
+проверки доступных манифестов; сообщения дедуплицируются по `message_uid`.
 
 ## 9. Фоновые процессы
 
 | Процесс | Интервал | Работа |
 |---|---:|---|
 | `heartbeatLoop` | 15 s | Heartbeat endpoint и повторная регистрация при 404 |
-| `peerRefreshLoop` | 15 s | Репликация локальных чанков и поиск входящих сообщений |
+| `peerRefreshLoop` | 15 s | Обновление пиров, поиск и повтор получения сообщений |
 | `signalPollLoop` | 500 ms | HTTP fallback и обработка WebSocket signals |
 | `rtcReconnectLoop` | 5 s | Восстановление signaling WebSocket |
 | `pendingChunkLoop` | 10 s | Размещение `placed=false` чанков |

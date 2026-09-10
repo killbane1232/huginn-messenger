@@ -6,6 +6,7 @@ package main
 import "C"
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -57,6 +58,8 @@ func removeInstance(handle int64) {
 	delete(instances, handle)
 }
 
+// An empty muninnAddr loads the saved address. Returns -4 if none is configured.
+//
 //export messenger_create
 func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass *C.char) C.long {
 	return createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass, "")
@@ -78,9 +81,6 @@ func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser,
 
 	if goUser == "" {
 		return -1
-	}
-	if goMuninn == "" {
-		goMuninn = "https://muninn.evil-bread.ru"
 	}
 	if goDB == "" {
 		goDB = "huginn.db"
@@ -109,7 +109,10 @@ func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser,
 		TurnPassword: goTurnPass,
 	}
 
-	mc := muninn.NewClient(cfg.MuninnAddr)
+	var mc *muninn.Client
+	if cfg.MuninnAddr != "" {
+		mc = muninn.NewClient(cfg.MuninnAddr)
+	}
 
 	mOpts := []messenger.MessengerOption{
 		messenger.WithPeerFlag(peerFlag),
@@ -117,6 +120,9 @@ func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser,
 	}
 	m, err := messenger.New(cfg.Username, mc, cfg.DBPath, mOpts...)
 	if err != nil {
+		if errors.Is(err, messenger.ErrMuninnAddressRequired) {
+			return -4
+		}
 		log.Printf("messenger_create: %v", err)
 		return -2
 	}
@@ -151,9 +157,6 @@ func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser,
 		cfg.TurnAddr = goTurnAddr
 		cfg.TurnUsername = goTurnUser
 		cfg.TurnPassword = goTurnPass
-	}
-	if goMuninn != "" && goMuninn != "https://muninn.evil-bread.ru" {
-		cfg.MuninnAddr = goMuninn
 	}
 	if goTTL != "" && goTTL != "1w" {
 		cfg.ChunkTTL = goTTL
@@ -341,6 +344,9 @@ func messenger_get_messages_paginated(handle C.long, peerID *C.char, limit, offs
 	return C.CString(string(data))
 }
 
+// Success means the message and retry payloads were committed locally.
+// Validation, attachment and database errors are returned before acceptance.
+//
 //export messenger_send_message
 func messenger_send_message(handle C.long, to, text *C.char, ttl C.int) *C.char {
 	inst := getInstance(int64(handle))
@@ -357,6 +363,8 @@ func messenger_send_message(handle C.long, to, text *C.char, ttl C.int) *C.char 
 	return okJSON()
 }
 
+// Success includes durable storage of the encrypted attachment for retry.
+//
 //export messenger_send_file
 func messenger_send_file(handle C.long, to, text, filePath *C.char, ttl C.int) *C.char {
 	inst := getInstance(int64(handle))

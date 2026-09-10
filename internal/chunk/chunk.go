@@ -133,7 +133,7 @@ func AssembleAndDecrypt(envelopes []Envelope, myPrivateKey, myPublicKey []byte, 
 }
 
 func SplitAndEncryptFile(fileID, senderID string, plaintext []byte, aesKey []byte, signKey ed25519.PrivateKey) ([]Envelope, error) {
-	total := (len(plaintext) + ChunkSize - 1) / ChunkSize
+	total := max(1, (len(plaintext)+ChunkSize-1)/ChunkSize)
 	envelopes := make([]Envelope, total)
 
 	for i := 0; i < total; i++ {

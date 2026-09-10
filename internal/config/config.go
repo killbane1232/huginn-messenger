@@ -26,16 +26,18 @@ const configPath = "config.conf"
 
 func Parse() *Config {
 	c := &Config{
-		MuninnAddr: "https://muninn.evil-bread.ru",
-		DBPath:     "huginn.db",
-		ChunkTTL:   "1w",
-		PeerFlag:   "thin",
+		DBPath:   "huginn.db",
+		ChunkTTL: "1w",
+		PeerFlag: "thin",
 	}
 
 	if data, err := os.ReadFile(configPath); err == nil {
 		if err := json.Unmarshal(data, c); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to parse %s: %v\n", configPath, err)
 		}
+	}
+	if addr := strings.TrimSpace(os.Getenv("MUNINN_ADDR")); addr != "" {
+		c.MuninnAddr = addr
 	}
 
 	flag.StringVar(&c.MuninnAddr, "muninn", c.MuninnAddr, "muninn server address")

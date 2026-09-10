@@ -1,19 +1,11 @@
 package messenger
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
-	"io"
 	"log"
-	"os"
-	"path/filepath"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/killbane1232/huginn-messenger/internal/chunk"
-	"github.com/killbane1232/huginn-messenger/internal/config"
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
 	"github.com/killbane1232/huginn-messenger/internal/store"
@@ -21,41 +13,40 @@ import (
 	//"runtime/debug"
 )
 
-func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest) {
-	// Если мы не являемся конечным получателем — сообщаем серверу, что сохранили чанк
-	if req.RecipientID != "" && req.RecipientID != m.Key && req.Hash != "" && req.SenderID != "" {
-		reportedPayload := fmt.Sprintf("muninn/reported/v1\n%s\n%d\n%s\n%s",
-			req.FileID, req.ChunkIndex, req.Hash, peerID)
-		sig := crypto.Sign(m.signPrivate, []byte(reportedPayload))
-		reportReq := muninn.ChunkReportRequest{
-			ReporterID: m.ID,
-			FileID:     req.FileID,
-			ChunkIndex: req.ChunkIndex,
-			Hash:       req.Hash,
-			Signature:  crypto.EncodeKey(sig),
-		}
-		if err := m.muninnClient.ReportChunk(m.ctx, peerID, reportReq); err != nil {
-			log.Printf("report chunk %s/%d failed, not saving: %v", req.FileID, req.ChunkIndex, err)
-			return
-		}
-		log.Printf("reported chunk %s/%d as storage peer", req.FileID, req.ChunkIndex)
+func (m *Messenger) handleChunkStore(peerID string, req webrtc.ChunkStoreRequest) error {
+	if req.Hash != "" && chunk.RegisteredHash(req.Data) != req.Hash {
+		return fmt.Errorf("chunk hash mismatch")
 	}
-
 	ttl := req.TTLSeconds
 	if ttl <= 0 {
 		ttl = 604800
 	}
 	if err := m.store.StoreChunk(req.FileID, req.ChunkIndex, req.Data, ttl); err != nil {
-		log.Printf("store chunk %s/%d: %v", req.FileID, req.ChunkIndex, err)
-		return
+		return err
 	}
-	log.Printf("stored chunk %s/%d from %s", req.FileID, req.ChunkIndex, peerID)
+	// A quality-report outage must neither discard data nor prevent the ACK
+	// for data that is already safely stored.
+	if req.RecipientID != "" && req.RecipientID != m.Key && req.Hash != "" && req.SenderID != "" {
+		report := func() {
+			payload := fmt.Sprintf("muninn/reported/v1\n%s\n%d\n%s\n%s", req.FileID, req.ChunkIndex, req.Hash, peerID)
+			request := muninn.ChunkReportRequest{ReporterID: m.ID, FileID: req.FileID, ChunkIndex: req.ChunkIndex, Hash: req.Hash, Signature: crypto.EncodeKey(crypto.Sign(m.signPrivate, []byte(payload)))}
+			if err := m.muninnClient.ReportChunk(m.ctx, peerID, request); err != nil {
+				log.Printf("chunk %s/%d retained despite report failure", req.FileID, req.ChunkIndex)
+			}
+		}
+		if m.async != nil {
+			m.async.trySubmit(report)
+		} else {
+			report()
+		}
+	}
 	m.pendingMu.Lock()
 	_, waitingForFile := m.pendingFileDownloads[req.FileID]
 	m.pendingMu.Unlock()
-	if waitingForFile {
+	if waitingForFile && m.async != nil {
 		m.async.trySubmit(m.checkPendingFileDownloads)
 	}
+	return nil
 }
 
 func (m *Messenger) handleChunkGet(peerID string, req webrtc.ChunkGetRequest) ([]byte, bool) {
@@ -106,287 +97,6 @@ func (m *Messenger) chunkCleanupLoop() {
 	}
 }
 
-func (m *Messenger) distributePendingChunks() {
-	chunks, err := m.store.GetUnplacedChunks()
-	if err != nil {
-		log.Printf("get unplaced chunks: %v", err)
-		return
-	}
-	if len(chunks) == 0 {
-		return
-	}
-
-	byRecipient := make(map[string][]store.PendingChunk)
-	for _, c := range chunks {
-		if byRecipient[c.RecipientID] == nil {
-			byRecipient[c.RecipientID] = []store.PendingChunk{}
-		}
-		byRecipient[c.RecipientID] = append(byRecipient[c.RecipientID], c)
-	}
-
-	for recipientID, recipientChunks := range byRecipient {
-		m.distributeChunksForRecipient(recipientID, recipientChunks)
-	}
-}
-
-func (m *Messenger) distributeChunksForRecipient(recipientID string, chunks []store.PendingChunk) {
-	onlinePeers, err := m.muninnClient.GetBestPeers(m.ctx, 10)
-	if err != nil {
-		onlinePeers = m.getOnlinePeers()
-	}
-
-	// Подключаем пиры
-	var storagePeers []string
-	for _, p := range onlinePeers {
-		if p.ID == m.ID || p.Key() == recipientID {
-			continue
-		}
-		if !m.IsPeerConnected(p.ID) {
-			m.ConnectPeer(p.ID)
-		}
-		storagePeers = append(storagePeers, p.ID)
-	}
-
-	if len(storagePeers) == 0 {
-		return
-	}
-
-	for i := 0; i < 30 && len(storagePeers) > 0; i++ {
-		time.Sleep(100 * time.Millisecond)
-		allConnected := true
-		for _, pid := range storagePeers {
-			if !m.IsPeerConnected(pid) {
-				allConnected = false
-				break
-			}
-		}
-		if allConnected {
-			break
-		}
-	}
-
-	byPeer := make(map[string][]store.PendingChunk)
-	for i, c := range chunks {
-		pid := storagePeers[i%len(storagePeers)]
-		byPeer[pid] = append(byPeer[pid], c)
-	}
-
-	for pid, peerChunks := range byPeer {
-		if !m.IsPeerConnected(pid) {
-			continue
-		}
-
-		byFile := make(map[string][]store.PendingChunk)
-		for _, c := range peerChunks {
-			byFile[c.FileID] = append(byFile[c.FileID], c)
-		}
-
-		for fileID, fileChunks := range byFile {
-			ttlSeconds := fileChunks[0].TTLSeconds
-			batch := make([]webrtc.ChunkStoreRequest, len(fileChunks))
-			regBatch := make([]muninn.RegisterChunkBatchEntry, len(fileChunks))
-			for i, c := range fileChunks {
-				batch[i] = webrtc.ChunkStoreRequest{
-					FileID: c.FileID, ChunkIndex: c.ChunkIndex, Data: c.Data,
-					SenderID: c.SenderID, RecipientID: c.RecipientID, Hash: c.Hash,
-					Signature: c.Signature, TTLSeconds: ttlSeconds,
-				}
-				regBatch[i] = muninn.RegisterChunkBatchEntry{
-					ChunkIndex: c.ChunkIndex, SenderID: c.SenderID, RecipientID: c.RecipientID,
-					Hash: c.Hash, Signature: c.Signature, PeerID: pid, TTL: ttlSeconds,
-				}
-			}
-
-			if err := m.muninnClient.RegisterChunks(m.ctx, fileID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
-				log.Printf("register batch %s on %s: %v", fileID, pid, err)
-				continue
-			}
-
-			if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
-				log.Printf("distribute batch %s to %s: %v", fileID, pid, err)
-				continue
-			}
-
-			for _, c := range fileChunks {
-				if err := m.store.MarkChunkPlaced(c.FileID, c.ChunkIndex); err != nil {
-					log.Printf("mark chunk placed %s/%d: %v", c.FileID, c.ChunkIndex, err)
-				}
-			}
-		}
-	}
-}
-
-func (m *Messenger) replicatePendingChunks() {
-	return
-	fileIDs, err := m.store.ListChunkFiles()
-	if err != nil {
-		log.Printf("list chunk files: %v", err)
-		return
-	}
-	if len(fileIDs) == 0 {
-		return
-	}
-
-	peers := m.getConnectedPeers()
-	if len(peers) == 0 {
-		return
-	}
-
-	for _, fileID := range fileIDs {
-		chunkMap, err := m.store.ListChunks(fileID)
-		if err != nil {
-			continue
-		}
-		for _, peer := range peers {
-			batch := make([]webrtc.ChunkStoreRequest, 0, len(chunkMap))
-			for idx, data := range chunkMap {
-				batch = append(batch, webrtc.ChunkStoreRequest{
-					FileID: fileID, ChunkIndex: idx, Data: data, TTLSeconds: 604800,
-				})
-			}
-			if len(batch) == 0 {
-				continue
-			}
-			if err := m.rtcManager.SendChunkStoreBatch(peer.ID, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
-				log.Printf("replicate chunks %s to %s: %v", fileID, peer.ID, err)
-				m.DisconnectPeer(peer.ID)
-			}
-		}
-	}
-}
-
-func (m *Messenger) sendFileChunks(recipientID, filePath string, ttlSeconds int) (*FileMeta, error) {
-	filedata, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("read file: %w", err)
-	}
-
-	fileID := uuid.New().String()
-	filename := filepath.Base(filePath)
-
-	aesKey := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, aesKey); err != nil {
-		return nil, fmt.Errorf("generate file key: %w", err)
-	}
-	fileHash := sha256.Sum256(filedata)
-	fileHashB64 := base64.StdEncoding.EncodeToString(fileHash[:])
-
-	envelopes, err := chunk.SplitAndEncryptFile(fileID, m.ID, filedata, aesKey, m.signPrivate)
-	if err != nil {
-		return nil, fmt.Errorf("split encrypt file: %w", err)
-	}
-
-	if ttlSeconds <= 0 {
-		ttlSeconds = config.ChunkTTLSeconds("1w")
-	}
-
-	type fileChunkData struct {
-		envData []byte
-		hash    string
-		sig     string
-	}
-	chunks := make([]fileChunkData, len(envelopes))
-	for i, env := range envelopes {
-		envData, err := chunk.MarshalEnvelope(env)
-		if err != nil {
-			return nil, fmt.Errorf("marshal file env %d: %w", i, err)
-		}
-		if err := m.store.StoreChunk(fileID, i, envData, ttlSeconds); err != nil {
-			return nil, fmt.Errorf("store file chunk %d: %w", i, err)
-		}
-		chunkHash := chunk.RegisteredHash(envData)
-		expectedPayload := fmt.Sprintf("muninn/expected/v1\n%s\n%d\n%s", fileID, i, chunkHash)
-		sig := crypto.Sign(m.signPrivate, []byte(expectedPayload))
-		chunks[i] = fileChunkData{envData, chunkHash, crypto.EncodeKey(sig)}
-	}
-
-	thickPeers, err := m.muninnClient.GetBestThickPeers(m.ctx, 5)
-	if err != nil {
-		log.Printf("get best thick peers: %v, fallback to best peers", err)
-		allPeers, err2 := m.muninnClient.GetBestPeers(m.ctx, 5)
-		if err2 != nil {
-			thickPeers = m.getOnlinePeers()
-		} else {
-			thickPeers = allPeers
-		}
-	}
-
-	storagePeers := []string{}
-	for _, p := range thickPeers {
-		if p.ID == m.ID {
-			continue
-		}
-		if !m.IsPeerConnected(p.ID) {
-			m.ConnectPeer(p.ID)
-		}
-		storagePeers = append(storagePeers, p.ID)
-	}
-
-	for i := 0; i < 30 && len(storagePeers) > 0; i++ {
-		time.Sleep(100 * time.Millisecond)
-		allConnected := true
-		for _, pid := range storagePeers {
-			if !m.IsPeerConnected(pid) {
-				allConnected = false
-				break
-			}
-		}
-		if allConnected {
-			break
-		}
-	}
-
-	for _, pid := range storagePeers {
-		if !m.IsPeerConnected(pid) {
-			continue
-		}
-
-		batch := make([]webrtc.ChunkStoreRequest, len(chunks))
-		regBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
-		for i, c := range chunks {
-			batch[i] = webrtc.ChunkStoreRequest{
-				FileID: fileID, ChunkIndex: i, Data: c.envData,
-				SenderID: m.Key, Hash: c.hash, Signature: c.sig,
-				TTLSeconds: ttlSeconds,
-			}
-			regBatch[i] = muninn.RegisterChunkBatchEntry{
-				ChunkIndex: i, SenderID: m.Key, Hash: c.hash,
-				Signature: c.sig, PeerID: pid, Persist: true, TTL: ttlSeconds,
-			}
-		}
-
-		if err := m.muninnClient.RegisterChunks(m.ctx, fileID, muninn.RegisterChunkBatchRequest{Chunks: regBatch}); err != nil {
-			log.Printf("register file chunks %s on %s: %v", fileID, pid, err)
-			continue
-		}
-
-		if err := m.rtcManager.SendChunkStoreBatch(pid, webrtc.ChunkStoreBatchRequest{Chunks: batch}); err != nil {
-			log.Printf("distribute file chunks %s to %s: %v", fileID, pid, err)
-		}
-	}
-
-	localRegBatch := make([]muninn.RegisterChunkBatchEntry, len(chunks))
-	for i, c := range chunks {
-		localRegBatch[i] = muninn.RegisterChunkBatchEntry{
-			ChunkIndex: i, SenderID: m.Key,
-			Hash: c.hash, Signature: c.sig, PeerID: m.ID, Persist: true, TTL: ttlSeconds,
-		}
-	}
-	if err := m.muninnClient.RegisterChunks(m.ctx, fileID, muninn.RegisterChunkBatchRequest{Chunks: localRegBatch}); err != nil {
-		log.Printf("register file chunks %s on self: %v", fileID, err)
-	}
-
-	log.Printf("file %s sent as %s (%d chunks)", filename, fileID, len(chunks))
-	return &FileMeta{
-		FileID:        fileID,
-		FileHash:      fileHashB64,
-		DecryptionKey: crypto.EncodeKey(aesKey),
-		TotalChunks:   len(chunks),
-		Filename:      filename,
-		FilePath:      filePath,
-	}, nil
-}
-
 func (m *Messenger) retryFailedChunks(recipientID string) {
 	failed, err := m.store.ListFailedChunks(recipientID)
 	if err != nil || len(failed) == 0 {
@@ -411,25 +121,9 @@ func (m *Messenger) retryFailedChunks(recipientID string) {
 			continue
 		}
 
-		allOk := true
-		for _, rec := range records {
-			if !m.store.IsChunkFailed(rec.FileID, rec.ChunkIndex) {
-				continue
-			}
-			data, ok := m.getChunkData(rec)
-			if !ok {
-				allOk = false
-				continue
-			}
-			if rec.Hash != "" && chunk.RegisteredHash(data) != rec.Hash {
-				allOk = false
-				continue
-			}
-			m.store.DeleteFailedChunk(rec.FileID, rec.ChunkIndex)
-		}
-		if allOk {
-			m.collectAndProcessMessage(fc.FileID, records)
-		}
+		// Keep the retry record through validation, sender lookup, decryption,
+		// and the message transaction. Receiving bytes alone is not delivery.
+		m.collectAndProcessMessage(fc.FileID, records)
 	}
 }
 

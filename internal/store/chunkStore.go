@@ -21,7 +21,13 @@ func (s *SQLiteStore) GetChunk(fileID string, chunkIndex int) ([]byte, error) {
 	err := s.db.QueryRow("SELECT data FROM chunks WHERE file_id = ? AND chunk_index = ?",
 		fileID, chunkIndex).Scan(&data)
 	if err == sql.ErrNoRows {
-		return nil, nil
+		// Recover outgoing payloads removed by older housekeeping code.
+		var created time.Time
+		var ttl int
+		err = s.db.QueryRow("SELECT data, created_at, ttl_seconds FROM pending_chunks WHERE file_id = ? AND chunk_index = ?", fileID, chunkIndex).Scan(&data, &created, &ttl)
+		if err == sql.ErrNoRows || (err == nil && !time.Now().Before(created.Add(time.Duration(ttl)*time.Second))) {
+			return nil, nil
+		}
 	}
 	return data, err
 }
@@ -73,23 +79,20 @@ func (s *SQLiteStore) ListChunks(fileID string) (map[int][]byte, error) {
 }
 
 func (s *SQLiteStore) DeleteExpiredChunks(now time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.db.Exec(`
-		DELETE FROM chunks 
-		WHERE created_at is not null
-			and ttl_seconds is not null
-			and ttl_seconds <> 0
-			and CAST((julianday(?) - julianday(created_at)) * 86400 AS INTEGER) > ttl_seconds
-		`,
-		now)
-	return err
+	return s.deleteExpiredPayloads("chunks", now)
 }
 
 func (s *SQLiteStore) DeleteChunksWithMessage() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
-		"DELETE FROM chunks WHERE file_id IN (SELECT message_uid FROM messages)")
+		`DELETE FROM chunks WHERE file_id IN (SELECT message_uid FROM messages)
+		 AND file_id NOT IN (SELECT file_id FROM pending_chunks)`)
+	return err
+}
+func (s *SQLiteStore) DeleteChunk(fileID string, index int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("DELETE FROM chunks WHERE file_id = ? AND chunk_index = ?", fileID, index)
 	return err
 }
