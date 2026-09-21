@@ -554,6 +554,32 @@ func messenger_apply_relogin_signature(handle C.long, signature *C.char) *C.char
 	return okJSON()
 }
 
+//export messenger_get_file_downloads
+func messenger_get_file_downloads(handle C.long) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	downloads, err := inst.m.GetFileDownloads()
+	if err != nil {
+		return errorJSON(err.Error())
+	}
+	data, _ := json.Marshal(downloads)
+	return C.CString(string(data))
+}
+
+//export messenger_cancel_file_download
+func messenger_cancel_file_download(handle C.long, fileID *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	if err := inst.m.CancelFileDownload(C.GoString(fileID)); err != nil {
+		return errorJSON(err.Error())
+	}
+	return okJSON()
+}
+
 //export messenger_set_downloads_dir
 func messenger_set_downloads_dir(handle C.long, dir *C.char) *C.char {
 	inst := getInstance(int64(handle))

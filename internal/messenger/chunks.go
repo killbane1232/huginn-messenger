@@ -1,6 +1,7 @@
 package messenger
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -134,6 +135,10 @@ func (m *Messenger) deleteChunksAndReturn(msgID string) {
 }
 
 func (m *Messenger) requestMissingChunk(fileID string, chunkIndex int, senderID string) {
+	m.requestMissingChunkWithContext(m.ctx, fileID, chunkIndex, senderID)
+}
+
+func (m *Messenger) requestMissingChunkWithContext(ctx context.Context, fileID string, chunkIndex int, senderID string) {
 	targets := []string{}
 	p := m.findPeerByKey(senderID)
 	if p == nil {
@@ -141,12 +146,18 @@ func (m *Messenger) requestMissingChunk(fileID string, chunkIndex int, senderID 
 	}
 	targets = p.IDS
 	for _, pid := range targets {
+		if ctx.Err() != nil {
+			return
+		}
 		if m.IsPeerConnected(pid) {
 			m.rtcManager.SendChunkGet(pid, webrtc.ChunkGetRequest{
 				FileID: fileID, ChunkIndex: chunkIndex,
 			})
 		} else if pid == senderID {
 			m.async.trySubmit(func() {
+				if ctx.Err() != nil {
+					return
+				}
 				if err := m.ConnectPeer(pid); err != nil {
 					log.Printf("connect to %s for missing chunk: %v", pid, err)
 				}
@@ -155,20 +166,26 @@ func (m *Messenger) requestMissingChunk(fileID string, chunkIndex int, senderID 
 	}
 }
 
-func (m *Messenger) requestMissingChunkFromPeer(fileID string, chunkIndex int, senderID, preferredPeerID string) {
+func (m *Messenger) requestMissingChunkFromPeer(ctx context.Context, fileID string, chunkIndex int, senderID, preferredPeerID string) {
+	if ctx.Err() != nil {
+		return
+	}
 	if preferredPeerID != "" && m.IsPeerConnected(preferredPeerID) {
 		_ = m.rtcManager.SendChunkGet(preferredPeerID, webrtc.ChunkGetRequest{
 			FileID: fileID, ChunkIndex: chunkIndex,
 		})
 	} else if preferredPeerID != "" && chunkIndex == 0 {
 		m.async.trySubmit(func() {
+			if ctx.Err() != nil {
+				return
+			}
 			if err := m.ConnectPeer(preferredPeerID); err != nil {
 				log.Printf("connect to relogin source %s for file %s: %v", preferredPeerID, fileID, err)
 				return
 			}
 			for attempt := 0; attempt < 50; attempt++ {
 				select {
-				case <-m.ctx.Done():
+				case <-ctx.Done():
 					return
 				case <-time.After(100 * time.Millisecond):
 				}
@@ -182,8 +199,8 @@ func (m *Messenger) requestMissingChunkFromPeer(fileID string, chunkIndex int, s
 		})
 	}
 
-	m.requestMissingChunk(fileID, chunkIndex, senderID)
-	records, err := m.muninnClient.GetChunksByFileID(m.ctx, fileID)
+	m.requestMissingChunkWithContext(ctx, fileID, chunkIndex, senderID)
+	records, err := m.muninnClient.GetChunksByFileID(ctx, fileID)
 	if err != nil {
 		return
 	}
@@ -191,13 +208,20 @@ func (m *Messenger) requestMissingChunkFromPeer(fileID string, chunkIndex int, s
 		if record.ChunkIndex != chunkIndex {
 			continue
 		}
-		if _, ok := m.getChunkData(record); ok {
+		if _, ok := m.getChunkDataWithContext(ctx, record); ok {
 			return
 		}
 	}
 }
 
 func (m *Messenger) getChunkData(rec muninn.ChunkRecord) ([]byte, bool) {
+	return m.getChunkDataWithContext(m.ctx, rec)
+}
+
+func (m *Messenger) getChunkDataWithContext(ctx context.Context, rec muninn.ChunkRecord) ([]byte, bool) {
+	if ctx.Err() != nil {
+		return nil, false
+	}
 	data, err := m.store.GetChunk(rec.FileID, rec.ChunkIndex)
 	if err == nil && data != nil {
 		return data, true
@@ -218,7 +242,7 @@ func (m *Messenger) getChunkData(rec muninn.ChunkRecord) ([]byte, bool) {
 		m.async.trySubmit(func() {
 			for i := 0; i < 50; i++ {
 				select {
-				case <-m.ctx.Done():
+				case <-ctx.Done():
 					return
 				case <-time.After(100 * time.Millisecond):
 				}

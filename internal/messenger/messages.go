@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -388,6 +389,7 @@ func (m *Messenger) GetMessages(peerID string) []ChatMessage {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+		m.restoreDownloadedFilePaths(&msg)
 		result = append(result, msg)
 	}
 	return result
@@ -404,9 +406,28 @@ func (m *Messenger) GetMessagesDesc(peerID string, limit, offset int) []ChatMess
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+		m.restoreDownloadedFilePaths(&msg)
 		result = append(result, msg)
 	}
 	return result
+}
+
+// Download paths belong to this device, so resolve them from file_downloads
+// when reading history instead of depending on a transient file_ready event.
+func (m *Messenger) restoreDownloadedFilePaths(msg *ChatMessage) {
+	for i := range msg.Files {
+		file := &msg.Files[i]
+		if file.FilePath != "" {
+			continue // Keep the original path of outgoing attachments.
+		}
+		state, err := m.store.GetFileDownload(file.FileID)
+		if err != nil || state.CompletedAt == nil || state.LocalPath == "" {
+			continue
+		}
+		if info, err := os.Stat(state.LocalPath); err == nil && info.Mode().IsRegular() {
+			file.FilePath = state.LocalPath
+		}
+	}
 }
 
 func (m *Messenger) SubscribeMessages() chan ChatMessage {

@@ -263,7 +263,7 @@ func (m *Messenger) reloadReplicatedPeers() {
 	m.subsMu.Unlock()
 }
 
-func (m *Messenger) queueReplicatedFiles(messages []store.ReplicatedMessage, sourcePeerID, sourceUsername string) {
+func (m *Messenger) queueFileDownloads(messages []store.ReplicatedMessage, sourcePeerID, sourceUsername string) {
 	for _, record := range messages {
 		var message ChatMessage
 		if err := json.Unmarshal(record.Data, &message); err != nil {
@@ -274,7 +274,7 @@ func (m *Messenger) queueReplicatedFiles(messages []store.ReplicatedMessage, sou
 			senderID = m.Key
 		}
 		for _, file := range message.Files {
-			if file.FileID == "" || file.TotalChunks <= 0 {
+			if file.FileID == "" || file.TotalChunks <= 0 || file.FilePath != "" {
 				continue
 			}
 			file := file
@@ -282,9 +282,8 @@ func (m *Messenger) queueReplicatedFiles(messages []store.ReplicatedMessage, sou
 			if preferredPeerID == "" {
 				preferredPeerID = sourcePeerID
 			}
-			if preferredPeerID == "" {
-				continue
-			}
+			// Ordinary received files have no replication source. They still
+			// resume through the sender and Muninn's stored chunk locations.
 			m.pendingMu.Lock()
 			m.pendingFileDownloads[file.FileID] = &pendingFileDownload{
 				fileMeta:        file,
@@ -299,11 +298,11 @@ func (m *Messenger) queueReplicatedFiles(messages []store.ReplicatedMessage, sou
 	}
 }
 
-func (m *Messenger) resumeReplicatedFileDownloads() {
+func (m *Messenger) resumeFileDownloads() {
 	snapshot, err := m.store.ExportReplicationSnapshot()
 	if err != nil {
-		log.Printf("resume replicated file downloads: %v", err)
+		log.Printf("resume file downloads: %v", err)
 		return
 	}
-	m.queueReplicatedFiles(snapshot.Messages, "", m.Username)
+	m.queueFileDownloads(snapshot.Messages, "", m.Username)
 }

@@ -136,7 +136,7 @@ func (m *Messenger) ApplyReloginSignature(signature string) error {
 
 	m.reloadReplicatedPeers()
 	if result.snapshot.Version == reloginSnapshotVersion {
-		m.queueReplicatedFiles(result.snapshot.Messages, peerID, peerUsername)
+		m.queueFileDownloads(result.snapshot.Messages, peerID, peerUsername)
 	}
 	return nil
 }

@@ -159,6 +159,8 @@ type Messenger struct {
 
 	pendingFileDownloads map[string]*pendingFileDownload
 	pendingMu            sync.Mutex
+	downloadMu           sync.Mutex
+	downloadContexts     map[string]fileDownloadContext
 
 	processingMsg map[string]bool
 	processingMu  sync.Mutex
@@ -360,7 +362,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	m.startBackground(m.pendingChunkLoop)
 	m.startBackground(m.fileDownloadLoop)
 	m.startBackground(m.chunkCleanupLoop)
-	m.async.trySubmit(m.resumeReplicatedFileDownloads)
+	m.async.trySubmit(m.resumeFileDownloads)
 
 	return m, nil
 }
@@ -470,6 +472,11 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 	defer m.releaseProcessMsg("file:" + f.FileID)
 	state, proceed := m.prepareFileDownload(f, senderID)
 	if !proceed {
+		m.endFileDownload(f.FileID)
+		return
+	}
+	ctx, err := m.beginFileDownload(f.FileID)
+	if err != nil {
 		return
 	}
 	chunkMap, err := m.store.ListChunks(f.FileID)
@@ -487,10 +494,15 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 				log.Printf("file %s download expired after %s; stopping with %d/%d chunks", f.FileID, fileDownloadTTL, len(chunkMap), f.TotalChunks)
 			}
 			m.removePendingFileDownload(f.FileID)
+			m.endFileDownload(f.FileID)
 			return
 		}
 		log.Printf("file %s: have %d/%d chunks, requesting missing from peers", f.FileID, len(chunkMap), f.TotalChunks)
 		m.pendingMu.Lock()
+		if ctx.Err() != nil {
+			m.pendingMu.Unlock()
+			return
+		}
 		m.pendingFileDownloads[f.FileID] = &pendingFileDownload{
 			fileMeta:        f,
 			senderID:        senderID,
@@ -498,8 +510,11 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 		}
 		m.pendingMu.Unlock()
 		for i := 0; i < f.TotalChunks; i++ {
+			if ctx.Err() != nil {
+				return
+			}
 			if _, ok := chunkMap[i]; !ok {
-				m.requestMissingChunkFromPeer(f.FileID, i, senderID, preferredPeerID)
+				m.requestMissingChunkFromPeer(ctx, f.FileID, i, senderID, preferredPeerID)
 			}
 		}
 		return
@@ -519,6 +534,9 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 	envelopes := make([]chunk.Envelope, f.TotalChunks)
 	envelopes[0] = env0
 	for i := 1; i < f.TotalChunks; i++ {
+		if ctx.Err() != nil {
+			return
+		}
 		data, ok := chunkMap[i]
 		if !ok {
 			log.Printf("missing chunk %d/%d for file %s", i, f.TotalChunks, f.FileID)
@@ -572,15 +590,13 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 		outputName = f.FileID
 	}
 	fp := filepath.Join(m.downloadsDir, outputName)
-	if err := os.WriteFile(fp, plaintext, 0644); err != nil {
+	if err := m.completeFileDownload(ctx, f.FileID, fp, plaintext); err != nil {
 		log.Printf("save file %s: %v", fp, err)
 		return
 	}
 	log.Printf("file saved: %s (%d bytes)", fp, len(plaintext))
 
-	if err := m.store.MarkFileDownloadCompleted(f.FileID, fp, time.Now()); err != nil {
-		log.Printf("persist completed file %s: %v", f.FileID, err)
-	}
+	m.endFileDownload(f.FileID)
 	m.removePendingFileDownload(f.FileID)
 
 	m.notifyFileReady(FileReadyEvent{
@@ -592,10 +608,14 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 }
 
 func (m *Messenger) prepareFileDownload(f FileMeta, senderID string) (store.FileDownloadState, bool) {
-	state, err := m.store.EnsureFileDownload(f.FileID, time.Now(), fileDownloadTTL)
+	state, err := m.store.TrackFileDownload(f.FileID, f.Filename, f.TotalChunks, time.Now(), fileDownloadTTL)
 	if err != nil {
 		log.Printf("track file download %s: %v", f.FileID, err)
 		return store.FileDownloadState{}, false
+	}
+	if state.CancelledAt != nil {
+		m.removePendingFileDownload(f.FileID)
+		return state, false
 	}
 
 	if state.CompletedAt != nil {
