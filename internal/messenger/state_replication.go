@@ -373,7 +373,7 @@ func (m *Messenger) finishStateSyncImport(peerID string, transfer *stateSyncInco
 		return
 	}
 	if len(inserted) > 0 {
-		m.queueReplicatedFiles(inserted, peerID, m.Username)
+		m.queueFileDownloads(inserted, peerID, m.Username)
 	}
 
 	m.clearIncomingStateSync(peerID, transfer)
