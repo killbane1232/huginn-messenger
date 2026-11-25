@@ -202,9 +202,16 @@ func (inst *instance) eventLoop() {
 	defer inst.m.UnsubscribePeers(peerCh)
 	defer inst.m.UnsubscribeMessages(msgCh)
 	defer inst.m.UnsubscribeFileReady(fileReadyCh)
+	connectionTick := time.NewTicker(250 * time.Millisecond)
+	defer connectionTick.Stop()
+	lastConnection := ""
+	inst.pushConnectionState(&lastConnection)
 
 	for {
 		select {
+		case <-connectionTick.C:
+			inst.pushConnectionState(&lastConnection)
+
 		case <-peerCh:
 			peers := inst.m.GetPeers()
 			if peers == nil {
@@ -235,10 +242,29 @@ func (inst *instance) eventLoop() {
 	}
 }
 
-func (inst *instance) pushEvent(typ string, data json.RawMessage) {
+// Retry a changed status if the event queue was full, so the UI cannot remain
+// stuck in an old state after a burst of messages. Sampling only reads local
+// WebSocket state; it never probes the server or blocks the UI on network I/O.
+func (inst *instance) pushConnectionState(last *string) {
+	state := "connecting"
+	if inst.m.IsMuninnConnected() {
+		state = "connected"
+	}
+	if state == *last {
+		return
+	}
+	data, _ := json.Marshal(map[string]string{"state": state})
+	if inst.pushEvent("muninn_connection", data) {
+		*last = state
+	}
+}
+
+func (inst *instance) pushEvent(typ string, data json.RawMessage) bool {
 	select {
 	case inst.events <- Event{Type: typ, Data: data}:
+		return true
 	default:
+		return false
 	}
 }
 

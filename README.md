@@ -243,8 +243,14 @@ Muninn, даже если других storage-пиров нет. Копия с�
 ## Flutter UI и real-time события
 
 Flutter-клиент вызывает функции из
-`bridge.go` через Dart FFI и получает события `peers`, `message` и `file_ready`
+`bridge.go` через Dart FFI и получает события `peers`, `message`, `file_ready` и `muninn_connection`
 через `messenger_get_event`.
+
+`muninn_connection` содержит `data.state`: `connecting` или `connected`.
+Bridge отслеживает фактическое состояние signaling WebSocket каждые 250 мс,
+без дополнительных сетевых запросов, и отправляет начальное состояние и его
+изменения. При переполнении очереди отправка актуального состояния повторяется.
+`Messenger.IsMuninnConnected()` позволяет Go-клиентам читать тот же статус.
 
 ## Структура проекта
 
