@@ -5,8 +5,6 @@ import (
 	"log"
 	"time"
 
-	"runtime/debug"
-
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
 	pion "github.com/pion/webrtc/v4"
 )
@@ -78,26 +76,49 @@ func (m *Messenger) handleSignal(sig muninn.Signal) {
 }
 
 func (m *Messenger) rtcReconnectLoop() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	const retryDelay = 5 * time.Second
+	retry := time.NewTimer(0)
+	defer retry.Stop()
+	needsSelection := false // Startup already selected a server.
+	var lastCheck time.Time
 	for {
-		if !m.wsClient.IsConnected() {
-			log.Printf("[ws] attempting to connect to muninn...")
-			if err := m.wsClient.Connect(m.ctx); err != nil {
-				if m.ctx.Err() != nil {
-					return
-				}
-				log.Printf("[ws] connect failed: %v", err)
-				log.Printf("[ws] connect stack:\n%s", debug.Stack())
-			} else {
-				log.Printf("[ws] connected to muninn")
-			}
-		}
-
 		select {
 		case <-m.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-m.wsDisconnected:
+			needsSelection = true
+		case <-retry.C:
+		}
+		if m.ctx.Err() != nil {
+			return
+		}
+		if m.wsClient.IsConnected() {
+			continue // Ignore a delayed disconnect notification after reconnecting.
+		}
+		retry.Stop()
+		if needsSelection {
+			// Bound retries during an outage or rapidly flapping connection.
+			if delay := time.Until(lastCheck.Add(retryDelay)); delay > 0 {
+				retry.Reset(delay)
+				continue
+			}
+			lastCheck = time.Now()
+			m.selectMuninnAfterDisconnect()
+		}
+		if m.ctx.Err() != nil {
+			return
+		}
+		log.Printf("[ws] attempting to connect to muninn...")
+		if err := m.wsClient.Connect(m.ctx); err != nil {
+			if m.ctx.Err() != nil {
+				return
+			}
+			log.Printf("[ws] connect failed: %v", err)
+			needsSelection = true
+			retry.Reset(retryDelay)
+		} else {
+			needsSelection = false
+			log.Printf("[ws] connected to muninn")
 		}
 	}
 }

@@ -22,6 +22,9 @@ func main() {
 		mc = muninn.NewClient(cfg.MuninnAddr)
 	}
 	opts := []messenger.MessengerOption{messenger.WithPeerFlag(muninn.PeerFlag(cfg.PeerFlag))}
+	if cfg.MuninnServers != nil {
+		opts = append(opts, messenger.WithMuninnServers(cfg.MuninnServers))
+	}
 	if cfg.PeerID != "" {
 		opts = append(opts, messenger.WithPeerID(cfg.PeerID))
 	}

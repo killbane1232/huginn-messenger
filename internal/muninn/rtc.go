@@ -62,6 +62,7 @@ type OnSignalFunc func(sig Signal)
 type OnDisconnectFunc func()
 
 type WSClient struct {
+	endpoint  *Client
 	mu        sync.RWMutex
 	connectMu sync.Mutex
 	baseURL   string
@@ -94,6 +95,28 @@ func NewWSClient(baseURL, localID string) *WSClient {
 	}
 }
 
+// NewSelectedWSClient shares the HTTP client's active endpoint and switch lease.
+func NewSelectedWSClient(endpoint *Client, localID string) *WSClient {
+	ws := NewWSClient(endpoint.BaseURL(), localID)
+	ws.endpoint = endpoint
+	endpoint.bind(ws)
+	return ws
+}
+
+// disconnect preserves callbacks and identity so the same WS client can reconnect.
+func (c *WSClient) disconnect() {
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+	c.mu.Lock()
+	conn := c.conn
+	c.conn = nil
+	c.connected = false
+	c.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+}
+
 func (c *WSClient) SetOnSignal(fn OnSignalFunc) {
 	c.mu.Lock()
 	c.onSignal = fn
@@ -107,6 +130,10 @@ func (c *WSClient) SetOnDisconnect(fn OnDisconnectFunc) {
 }
 
 func (c *WSClient) Connect(ctx context.Context) error {
+	if c.endpoint != nil {
+		c.endpoint.endpointMu.RLock()
+		defer c.endpoint.endpointMu.RUnlock()
+	}
 	c.connectMu.Lock()
 	defer c.connectMu.Unlock()
 
@@ -120,7 +147,11 @@ func (c *WSClient) Connect(ctx context.Context) error {
 		return nil
 	}
 
-	u, err := url.Parse(c.baseURL)
+	address := c.baseURL
+	if c.endpoint != nil {
+		address = c.endpoint.baseURL
+	}
+	u, err := url.Parse(address)
 	if err != nil {
 		return fmt.Errorf("parse base url: %w", err)
 	}
@@ -144,6 +175,10 @@ func (c *WSClient) Connect(ctx context.Context) error {
 
 	conn, _, err := dialer.DialContext(ctx, u.String(), header)
 	if err != nil {
+		if c.endpoint != nil {
+			c.endpoint.observe(address, ctx, true)
+			c.endpoint.observeWebSocket(address, ctx, true)
+		}
 		return fmt.Errorf("websocket dial: %w", err)
 	}
 
@@ -156,6 +191,9 @@ func (c *WSClient) Connect(ctx context.Context) error {
 	c.conn = conn
 	c.connected = true
 	c.mu.Unlock()
+	if c.endpoint != nil {
+		c.endpoint.observeWebSocket(address, ctx, false)
+	}
 
 	c.mu.RLock()
 	onDisconnect := c.onDisconnect
@@ -234,6 +272,10 @@ func (c *WSClient) handleNotification(notif rpcNotification) {
 }
 
 func (c *WSClient) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	if c.endpoint != nil {
+		c.endpoint.endpointMu.RLock()
+		defer c.endpoint.endpointMu.RUnlock()
+	}
 	id := uuid.New().String()
 	ch := make(chan wsResponse, 1)
 
@@ -268,9 +310,16 @@ func (c *WSClient) sendRequest(ctx context.Context, method string, params any) (
 	}
 
 	c.writeMu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(rtcRequestTimeout))
 	err = conn.WriteMessage(websocket.TextMessage, data)
 	c.writeMu.Unlock()
 	if err != nil {
+		// A write error leaves Gorilla's connection unusable. Closing it wakes
+		// the reader and its disconnect callback, which starts server selection.
+		conn.Close()
+		if c.endpoint != nil {
+			c.endpoint.observe(c.endpoint.baseURL, ctx, true)
+		}
 		return nil, fmt.Errorf("send: %w", err)
 	}
 
@@ -285,6 +334,9 @@ func (c *WSClient) sendRequest(ctx context.Context, method string, params any) (
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-timer.C:
+		if c.endpoint != nil {
+			c.endpoint.observe(c.endpoint.baseURL, ctx, true)
+		}
 		return nil, fmt.Errorf("rpc timeout")
 	}
 }

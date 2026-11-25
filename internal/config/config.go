@@ -11,15 +11,16 @@ import (
 )
 
 type Config struct {
-	MuninnAddr   string `json:"muninn"`
-	Username     string `json:"username"`
-	PeerID       string `json:"peer_id,omitempty"`
-	DBPath       string `json:"-"`
-	ChunkTTL     string `json:"chunk_ttl"`
-	PeerFlag     string `json:"peer_flag"`
-	TurnAddr     string `json:"turn_addr"`
-	TurnUsername string `json:"turn_user"`
-	TurnPassword string `json:"turn_pass"`
+	MuninnServers []string `json:"muninn_servers,omitempty"`
+	MuninnAddr    string   `json:"muninn"`
+	Username      string   `json:"username"`
+	PeerID        string   `json:"peer_id,omitempty"`
+	DBPath        string   `json:"-"`
+	ChunkTTL      string   `json:"chunk_ttl"`
+	PeerFlag      string   `json:"peer_flag"`
+	TurnAddr      string   `json:"turn_addr"`
+	TurnUsername  string   `json:"turn_user"`
+	TurnPassword  string   `json:"turn_pass"`
 }
 
 const configPath = "config.conf"
@@ -45,7 +46,18 @@ func Parse() *Config {
 	flag.StringVar(&c.DBPath, "db", c.DBPath, "path to SQLite database")
 	flag.StringVar(&c.ChunkTTL, "chunk-ttl", c.ChunkTTL, "chunk TTL (1d, 1w, 1m)")
 	flag.StringVar(&c.PeerFlag, "peer-flag", c.PeerFlag, "peer flag: thin, thick, very_thick")
+	known := strings.Join(c.MuninnServers, ",")
+	if v, ok := os.LookupEnv("MUNINN_SERVERS"); ok {
+		known = v
+	}
+	flag.StringVar(&known, "muninn-servers", known, "comma-separated Muninn mesh discovery hints")
 	flag.Parse()
+	c.MuninnServers = nil
+	for _, address := range strings.Split(known, ",") {
+		if address = strings.TrimSpace(address); address != "" {
+			c.MuninnServers = append(c.MuninnServers, address)
+		}
+	}
 
 	if c.Username == "" {
 		c.Username = uuid.New().String()

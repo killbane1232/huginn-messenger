@@ -128,6 +128,7 @@ func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser,
 	}
 
 	storedCfg := m.Config()
+	cfg.MuninnServers = append([]string(nil), storedCfg.MuninnServers...)
 	if storedCfg.Username != "" {
 		cfg.Username = storedCfg.Username
 	}
@@ -387,15 +388,17 @@ func messenger_get_config(handle C.long) *C.char {
 	if inst == nil {
 		return errorJSON("invalid handle")
 	}
+	cfg := inst.m.Config()
 	resp := map[string]interface{}{
-		"username":  inst.cfg.Username,
-		"peer_id":   inst.cfg.PeerID,
-		"muninn":    inst.cfg.MuninnAddr,
-		"chunk_ttl": inst.cfg.ChunkTTL,
-		"db_path":   inst.cfg.DBPath,
-		"turn_addr": inst.cfg.TurnAddr,
-		"turn_user": inst.cfg.TurnUsername,
-		"turn_pass": inst.cfg.TurnPassword,
+		"muninn_servers": cfg.MuninnServers,
+		"username":       cfg.Username,
+		"peer_id":        cfg.PeerID,
+		"muninn":         cfg.MuninnAddr,
+		"chunk_ttl":      cfg.ChunkTTL,
+		"db_path":        cfg.DBPath,
+		"turn_addr":      cfg.TurnAddr,
+		"turn_user":      cfg.TurnUsername,
+		"turn_pass":      cfg.TurnPassword,
 	}
 	data, _ := json.Marshal(resp)
 	return C.CString(string(data))
@@ -408,41 +411,47 @@ func messenger_save_config(handle C.long, jsonConfig *C.char) *C.char {
 		return errorJSON("invalid handle")
 	}
 	var req struct {
-		Username string `json:"username"`
-		PeerID   string `json:"peer_id"`
-		Muninn   string `json:"muninn"`
-		ChunkTTL string `json:"chunk_ttl"`
-		TurnAddr string `json:"turn_addr"`
-		TurnUser string `json:"turn_user"`
-		TurnPass string `json:"turn_pass"`
+		Username      string    `json:"username"`
+		PeerID        string    `json:"peer_id"`
+		Muninn        string    `json:"muninn"`
+		MuninnServers *[]string `json:"muninn_servers"`
+		ChunkTTL      string    `json:"chunk_ttl"`
+		TurnAddr      string    `json:"turn_addr"`
+		TurnUser      string    `json:"turn_user"`
+		TurnPass      string    `json:"turn_pass"`
 	}
 	if err := json.Unmarshal([]byte(C.GoString(jsonConfig)), &req); err != nil {
 		return errorJSON("bad request: " + err.Error())
 	}
+	cfg := inst.m.Config()
+	if req.MuninnServers != nil {
+		cfg.MuninnServers = append([]string(nil), (*req.MuninnServers)...)
+	}
 	if req.Username != "" {
-		inst.cfg.Username = req.Username
+		cfg.Username = req.Username
 	}
 	if req.PeerID != "" {
-		inst.cfg.PeerID = req.PeerID
+		cfg.PeerID = req.PeerID
 	}
 	if req.Muninn != "" {
-		inst.cfg.MuninnAddr = req.Muninn
+		cfg.MuninnAddr = req.Muninn
 	}
 	if req.ChunkTTL != "" {
-		inst.cfg.ChunkTTL = req.ChunkTTL
+		cfg.ChunkTTL = req.ChunkTTL
 	}
 	if req.TurnAddr != "" {
-		inst.cfg.TurnAddr = req.TurnAddr
+		cfg.TurnAddr = req.TurnAddr
 	}
 	if req.TurnUser != "" {
-		inst.cfg.TurnUsername = req.TurnUser
+		cfg.TurnUsername = req.TurnUser
 	}
 	if req.TurnPass != "" {
-		inst.cfg.TurnPassword = req.TurnPass
+		cfg.TurnPassword = req.TurnPass
 	}
-	if err := inst.m.SaveConfig(inst.cfg); err != nil {
+	if err := inst.m.SaveConfig(cfg); err != nil {
 		return errorJSON("failed to save: " + err.Error())
 	}
+	inst.cfg = inst.m.Config()
 	return okJSON()
 }
 
