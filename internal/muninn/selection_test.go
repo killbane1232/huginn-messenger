@@ -3,6 +3,7 @@ package muninn
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -383,5 +384,27 @@ func TestSuccessfulWebSocketReconnectClearsHandshakeFailure(t *testing.T) {
 	}
 	if changed, err := c.SelectFastest(context.Background()); err != nil || changed {
 		t.Fatalf("successful reconnect left server excluded: %t %v", changed, err)
+	}
+}
+
+func TestNormalizeConfiguredServers(t *testing.T) {
+	servers, err := NormalizeServers([]string{" https://MUNINN.example.:443/ ", "https://muninn.example", "http://[::1]:8080/"})
+	if err != nil || len(servers) != 2 || servers[0] != "https://muninn.example" || servers[1] != "http://[::1]:8080" {
+		t.Fatalf("normalized list: %v, %v", servers, err)
+	}
+	for _, address := range []string{"", "host:8080", "ftp://host", "http://host/path", "http://@host", "http://host?", "http://host#", "http://host:0", "http://host:65536"} {
+		if _, err := NormalizeServers([]string{address}); err == nil {
+			t.Errorf("accepted invalid origin %q", address)
+		}
+	}
+	addresses := make([]string, maxServers+1)
+	for i := range addresses {
+		addresses[i] = fmt.Sprintf("https://server%d.example", i)
+	}
+	if _, err := NormalizeServers(addresses); err == nil {
+		t.Fatal("silently accepted too many candidates")
+	}
+	if _, err := NormalizeServers(addresses[:maxServers]); err != nil {
+		t.Fatal(err)
 	}
 }

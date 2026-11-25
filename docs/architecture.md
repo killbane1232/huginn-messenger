@@ -354,7 +354,7 @@ context, закрывает signaling и WebRTC, ждёт background goroutines 
 
 | Операция | C ABI |
 |---|---|
-| Lifecycle | `messenger_create`, `messenger_destroy` |
+| Lifecycle | `messenger_create_with_config`, legacy `messenger_create` / `messenger_create_with_peer_flag`, `messenger_destroy` |
 | Identity/config | `messenger_get_me`, `messenger_get_config`, `messenger_save_config` |
 | Peers/history | `messenger_get_peers`, `messenger_search_peers`, `messenger_get_messages_paginated` |
 | Send | `messenger_send_message`, `messenger_send_file` |
@@ -640,3 +640,12 @@ crypto.Verify(m.signPublic, challenge, sig) // true только если под
 - **После relogin старые ключи Bob'а теряются.** Если Bob не сохранил их отдельно, он не сможет восстановить свою старую идентичность.
 - **Endpoint peer ID не меняется.** Relogin меняет пользовательский login и криптографические ключи, но сохраняет уникальный ID устройства.
 - **После relogin Flutter пересоздаёт Go-инстанс.** Новый экземпляр регистрируется на Muninn с прежним endpoint `peer_id`, новым login/ключами и возобновляет фоновые загрузки по сохранённым файловым указателям.
+
+### ICE-профили выбранного Muninn
+
+Конфигурация `muninn_ice` содержит локальные STUN/TURN-профили по нормализованному
+origin Muninn. `Messenger.New` выбирает сервер и передаёт его профиль в WebRTC
+manager. При смене Muninn `SetICEServers` атомарно заменяет конфигурацию для новых
+PeerConnection, сохраняя транспорт существующих соединений. Ручное изменение
+профиля в Flutter сохраняет SQLite и пересоздаёт native-инстанс. Профили глубоко
+копируются, удаляются вместе с сервером и не входят в регистрационные запросы.

@@ -25,6 +25,9 @@ func main() {
 	if cfg.MuninnServers != nil {
 		opts = append(opts, messenger.WithMuninnServers(cfg.MuninnServers))
 	}
+	if cfg.MuninnICE != nil {
+		opts = append(opts, messenger.WithMuninnICE(cfg.MuninnICE))
+	}
 	if cfg.PeerID != "" {
 		opts = append(opts, messenger.WithPeerID(cfg.PeerID))
 	}

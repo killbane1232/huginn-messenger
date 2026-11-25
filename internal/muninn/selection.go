@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,12 +75,18 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 
 func canonicalServer(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || strings.Contains(raw, "#") || (u.Path != "" && u.Path != "/") {
 		return "", fmt.Errorf("invalid Muninn origin")
 	}
 	u.Path = ""
 	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	port := u.Port()
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", fmt.Errorf("invalid Muninn port")
+		}
+	}
 	if u.Scheme == "http" && port == "80" || u.Scheme == "https" && port == "443" {
 		port = ""
 	}
@@ -91,6 +98,27 @@ func canonicalServer(raw string) (string, error) {
 		u.Host = host
 	}
 	return u.String(), nil
+}
+
+// NormalizeServers validates the complete configured list before any network
+// traffic or persistence, and rejects overflow instead of dropping servers.
+func NormalizeServers(addresses []string) ([]string, error) {
+	result := []string{}
+	seen := map[string]bool{}
+	for _, raw := range addresses {
+		address, err := canonicalServer(raw)
+		if err != nil {
+			return nil, err
+		}
+		if !seen[address] {
+			result = append(result, address)
+			seen[address] = true
+		}
+	}
+	if len(result) > maxServers {
+		return nil, fmt.Errorf("at most %d Muninn servers are supported", maxServers)
+	}
+	return result, nil
 }
 
 // SetServers accepts only configured/remembered addresses; remote responses do

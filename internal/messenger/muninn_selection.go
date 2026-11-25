@@ -16,12 +16,15 @@ func (m *Messenger) selectMuninnAfterDisconnect() {
 		return
 	}
 	address := m.muninnClient.BaseURL()
-	others := m.muninnClient.OtherServers()
 	m.configMu.Lock()
 	cfg := copyConfig(m.appConfig)
-	cfg.MuninnAddr = address
-	cfg.MuninnServers = others
+	if !selectConfiguredMuninn(cfg, address) {
+		// A manual replacement has been saved and is awaiting recreation.
+		m.configMu.Unlock()
+		return
+	}
 	m.appConfig = cfg
+	m.applyMuninnICE(cfg, address)
 	if err := m.store.SaveAppConfig(cfg); err != nil {
 		log.Printf("save selected Muninn: %v", err)
 	}
