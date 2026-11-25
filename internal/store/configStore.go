@@ -12,15 +12,16 @@ import (
 )
 
 const (
-	ConfigCryptoKeys = "crypto_keys"
-	ConfigUsername   = "username"
-	ConfigMuninn     = "muninn"
-	ConfigPeerID     = "peer_id"
-	ConfigChunkTTL   = "chunk_ttl"
-	ConfigPeerFlag   = "peer_flag"
-	ConfigTurnAddr   = "turn_addr"
-	ConfigTurnUser   = "turn_user"
-	ConfigTurnPass   = "turn_pass"
+	ConfigCryptoKeys    = "crypto_keys"
+	ConfigUsername      = "username"
+	ConfigMuninn        = "muninn"
+	ConfigMuninnServers = "muninn_servers"
+	ConfigPeerID        = "peer_id"
+	ConfigChunkTTL      = "chunk_ttl"
+	ConfigPeerFlag      = "peer_flag"
+	ConfigTurnAddr      = "turn_addr"
+	ConfigTurnUser      = "turn_user"
+	ConfigTurnPass      = "turn_pass"
 )
 
 var ErrConfigNotFound = errors.New("config value not found")
@@ -67,6 +68,12 @@ func (s *SQLiteStore) LoadAppConfig() (*config.Config, error) {
 		cfg.MuninnAddr = v
 		hasValue = true
 	}
+	if v, err := s.GetConfigValue(ConfigMuninnServers); err == nil {
+		if err := json.Unmarshal([]byte(v), &cfg.MuninnServers); err != nil {
+			return nil, fmt.Errorf("parse muninn_servers: %w", err)
+		}
+		hasValue = true
+	}
 	if v, err := s.GetConfigValue(ConfigPeerID); err == nil {
 		cfg.PeerID = v
 		hasValue = true
@@ -110,6 +117,13 @@ func (s *SQLiteStore) SaveAppConfig(cfg *config.Config) error {
 		if err := s.SetConfigValue(ConfigMuninn, cfg.MuninnAddr); err != nil {
 			return err
 		}
+	}
+	servers, err := json.Marshal(cfg.MuninnServers)
+	if err != nil {
+		return err
+	}
+	if err := s.SetConfigValue(ConfigMuninnServers, string(servers)); err != nil {
+		return err
 	}
 	if cfg.PeerID != "" {
 		if err := s.SetConfigValue(ConfigPeerID, cfg.PeerID); err != nil {

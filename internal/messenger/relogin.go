@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/killbane1232/huginn-messenger/internal/config"
 	"github.com/killbane1232/huginn-messenger/internal/crypto"
 	"github.com/killbane1232/huginn-messenger/internal/webrtc"
 	//"runtime/debug"
@@ -125,12 +124,10 @@ func (m *Messenger) ApplyReloginSignature(signature string) error {
 	peerUsername := peer.Login
 	m.Username = peerUsername
 
-	if m.appConfig == nil {
-		m.appConfig = &config.Config{}
-	}
-	m.appConfig.Username = peerUsername
-	m.appConfig.PeerID = targetPeerID
-	if err := m.store.SaveAppConfig(m.appConfig); err != nil {
+	cfg := m.Config()
+	cfg.Username = peerUsername
+	cfg.PeerID = targetPeerID
+	if err := m.SaveConfig(cfg); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
 

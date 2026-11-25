@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,14 +75,16 @@ const (
 )
 
 type messengerOpts struct {
-	iceServers []pion.ICEServer
-	iceSet     bool
-	peerFlag   muninn.PeerFlag
-	turnAddr   string
-	turnUser   string
-	turnPass   string
-	peerID     string
-	pollSignal bool
+	muninnServers    []string
+	muninnServersSet bool
+	iceServers       []pion.ICEServer
+	iceSet           bool
+	peerFlag         muninn.PeerFlag
+	turnAddr         string
+	turnUser         string
+	turnPass         string
+	peerID           string
+	pollSignal       bool
 }
 
 func WithICEServers(servers []pion.ICEServer) MessengerOption {
@@ -103,6 +106,11 @@ func WithTURN(addr, user, pass string) MessengerOption {
 		o.turnUser = user
 		o.turnPass = pass
 	}
+}
+
+// WithMuninnServers supplies server addresses advertised at registration.
+func WithMuninnServers(servers []string) MessengerOption {
+	return func(o *messengerOpts) { o.muninnServers = append([]string(nil), servers...); o.muninnServersSet = true }
 }
 
 func WithPeerID(id string) MessengerOption {
@@ -127,11 +135,12 @@ type Messenger struct {
 	encPrivate  []byte
 	encPublic   []byte
 
-	muninnClient *muninn.Client
-	wsClient     *muninn.WSClient
-	rtcManager   *webrtc.Manager
-	rtcMsgChan   chan webrtc.ChatMessage
-	signalChan   chan muninn.Signal
+	muninnClient   *muninn.Client
+	wsClient       *muninn.WSClient
+	wsDisconnected chan struct{}
+	rtcManager     *webrtc.Manager
+	rtcMsgChan     chan webrtc.ChatMessage
+	signalChan     chan muninn.Signal
 
 	store *store.SQLiteStore
 
@@ -166,6 +175,7 @@ type Messenger struct {
 	processingMu  sync.Mutex
 	deliveryMu    sync.Mutex
 
+	configMu           sync.RWMutex
 	appConfig          *config.Config
 	reloginMu          sync.Mutex
 	reloginTransfer    *reloginTransferState
@@ -249,8 +259,30 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		}
 		muninnClient = muninn.NewClient(appCfg.MuninnAddr)
 	}
-	// An explicit address (for example the bot's ENV) overrides saved settings.
+	// When changing servers, introduce the previous home to the new one.
+	if appCfg.MuninnAddr != "" && appCfg.MuninnAddr != muninnClient.BaseURL() {
+		appCfg.MuninnServers = append(appCfg.MuninnServers, appCfg.MuninnAddr)
+	}
+	if o.muninnServersSet {
+		appCfg.MuninnServers = o.muninnServers
+	}
+	seenServers := map[string]bool{muninnClient.BaseURL(): true}
+	knownServers := []string{}
+	for _, address := range appCfg.MuninnServers {
+		address = strings.TrimSpace(address)
+		if address != "" && !seenServers[address] && len(knownServers) < 16 {
+			knownServers = append(knownServers, address)
+			seenServers[address] = true
+		}
+	}
+	appCfg.MuninnServers = knownServers
+	// Probe configured candidates before opening any business connection.
+	muninnClient.SetServers(appCfg.MuninnServers)
+	if _, err := muninnClient.SelectFastest(context.Background()); err != nil {
+		log.Printf("select Muninn: %v", err)
+	}
 	appCfg.MuninnAddr = muninnClient.BaseURL()
+	appCfg.MuninnServers = muninnClient.OtherServers()
 	if appCfg.ChunkTTL == "" {
 		appCfg.ChunkTTL = "1w"
 	}
@@ -294,6 +326,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		encPublic:   encPub,
 
 		muninnClient:    muninnClient,
+		wsDisconnected:  make(chan struct{}, 1),
 		rtcMsgChan:      rtcMsgChan,
 		signalChan:      signalChan,
 		store:           st,
@@ -335,7 +368,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		m.handleStateSyncRequest, m.handleStateSyncManifest, m.handleStateSyncChunk, m.handleStateSyncAck,
 		m.handlePeerConnected, m.handlePeerDisconnected, o.iceServers, m.async.submit)
 
-	m.wsClient = muninn.NewWSClient(muninnClient.BaseURL(), peerID)
+	m.wsClient = muninn.NewSelectedWSClient(muninnClient, peerID)
 	m.wsClient.SetOnSignal(func(sig muninn.Signal) {
 		select {
 		case m.signalChan <- sig:
@@ -344,7 +377,11 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		}
 	})
 	m.wsClient.SetOnDisconnect(func() {
-		log.Printf("[ws] connection to muninn lost, reconnect scheduled")
+		log.Printf("[ws] connection to muninn lost, server selection scheduled")
+		select {
+		case m.wsDisconnected <- struct{}{}:
+		default:
+		}
 	})
 	m.startBackground(m.rtcReconnectLoop)
 	storedPeers, _ := st.GetStoredPeers()
@@ -435,6 +472,7 @@ func (m *Messenger) Register() error {
 		delete(m.registeredMap, key)
 	}
 	req := &muninn.RegisterRequest{
+		MuninnServers: m.Config().MuninnServers,
 		ID:            m.ID,
 		Login:         m.Username,
 		EncryptionKey: crypto.EncodeKey(m.encPublic),
@@ -760,18 +798,42 @@ func (m *Messenger) SetDownloadsDir(dir string) {
 }
 
 func (m *Messenger) Config() *config.Config {
-	if m.appConfig == nil {
+	m.configMu.RLock()
+	cfg := copyConfig(m.appConfig)
+	m.configMu.RUnlock()
+	if m.muninnClient != nil {
+		cfg.MuninnAddr = m.muninnClient.BaseURL()
+		cfg.MuninnServers = m.muninnClient.OtherServers()
+	}
+	return cfg
+}
+
+func copyConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
 		return &config.Config{}
 	}
-	return m.appConfig
+	copy := *cfg
+	copy.MuninnServers = append([]string(nil), cfg.MuninnServers...)
+	return &copy
 }
 
 func (m *Messenger) SaveConfig(cfg *config.Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
 	}
-	m.appConfig = cfg
-	return m.store.SaveAppConfig(cfg)
+	saved := copyConfig(cfg)
+	if m.muninnClient != nil {
+		m.muninnClient.SetServers(append([]string{saved.MuninnAddr}, saved.MuninnServers...))
+		saved.MuninnAddr = m.muninnClient.BaseURL()
+		saved.MuninnServers = m.muninnClient.OtherServers()
+	}
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
+	if err := m.store.SaveAppConfig(saved); err != nil {
+		return err
+	}
+	m.appConfig = saved
+	return nil
 }
 
 func (m *Messenger) Shutdown() {

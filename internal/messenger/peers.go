@@ -278,9 +278,8 @@ func (m *Messenger) ConnectPeer(toPeerID string) error {
 	}
 	offerData, _ := json.Marshal(offer)
 
-	if !m.wsClient.IsConnected() {
-		m.wsClient.Connect(m.ctx)
-	}
+	// The reconnect loop owns connection attempts and server selection. While
+	// signaling reconnects, the offer can use HTTP on the same selected server.
 	if m.wsClient != nil && m.wsClient.IsConnected() {
 		if err := m.wsClient.ConnectToPeer(m.ctx, toPeerID, string(offerData)); err == nil {
 			log.Printf("webrtc offer sent to %s via rtc relay", toPeerID)

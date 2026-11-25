@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,33 +31,52 @@ type Signal struct {
 }
 
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
+	endpointMu     sync.RWMutex
+	selectionMu    sync.Mutex
+	registrationMu sync.Mutex
+	probeMu        sync.Mutex
+	servers        []string
+	measurements   map[string]*serverMeasurement
+	registrations  map[string]RegisterRequest
+	websockets     map[*WSClient]struct{}
+	failures       chan struct{}
+	lastSelection  time.Time
+	lastSwitch     time.Time
+	baseURL        string
+	httpClient     *http.Client
 }
 
 func (c *Client) BaseURL() string {
+	c.endpointMu.RLock()
+	defer c.endpointMu.RUnlock()
 	return c.baseURL
 }
 
 func NewClient(baseURL string) *Client {
+	if canonical, err := canonicalServer(baseURL); err == nil {
+		baseURL = canonical
+	}
 	return &Client{
+		servers: []string{baseURL}, measurements: map[string]*serverMeasurement{baseURL: {}}, registrations: map[string]RegisterRequest{}, websockets: map[*WSClient]struct{}{}, failures: make(chan struct{}, 1),
 		baseURL: baseURL,
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout:       10 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}
 }
 
 type Peer struct {
-	ID            string    `json:"id"`
-	IDS           []string  `json:ignore`
-	Login         string    `json:"login"`
-	EncryptionKey string    `json:"encryption_key,omitempty"`
-	SignatureKey  string    `json:"signature_key,omitempty"`
-	LastSeen      time.Time `json:"last_seen"`
-	TTLSeconds    int       `json:"ttl_seconds"`
-	PeerFlag      PeerFlag  `json:"peer_flag,omitempty"`
-	IsFake        bool      `json:"is_fake,omitempty"`
+	SignalConnected bool      `json:"signal_connected,omitempty"`
+	ID              string    `json:"id"`
+	IDS             []string  `json:"IDS"`
+	Login           string    `json:"login"`
+	EncryptionKey   string    `json:"encryption_key,omitempty"`
+	SignatureKey    string    `json:"signature_key,omitempty"`
+	LastSeen        time.Time `json:"last_seen"`
+	TTLSeconds      int       `json:"ttl_seconds"`
+	PeerFlag        PeerFlag  `json:"peer_flag,omitempty"`
+	IsFake          bool      `json:"is_fake,omitempty"`
 }
 
 func (p Peer) Key() string {
@@ -82,6 +102,7 @@ func (p Peer) DisplayLogin() string {
 }
 
 type RegisterRequest struct {
+	MuninnServers []string `json:"muninn_servers,omitempty"`
 	ID            string   `json:"id"`
 	Login         string   `json:"login"`
 	EncryptionKey string   `json:"encryption_key,omitempty"`
@@ -192,13 +213,13 @@ func (c *Client) SendSignal(ctx context.Context, peerID string, sig Signal) erro
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	url := fmt.Sprintf("%s/api/v1/peers/%s/signals", c.baseURL, peerID)
+	url := fmt.Sprintf("/api/v1/peers/%s/signals", peerID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -211,12 +232,12 @@ func (c *Client) SendSignal(ctx context.Context, peerID string, sig Signal) erro
 }
 
 func (c *Client) PollSignals(ctx context.Context, peerID string) ([]Signal, error) {
-	url := fmt.Sprintf("%s/api/v1/peers/%s/signals", c.baseURL, peerID)
+	url := fmt.Sprintf("/api/v1/peers/%s/signals", peerID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -237,12 +258,12 @@ func (c *Client) Register(ctx context.Context, req *RegisterRequest) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/peers", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "/api/v1/peers", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -251,6 +272,7 @@ func (c *Client) Register(ctx context.Context, req *RegisterRequest) error {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("register failed (status %d): %s", resp.StatusCode, string(b))
 	}
+	c.rememberRegistration(req)
 	return nil
 }
 
@@ -259,12 +281,12 @@ func (c *Client) Refresh(ctx context.Context, req *RefreshRequest) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+"/api/v1/peers", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, "/api/v1/peers", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -280,11 +302,11 @@ func (c *Client) Refresh(ctx context.Context, req *RefreshRequest) error {
 }
 
 func (c *Client) List(ctx context.Context) ([]Peer, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/peers", nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/peers", nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -301,11 +323,11 @@ func (c *Client) List(ctx context.Context) ([]Peer, error) {
 }
 
 func (c *Client) Get(ctx context.Context, id string) (*Peer, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/peers/"+id, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/peers/"+id, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -322,12 +344,12 @@ func (c *Client) Get(ctx context.Context, id string) (*Peer, error) {
 }
 
 func (c *Client) GetBestPeers(ctx context.Context, n int) ([]Peer, error) {
-	url := fmt.Sprintf("%s/api/v1/peers/best?n=%d", c.baseURL, n)
+	url := fmt.Sprintf("/api/v1/peers/best?n=%d", n)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -344,12 +366,12 @@ func (c *Client) GetBestPeers(ctx context.Context, n int) ([]Peer, error) {
 }
 
 func (c *Client) GetBestThickPeers(ctx context.Context, n int) ([]Peer, error) {
-	url := fmt.Sprintf("%s/api/v1/peers/best/thick?n=%d", c.baseURL, n)
+	url := fmt.Sprintf("/api/v1/peers/best/thick?n=%d", n)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -367,12 +389,12 @@ func (c *Client) GetBestThickPeers(ctx context.Context, n int) ([]Peer, error) {
 
 func (c *Client) Heartbeat(ctx context.Context, id string, ttlSeconds int) error {
 	body, _ := json.Marshal(map[string]int{"ttl_seconds": ttlSeconds})
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/peers/"+id+"/heartbeat", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "/api/v1/peers/"+id+"/heartbeat", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -384,15 +406,23 @@ func (c *Client) Heartbeat(ctx context.Context, id string, ttlSeconds int) error
 		}
 		return fmt.Errorf("heartbeat failed (status %d): %s", resp.StatusCode, string(b))
 	}
+	if ttlSeconds > 0 {
+		c.registrationMu.Lock()
+		if saved, ok := c.registrations[id]; ok {
+			saved.TTLSeconds = ttlSeconds
+			c.registrations[id] = saved
+		}
+		c.registrationMu.Unlock()
+	}
 	return nil
 }
 
 func (c *Client) Delete(ctx context.Context, id string) error {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/v1/peers/"+id, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, "/api/v1/peers/"+id, nil)
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -401,6 +431,9 @@ func (c *Client) Delete(ctx context.Context, id string) error {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("delete failed (status %d): %s", resp.StatusCode, string(b))
 	}
+	c.registrationMu.Lock()
+	delete(c.registrations, id)
+	c.registrationMu.Unlock()
 	return nil
 }
 
@@ -409,13 +442,13 @@ func (c *Client) RegisterChunks(ctx context.Context, fileID string, req Register
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	url := fmt.Sprintf("%s/api/v1/files/%s/chunks", c.baseURL, fileID)
+	url := fmt.Sprintf("/api/v1/files/%s/chunks", fileID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -432,13 +465,13 @@ func (c *Client) RegisterChunk(ctx context.Context, fileID string, chunkIndex in
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	url := fmt.Sprintf("%s/api/v1/files/%s/chunks/%d", c.baseURL, fileID, chunkIndex)
+	url := fmt.Sprintf("/api/v1/files/%s/chunks/%d", fileID, chunkIndex)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -455,13 +488,13 @@ func (c *Client) ReportChunk(ctx context.Context, sourcePeerID string, req Chunk
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	url := fmt.Sprintf("%s/api/v1/peers/%s/chunk-reports", c.baseURL, url.PathEscape(sourcePeerID))
+	url := fmt.Sprintf("/api/v1/peers/%s/chunk-reports", url.PathEscape(sourcePeerID))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -474,12 +507,12 @@ func (c *Client) ReportChunk(ctx context.Context, sourcePeerID string, req Chunk
 }
 
 func (c *Client) GetChunksByRecipient(ctx context.Context, recipientID string, dateFrom int64) ([]ChunkRecord, error) {
-	endpoint := fmt.Sprintf("%s/api/v1/recipient/chunks?date_from=%d&recipient_id=%s", c.baseURL, dateFrom, url.QueryEscape(recipientID))
+	endpoint := fmt.Sprintf("/api/v1/recipient/chunks?date_from=%d&recipient_id=%s", dateFrom, url.QueryEscape(recipientID))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -496,12 +529,12 @@ func (c *Client) GetChunksByRecipient(ctx context.Context, recipientID string, d
 }
 
 func (c *Client) GetChunksByFileID(ctx context.Context, fileID string) ([]ChunkRecord, error) {
-	url := fmt.Sprintf("%s/api/v1/files/%s/chunks", c.baseURL, fileID)
+	url := fmt.Sprintf("/api/v1/files/%s/chunks", fileID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -518,12 +551,12 @@ func (c *Client) GetChunksByFileID(ctx context.Context, fileID string) ([]ChunkR
 }
 
 func (c *Client) DeleteChunksByRecipient(ctx context.Context, recipientID string, fileID string) error {
-	url := fmt.Sprintf("%s/api/v1/recipient/%s/chunks/%s", c.baseURL, url.PathEscape(recipientID), url.PathEscape(fileID))
+	url := fmt.Sprintf("/api/v1/recipient/%s/chunks/%s", url.PathEscape(recipientID), url.PathEscape(fileID))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -539,13 +572,13 @@ func (c *Client) ReadChunk(ctx context.Context, req ReadChunkRequest) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	url := fmt.Sprintf("%s/api/v1/chunks/read", c.baseURL)
+	url := "/api/v1/chunks/read"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
@@ -558,12 +591,12 @@ func (c *Client) ReadChunk(ctx context.Context, req ReadChunkRequest) error {
 }
 
 func (c *Client) GetByKey(ctx context.Context, login, signature string) (*Peer, error) {
-	endpoint := fmt.Sprintf("%s/api/v1/keys/%s?signature=%s", c.baseURL, url.PathEscape(login), url.QueryEscape(signature))
+	endpoint := fmt.Sprintf("/api/v1/keys/%s?signature=%s", url.PathEscape(login), url.QueryEscape(signature))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -580,12 +613,12 @@ func (c *Client) GetByKey(ctx context.Context, login, signature string) (*Peer, 
 }
 
 func (c *Client) GetAllByKey(ctx context.Context, login, signature string) ([]Peer, error) {
-	endpoint := fmt.Sprintf("%s/api/v1/keys/%s?signature=%s", c.baseURL, url.PathEscape(login), url.QueryEscape(signature))
+	endpoint := fmt.Sprintf("/api/v1/keys/%s?signature=%s", url.PathEscape(login), url.QueryEscape(signature))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -606,12 +639,12 @@ func (c *Client) ConfirmChunk(ctx context.Context, req ConfirmChunkRequest) (*Co
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/chunks/confirm", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "/api/v1/chunks/confirm", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do: %w", err)
 	}
@@ -632,12 +665,12 @@ func (c *Client) ConfirmChunkBatch(ctx context.Context, req ConfirmChunkBatchReq
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/chunks/confirm-batch", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "/api/v1/chunks/confirm-batch", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)
 	}
