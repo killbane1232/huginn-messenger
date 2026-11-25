@@ -21,10 +21,17 @@ func messageHistoryArgs(peerID string) []any {
 func (s *SQLiteStore) SaveMessage(msg_uid string, login string, senderLogin string, chatID string, data []byte, created_at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`
+	result, err := s.db.Exec(`
 		INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at, state_updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		msg_uid, login, senderLogin, chatID, data, created_at.UnixMicro(), time.Now().UTC().UnixMicro())
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count == 0 {
+		return ErrDeletedMessage
+	}
 	return err
 }
 
@@ -75,21 +82,10 @@ func (s *SQLiteStore) GetMessagesDesc(peerID string, limit, offset int) ([][]byt
 func (s *SQLiteStore) FindMessageById(msgID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query("SELECT '1' FROM messages WHERE message_uid = ?", msgID)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	var result []string
-	for rows.Next() {
-		var data string
-		if err := rows.Scan(&data); err != nil {
-			return false, nil
-		}
-		if len(data) > 0 {
-			return true, nil
-		}
-		result = append(result, data)
-	}
-	return len(result) > 0, nil
+	var found bool
+	err := s.db.QueryRow(`SELECT EXISTS (
+		SELECT message_uid FROM messages WHERE message_uid = ?
+		UNION ALL SELECT message_uid FROM deleted_messages WHERE message_uid = ?
+	)`, msgID, msgID).Scan(&found)
+	return found, err
 }

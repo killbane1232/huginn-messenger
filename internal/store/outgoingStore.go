@@ -15,9 +15,17 @@ func (s *SQLiteStore) QueueOutgoing(msgID, login, sender, chatID string, data []
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at, state_updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, msgID, login, sender, chatID, data, sentAt.UnixMicro(), time.Now().UTC().UnixMicro()); err != nil {
+	result, err := tx.Exec(`INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at, state_updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, msgID, login, sender, chatID, data, sentAt.UnixMicro(), time.Now().UTC().UnixMicro())
+	if err != nil {
 		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return ErrDeletedMessage
 	}
 	for _, c := range chunks {
 		if len(c.Data) == 0 || c.TTLSeconds <= 0 {
