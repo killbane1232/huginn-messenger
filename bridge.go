@@ -336,6 +336,32 @@ func messenger_search_peers(handle C.long, query *C.char) *C.char {
 	return peersToJSON(inst, inst.m.SearchPeers(C.GoString(query)))
 }
 
+//export messenger_delete_chat
+func messenger_delete_chat(handle C.long, chatID *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	if err := inst.m.DeleteChat(C.GoString(chatID)); err != nil {
+		return errorJSON(err.Error())
+	}
+	return okJSON()
+}
+
+//export messenger_get_hidden_chats
+func messenger_get_hidden_chats(handle C.long) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	ids, err := inst.m.GetHiddenChatIDs()
+	if err != nil {
+		return errorJSON(err.Error())
+	}
+	data, _ := json.Marshal(ids)
+	return C.CString(string(data))
+}
+
 //export messenger_get_messages
 func messenger_get_messages(handle C.long, peerID *C.char) *C.char {
 	inst := getInstance(int64(handle))
