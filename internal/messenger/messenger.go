@@ -10,7 +10,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -75,14 +74,12 @@ const (
 )
 
 type messengerOpts struct {
+	muninnICE        map[string]config.ICEConfig
 	muninnServers    []string
 	muninnServersSet bool
 	iceServers       []pion.ICEServer
 	iceSet           bool
 	peerFlag         muninn.PeerFlag
-	turnAddr         string
-	turnUser         string
-	turnPass         string
 	peerID           string
 	pollSignal       bool
 }
@@ -100,17 +97,15 @@ func WithPeerFlag(flag muninn.PeerFlag) MessengerOption {
 	}
 }
 
-func WithTURN(addr, user, pass string) MessengerOption {
-	return func(o *messengerOpts) {
-		o.turnAddr = addr
-		o.turnUser = user
-		o.turnPass = pass
-	}
-}
-
-// WithMuninnServers supplies server addresses advertised at registration.
+// WithMuninnServers replaces remembered candidates for startup selection and
+// registration. When no client is supplied, the list can bootstrap a fresh DB.
 func WithMuninnServers(servers []string) MessengerOption {
 	return func(o *messengerOpts) { o.muninnServers = append([]string(nil), servers...); o.muninnServersSet = true }
+}
+
+// WithMuninnICE supplies local STUN/TURN profiles keyed by Muninn origin.
+func WithMuninnICE(profiles map[string]config.ICEConfig) MessengerOption {
+	return func(o *messengerOpts) { o.muninnICE = config.CloneMuninnICE(profiles) }
 }
 
 func WithPeerID(id string) MessengerOption {
@@ -135,12 +130,13 @@ type Messenger struct {
 	encPrivate  []byte
 	encPublic   []byte
 
-	muninnClient   *muninn.Client
-	wsClient       *muninn.WSClient
-	wsDisconnected chan struct{}
-	rtcManager     *webrtc.Manager
-	rtcMsgChan     chan webrtc.ChatMessage
-	signalChan     chan muninn.Signal
+	muninnClient    *muninn.Client
+	wsClient        *muninn.WSClient
+	wsDisconnected  chan struct{}
+	rtcManager      *webrtc.Manager
+	fixedICEServers bool
+	rtcMsgChan      chan webrtc.ChatMessage
+	signalChan      chan muninn.Signal
 
 	store *store.SQLiteStore
 
@@ -252,30 +248,44 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	default:
 		log.Printf("messenger: cfgErr=%v, username=%q", cfgErr, username)
 	}
-	if muninnClient == nil {
-		if appCfg.MuninnAddr == "" {
-			st.Close()
-			return nil, ErrMuninnAddressRequired
-		}
-		muninnClient = muninn.NewClient(appCfg.MuninnAddr)
-	}
-	// When changing servers, introduce the previous home to the new one.
-	if appCfg.MuninnAddr != "" && appCfg.MuninnAddr != muninnClient.BaseURL() {
-		appCfg.MuninnServers = append(appCfg.MuninnServers, appCfg.MuninnAddr)
-	}
+	// An explicit list replaces remembered candidates. Without one, retain the
+	// saved list and the previous server for legacy single-address callers.
 	if o.muninnServersSet {
 		appCfg.MuninnServers = o.muninnServers
-	}
-	seenServers := map[string]bool{muninnClient.BaseURL(): true}
-	knownServers := []string{}
-	for _, address := range appCfg.MuninnServers {
-		address = strings.TrimSpace(address)
-		if address != "" && !seenServers[address] && len(knownServers) < 16 {
-			knownServers = append(knownServers, address)
-			seenServers[address] = true
+		if muninnClient == nil {
+			appCfg.MuninnAddr = ""
 		}
 	}
-	appCfg.MuninnServers = knownServers
+	addresses := append([]string(nil), appCfg.MuninnServers...)
+	if muninnClient != nil {
+		addresses = append([]string{muninnClient.BaseURL()}, addresses...)
+		if !o.muninnServersSet && appCfg.MuninnAddr != "" {
+			addresses = append(addresses, appCfg.MuninnAddr)
+		}
+	} else if appCfg.MuninnAddr != "" {
+		addresses = append([]string{appCfg.MuninnAddr}, addresses...)
+	}
+	addresses, err = muninn.NormalizeServers(addresses)
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	if len(addresses) == 0 {
+		st.Close()
+		return nil, ErrMuninnAddressRequired
+	}
+	if muninnClient == nil {
+		muninnClient = muninn.NewClient(addresses[0])
+	}
+	appCfg.MuninnServers = addresses
+	if o.muninnICE != nil {
+		appCfg.MuninnICE = config.CloneMuninnICE(o.muninnICE)
+	}
+	appCfg.MuninnICE, err = normalizeMuninnICE(appCfg.MuninnICE, addresses)
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
 	// Probe configured candidates before opening any business connection.
 	muninnClient.SetServers(appCfg.MuninnServers)
 	if _, err := muninnClient.SelectFastest(context.Background()); err != nil {
@@ -349,19 +359,9 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 	}
 	m.async = newAsyncPool(ctx, asyncWorkerCount, asyncQueueSize)
 
-	if len(o.iceServers) < 1 {
-		o.iceServers = []pion.ICEServer{
-			{
-				URLs: []string{
-					"turn:stun.evil-bread.ru:3478",
-					"turn:turn.evil-bread.ru:3478?transport=udp",
-					"turn:turn.evil-bread.ru:3478?transport=tcp",
-					"turns:turn.evil-bread.ru:5349?transport=tcp",
-				},
-				Username:   "turnuser",
-				Credential: "turnpass",
-			},
-		}
+	m.fixedICEServers = o.iceSet
+	if !o.iceSet {
+		o.iceServers = appCfg.MuninnICE[appCfg.MuninnAddr].Servers()
 	}
 	m.rtcManager = webrtc.NewManager(peerID, rtcMsgChan, m.handleChunkStore, m.handleChunkGet,
 		m.handleReloginRequest, m.handleReloginResponse, m.handleReloginChunk,
@@ -802,8 +802,7 @@ func (m *Messenger) Config() *config.Config {
 	cfg := copyConfig(m.appConfig)
 	m.configMu.RUnlock()
 	if m.muninnClient != nil {
-		cfg.MuninnAddr = m.muninnClient.BaseURL()
-		cfg.MuninnServers = m.muninnClient.OtherServers()
+		selectConfiguredMuninn(cfg, m.muninnClient.BaseURL())
 	}
 	return cfg
 }
@@ -814,6 +813,7 @@ func copyConfig(cfg *config.Config) *config.Config {
 	}
 	copy := *cfg
 	copy.MuninnServers = append([]string(nil), cfg.MuninnServers...)
+	copy.MuninnICE = config.CloneMuninnICE(cfg.MuninnICE)
 	return &copy
 }
 
@@ -822,10 +822,22 @@ func (m *Messenger) SaveConfig(cfg *config.Config) error {
 		return fmt.Errorf("config is nil")
 	}
 	saved := copyConfig(cfg)
-	if m.muninnClient != nil {
-		m.muninnClient.SetServers(append([]string{saved.MuninnAddr}, saved.MuninnServers...))
-		saved.MuninnAddr = m.muninnClient.BaseURL()
-		saved.MuninnServers = m.muninnClient.OtherServers()
+	addresses := append([]string(nil), saved.MuninnServers...)
+	if saved.MuninnAddr != "" {
+		addresses = append([]string{saved.MuninnAddr}, addresses...)
+	}
+	addresses, err := muninn.NormalizeServers(addresses)
+	if err != nil {
+		return err
+	}
+	if len(addresses) == 0 {
+		return ErrMuninnAddressRequired
+	}
+	saved.MuninnAddr = addresses[0]
+	saved.MuninnServers = addresses[1:]
+	saved.MuninnICE, err = normalizeMuninnICE(saved.MuninnICE, addresses)
+	if err != nil {
+		return err
 	}
 	m.configMu.Lock()
 	defer m.configMu.Unlock()
@@ -833,7 +845,42 @@ func (m *Messenger) SaveConfig(cfg *config.Config) error {
 		return err
 	}
 	m.appConfig = saved
+	// A replacement excluding the active server takes effect on recreation.
+	// Do not reinsert a server that the user explicitly removed.
+	if m.muninnClient != nil && containsMuninn(saved, m.muninnClient.BaseURL()) {
+		m.muninnClient.SetServers(addresses)
+		m.applyMuninnICE(saved, m.muninnClient.BaseURL())
+	}
 	return nil
+}
+
+func containsMuninn(cfg *config.Config, address string) bool {
+	if cfg.MuninnAddr == address {
+		return true
+	}
+	for _, candidate := range cfg.MuninnServers {
+		if candidate == address {
+			return true
+		}
+	}
+	return false
+}
+
+// Reorder the saved list without importing stale candidates from a concurrent
+// connection switch after a manual edit.
+func selectConfiguredMuninn(cfg *config.Config, address string) bool {
+	if !containsMuninn(cfg, address) {
+		return false
+	}
+	addresses := append([]string{cfg.MuninnAddr}, cfg.MuninnServers...)
+	cfg.MuninnAddr = address
+	cfg.MuninnServers = []string{}
+	for _, candidate := range addresses {
+		if candidate != address {
+			cfg.MuninnServers = append(cfg.MuninnServers, candidate)
+		}
+	}
+	return true
 }
 
 func (m *Messenger) Shutdown() {

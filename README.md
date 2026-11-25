@@ -46,7 +46,7 @@ flowchart TB
 
 - Go 1.25 или новее;
 - запущенный Muninn;
-- доступные UDP/TCP-маршруты для WebRTC либо настроенный TURN.
+- доступные UDP/TCP-маршруты для WebRTC.
 
 ## Запуск headless-ядра
 
@@ -77,14 +77,44 @@ go build -o huginn-messenger .
 | Флаг | Значение по умолчанию | Назначение |
 |---|---|---|
 | `--username` | UUID при пустом значении | Login пользователя |
-| `--muninn-servers` | `MUNINN_SERVERS` / config | Известные Muninn для mesh discovery, через запятую |
+| `--muninn-servers` | `MUNINN_SERVERS` / config | Кандидаты Muninn для автоматического выбора, через запятую |
 | `--muninn` | `MUNINN_ADDR`, затем `config.conf` / SQLite | Адрес Muninn, без встроенного сервера |
 | `--db` | `huginn.db` | Путь к SQLite |
 | `--chunk-ttl` | `1w` | TTL чанков: `1d`, `1w` или `1m` |
 | `--peer-flag` | `thin` | Класс storage-пира: `thin`, `thick`, `very_thick` |
 
-Конфигурация также читается из `config.conf`. TURN-поля называются
-`turn_addr`, `turn_user` и `turn_pass`.
+Конфигурация также читается из `config.conf`. Устаревшие глобальные поля TURN
+заменены локальными профилями `muninn_ice`, привязанными к адресу Muninn.
+
+## STUN/TURN для каждого Muninn
+
+`muninn_ice` — объект, ключами которого служат HTTP(S) origins из списка серверов:
+
+```json
+{
+  "muninn_servers": ["https://muninn.example.org"],
+  "muninn_ice": {
+    "https://muninn.example.org": {
+      "stun_urls": ["stun:muninn.example.org:3478"],
+      "turn_urls": ["turns:muninn.example.org:5349?transport=tcp"],
+      "turn_username": "your-user",
+      "turn_password": "your-password"
+    }
+  }
+}
+```
+
+Профиль выбранного Muninn задаёт ICE для новых WebRTC-соединений. При переключении
+профиль обновляется без разрыва уже работающих P2P-соединений. Неверные URI и TURN
+без учётных данных отклоняются до сохранения; пустые списки отключают STUN/TURN.
+Общего жёстко заданного relay больше нет. Миграция сохраняет прежние настройки
+только для публичного `https://muninn.evil-bread.ru`, если он присутствует в базе.
+
+Профили сохраняются в SQLite и передаются локально через C ABI. В Muninn
+регистрацию и mesh discovery попадают только HTTP(S)-адреса, без ICE-паролей.
+Удаление кандидата удаляет и его профиль. Go-клиенты могут использовать
+`messenger.WithMuninnICE(map[string]config.ICEConfig{...})`; явный
+`WithICEServers` переопределяет выбор профиля и сохраняется при переключении Muninn.
 
 ## Несколько Muninn
 
@@ -104,11 +134,21 @@ go build -o huginn-messenger .
 
 Также поддерживаются `MUNINN_SERVERS` и массив `muninn_servers` в `config.conf`
 или сохранённом конфиге. Ядро отправляет их в `POST /api/v1/peers`, хранит в SQLite
-и при смене основного сервера добавляет предыдущий адрес. Go-интеграции могут
+и поддерживает запуск только со списком, без отдельного `muninn`.
+Явный список заменяет сохранённых кандидатов; удалённые адреса не восстанавливаются.
+Go-интеграции могут
 использовать `messenger.WithMuninnServers([]string{...})` или поле
 `muninn.RegisterRequest.MuninnServers`. Клиент передаёт не более 16 уникальных
 адресов, исключая свой текущий сервер. Mesh-секрет клиенту не нужен: режим и
 членство проверяются серверами.
+
+Flutter передаёт полный конфиг через `messenger_create_with_config(jsonConfig, dbPath)`
+до первого выбора и регистрации. При отсутствии адреса и списка загружается SQLite;
+код `-4` означает, что серверы ещё не заданы. Старые C ABI entry points сохранены,
+их три устаревших аргумента игнорируются. После изменения списка через
+`messenger_save_config` клиент пересоздаёт native-инстанс.
+Адреса проверяются как HTTP(S) origins; некорректный список или более 17 уникальных
+серверов отклоняются до подключения и сохранения.
 
 Выбор выполняется перед запуском соединений и затем при разрыве WebSocket с
 активным сервером. Пока WebSocket подключён, периодических проверок кандидатов
@@ -248,6 +288,9 @@ GOCACHE=/tmp/huginmunin-messenger-go-cache go test ./...
 `messenger_create` и `messenger_create_with_peer_flag` используют явно переданный
 адрес с приоритетом над SQLite. Пустой адрес загружает сохранённый `muninn`
 до создания HTTP и WebSocket клиентов. Если адрес отсутствует, возвращается
-`-4`; подключения к серверу по умолчанию нет. Flutter в этом случае повторяет
-создание с адресом из `assets/config.json`. Бот всегда передаёт `MUNINN_ADDR`.
-Сигнатуры C ABI не изменены, но потребителям нужна новая сборка библиотеки.
+`-4`; подключения к серверу по умолчанию нет. Бот всегда передаёт `MUNINN_ADDR`.
+Сигнатуры этих экспортов сохранены.
+
+Flutter использует `messenger_create_with_config` и при коде `-4` повторяет
+создание с полным списком из `assets/config.json`. Новый экспорт принимает
+JSON-конфигурацию и путь SQLite; для него нужна обновлённая сборка библиотеки.

@@ -348,6 +348,7 @@ func (m *Manager) sendEnvelope(remoteID, msgType string, v any) error {
 
 func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, error) {
 	m.mu.Lock()
+	configuration := m.config
 	existing := m.connections[remoteID]
 	delete(m.connections, remoteID)
 	delete(m.dataChans, remoteID)
@@ -368,7 +369,7 @@ func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, erro
 	// а не как обход Android.
 	api := pion.NewAPI(pion.WithSettingEngine(se))
 
-	pc, err := api.NewPeerConnection(m.config)
+	pc, err := api.NewPeerConnection(configuration)
 	if err != nil {
 		return nil, fmt.Errorf("new pc: %w", err)
 	}
@@ -403,6 +404,19 @@ func (m *Manager) NewPeerConnection(remoteID string) (*pion.PeerConnection, erro
 	m.mu.Unlock()
 
 	return pc, nil
+}
+
+// SetICEServers applies the selected Muninn profile to subsequent connections.
+// Existing working peer connections retain their negotiated transport.
+func (m *Manager) SetICEServers(servers []pion.ICEServer) {
+	copied := make([]pion.ICEServer, len(servers))
+	for i, server := range servers {
+		copied[i] = server
+		copied[i].URLs = append([]string(nil), server.URLs...)
+	}
+	m.mu.Lock()
+	m.config.ICEServers = copied
+	m.mu.Unlock()
 }
 
 func (m *Manager) CreateOffer(remoteID string) (pion.SessionDescription, error) {

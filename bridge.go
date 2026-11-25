@@ -58,27 +58,32 @@ func removeInstance(handle int64) {
 	delete(instances, handle)
 }
 
-// An empty muninnAddr loads the saved address. Returns -4 if none is configured.
+// Legacy entry points retain their ABI; the three reserved arguments are ignored.
+// An empty muninnAddr loads saved settings. Returns -4 if none are configured.
 //
 //export messenger_create
-func messenger_create(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass *C.char) C.long {
-	return createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass, "")
+func messenger_create(username, muninnAddr, dbPath, chunkTTL, reserved1, reserved2, reserved3 *C.char) C.long {
+	return createMessenger(C.GoString(username), C.GoString(muninnAddr), C.GoString(dbPath), C.GoString(chunkTTL), "", nil, nil)
 }
 
 //export messenger_create_with_peer_flag
-func messenger_create_with_peer_flag(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass, peerFlag *C.char) C.long {
-	return createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass, C.GoString(peerFlag))
+func messenger_create_with_peer_flag(username, muninnAddr, dbPath, chunkTTL, reserved1, reserved2, reserved3, peerFlag *C.char) C.long {
+	return createMessenger(C.GoString(username), C.GoString(muninnAddr), C.GoString(dbPath), C.GoString(chunkTTL), C.GoString(peerFlag), nil, nil)
 }
 
-func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser, turnPass *C.char, requestedPeerFlag string) C.long {
-	goUser := C.GoString(username)
-	goMuninn := C.GoString(muninnAddr)
-	goDB := C.GoString(dbPath)
-	goTTL := C.GoString(chunkTTL)
-	goTurnAddr := C.GoString(turnAddr)
-	goTurnUser := C.GoString(turnUser)
-	goTurnPass := C.GoString(turnPass)
+// messenger_create_with_config receives the full candidate list before startup
+// selection or registration. Omitted candidates load the saved SQLite settings.
+//
+//export messenger_create_with_config
+func messenger_create_with_config(jsonConfig, dbPath *C.char) C.long {
+	var cfg config.Config
+	if err := json.Unmarshal([]byte(C.GoString(jsonConfig)), &cfg); err != nil {
+		return -3
+	}
+	return createMessenger(cfg.Username, cfg.MuninnAddr, C.GoString(dbPath), cfg.ChunkTTL, cfg.PeerFlag, cfg.MuninnServers, cfg.MuninnICE)
+}
 
+func createMessenger(goUser, goMuninn, goDB, goTTL, requestedPeerFlag string, servers []string, profiles map[string]config.ICEConfig) C.long {
 	if goUser == "" {
 		return -1
 	}
@@ -99,14 +104,11 @@ func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser,
 	}
 
 	cfg := &config.Config{
-		Username:     goUser,
-		MuninnAddr:   goMuninn,
-		DBPath:       goDB,
-		ChunkTTL:     goTTL,
-		PeerFlag:     string(peerFlag),
-		TurnAddr:     goTurnAddr,
-		TurnUsername: goTurnUser,
-		TurnPassword: goTurnPass,
+		Username:   goUser,
+		MuninnAddr: goMuninn,
+		DBPath:     goDB,
+		ChunkTTL:   goTTL,
+		PeerFlag:   string(peerFlag),
 	}
 
 	var mc *muninn.Client
@@ -116,7 +118,12 @@ func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser,
 
 	mOpts := []messenger.MessengerOption{
 		messenger.WithPeerFlag(peerFlag),
-		messenger.WithTURN(cfg.TurnAddr, cfg.TurnUsername, cfg.TurnPassword),
+	}
+	if servers != nil {
+		mOpts = append(mOpts, messenger.WithMuninnServers(servers))
+	}
+	if profiles != nil {
+		mOpts = append(mOpts, messenger.WithMuninnICE(profiles))
 	}
 	m, err := messenger.New(cfg.Username, mc, cfg.DBPath, mOpts...)
 	if err != nil {
@@ -128,6 +135,7 @@ func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser,
 	}
 
 	storedCfg := m.Config()
+	cfg.MuninnICE = config.CloneMuninnICE(storedCfg.MuninnICE)
 	cfg.MuninnServers = append([]string(nil), storedCfg.MuninnServers...)
 	if storedCfg.Username != "" {
 		cfg.Username = storedCfg.Username
@@ -141,24 +149,10 @@ func createMessenger(username, muninnAddr, dbPath, chunkTTL, turnAddr, turnUser,
 	if storedCfg.PeerFlag != "" && requestedPeerFlag == "" {
 		cfg.PeerFlag = storedCfg.PeerFlag
 	}
-	if storedCfg.TurnAddr != "" {
-		cfg.TurnAddr = storedCfg.TurnAddr
-	}
-	if storedCfg.TurnUsername != "" {
-		cfg.TurnUsername = storedCfg.TurnUsername
-	}
-	if storedCfg.TurnPassword != "" {
-		cfg.TurnPassword = storedCfg.TurnPassword
-	}
 	if storedCfg.PeerID != "" {
 		cfg.PeerID = storedCfg.PeerID
 	}
 	cfg.DBPath = goDB
-	if goTurnAddr != "" {
-		cfg.TurnAddr = goTurnAddr
-		cfg.TurnUsername = goTurnUser
-		cfg.TurnPassword = goTurnPass
-	}
 	if goTTL != "" && goTTL != "1w" {
 		cfg.ChunkTTL = goTTL
 	}
@@ -391,14 +385,12 @@ func messenger_get_config(handle C.long) *C.char {
 	cfg := inst.m.Config()
 	resp := map[string]interface{}{
 		"muninn_servers": cfg.MuninnServers,
+		"muninn_ice":     cfg.MuninnICE,
 		"username":       cfg.Username,
 		"peer_id":        cfg.PeerID,
 		"muninn":         cfg.MuninnAddr,
 		"chunk_ttl":      cfg.ChunkTTL,
 		"db_path":        cfg.DBPath,
-		"turn_addr":      cfg.TurnAddr,
-		"turn_user":      cfg.TurnUsername,
-		"turn_pass":      cfg.TurnPassword,
 	}
 	data, _ := json.Marshal(resp)
 	return C.CString(string(data))
@@ -411,19 +403,20 @@ func messenger_save_config(handle C.long, jsonConfig *C.char) *C.char {
 		return errorJSON("invalid handle")
 	}
 	var req struct {
-		Username      string    `json:"username"`
-		PeerID        string    `json:"peer_id"`
-		Muninn        string    `json:"muninn"`
-		MuninnServers *[]string `json:"muninn_servers"`
-		ChunkTTL      string    `json:"chunk_ttl"`
-		TurnAddr      string    `json:"turn_addr"`
-		TurnUser      string    `json:"turn_user"`
-		TurnPass      string    `json:"turn_pass"`
+		Username      string                      `json:"username"`
+		PeerID        string                      `json:"peer_id"`
+		Muninn        string                      `json:"muninn"`
+		MuninnServers *[]string                   `json:"muninn_servers"`
+		MuninnICE     map[string]config.ICEConfig `json:"muninn_ice"`
+		ChunkTTL      string                      `json:"chunk_ttl"`
 	}
 	if err := json.Unmarshal([]byte(C.GoString(jsonConfig)), &req); err != nil {
 		return errorJSON("bad request: " + err.Error())
 	}
 	cfg := inst.m.Config()
+	if req.MuninnICE != nil {
+		cfg.MuninnICE = config.CloneMuninnICE(req.MuninnICE)
+	}
 	if req.MuninnServers != nil {
 		cfg.MuninnServers = append([]string(nil), (*req.MuninnServers)...)
 	}
@@ -438,15 +431,6 @@ func messenger_save_config(handle C.long, jsonConfig *C.char) *C.char {
 	}
 	if req.ChunkTTL != "" {
 		cfg.ChunkTTL = req.ChunkTTL
-	}
-	if req.TurnAddr != "" {
-		cfg.TurnAddr = req.TurnAddr
-	}
-	if req.TurnUser != "" {
-		cfg.TurnUsername = req.TurnUser
-	}
-	if req.TurnPass != "" {
-		cfg.TurnPassword = req.TurnPass
 	}
 	if err := inst.m.SaveConfig(cfg); err != nil {
 		return errorJSON("failed to save: " + err.Error())

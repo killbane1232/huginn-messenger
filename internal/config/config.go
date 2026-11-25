@@ -11,16 +11,14 @@ import (
 )
 
 type Config struct {
-	MuninnServers []string `json:"muninn_servers,omitempty"`
-	MuninnAddr    string   `json:"muninn"`
-	Username      string   `json:"username"`
-	PeerID        string   `json:"peer_id,omitempty"`
-	DBPath        string   `json:"-"`
-	ChunkTTL      string   `json:"chunk_ttl"`
-	PeerFlag      string   `json:"peer_flag"`
-	TurnAddr      string   `json:"turn_addr"`
-	TurnUsername  string   `json:"turn_user"`
-	TurnPassword  string   `json:"turn_pass"`
+	MuninnICE     map[string]ICEConfig `json:"muninn_ice,omitempty"`
+	MuninnServers []string             `json:"muninn_servers,omitempty"`
+	MuninnAddr    string               `json:"muninn"`
+	Username      string               `json:"username"`
+	PeerID        string               `json:"peer_id,omitempty"`
+	DBPath        string               `json:"-"`
+	ChunkTTL      string               `json:"chunk_ttl"`
+	PeerFlag      string               `json:"peer_flag"`
 }
 
 const configPath = "config.conf"

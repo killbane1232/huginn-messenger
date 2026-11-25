@@ -16,12 +16,10 @@ const (
 	ConfigUsername      = "username"
 	ConfigMuninn        = "muninn"
 	ConfigMuninnServers = "muninn_servers"
+	ConfigMuninnICE     = "muninn_ice"
 	ConfigPeerID        = "peer_id"
 	ConfigChunkTTL      = "chunk_ttl"
 	ConfigPeerFlag      = "peer_flag"
-	ConfigTurnAddr      = "turn_addr"
-	ConfigTurnUser      = "turn_user"
-	ConfigTurnPass      = "turn_pass"
 )
 
 var ErrConfigNotFound = errors.New("config value not found")
@@ -78,24 +76,18 @@ func (s *SQLiteStore) LoadAppConfig() (*config.Config, error) {
 		cfg.PeerID = v
 		hasValue = true
 	}
+	if v, err := s.GetConfigValue(ConfigMuninnICE); err == nil {
+		if err := json.Unmarshal([]byte(v), &cfg.MuninnICE); err != nil {
+			return nil, fmt.Errorf("parse muninn_ice: %w", err)
+		}
+		hasValue = true
+	}
 	if v, err := s.GetConfigValue(ConfigChunkTTL); err == nil {
 		cfg.ChunkTTL = v
 		hasValue = true
 	}
 	if v, err := s.GetConfigValue(ConfigPeerFlag); err == nil {
 		cfg.PeerFlag = v
-		hasValue = true
-	}
-	if v, err := s.GetConfigValue(ConfigTurnAddr); err == nil {
-		cfg.TurnAddr = v
-		hasValue = true
-	}
-	if v, err := s.GetConfigValue(ConfigTurnUser); err == nil {
-		cfg.TurnUsername = v
-		hasValue = true
-	}
-	if v, err := s.GetConfigValue(ConfigTurnPass); err == nil {
-		cfg.TurnPassword = v
 		hasValue = true
 	}
 	if !hasValue {
@@ -125,6 +117,13 @@ func (s *SQLiteStore) SaveAppConfig(cfg *config.Config) error {
 	if err := s.SetConfigValue(ConfigMuninnServers, string(servers)); err != nil {
 		return err
 	}
+	profiles, err := json.Marshal(cfg.MuninnICE)
+	if err != nil {
+		return err
+	}
+	if err := s.SetConfigValue(ConfigMuninnICE, string(profiles)); err != nil {
+		return err
+	}
 	if cfg.PeerID != "" {
 		if err := s.SetConfigValue(ConfigPeerID, cfg.PeerID); err != nil {
 			return err
@@ -137,21 +136,6 @@ func (s *SQLiteStore) SaveAppConfig(cfg *config.Config) error {
 	}
 	if cfg.PeerFlag != "" {
 		if err := s.SetConfigValue(ConfigPeerFlag, cfg.PeerFlag); err != nil {
-			return err
-		}
-	}
-	if cfg.TurnAddr != "" {
-		if err := s.SetConfigValue(ConfigTurnAddr, cfg.TurnAddr); err != nil {
-			return err
-		}
-	}
-	if cfg.TurnUsername != "" {
-		if err := s.SetConfigValue(ConfigTurnUser, cfg.TurnUsername); err != nil {
-			return err
-		}
-	}
-	if cfg.TurnPassword != "" {
-		if err := s.SetConfigValue(ConfigTurnPass, cfg.TurnPassword); err != nil {
 			return err
 		}
 	}

@@ -171,3 +171,74 @@ func TestStartupSelectsFastestMuninnAndPersistsChoice(t *testing.T) {
 		t.Fatal("configuration alias escaped")
 	}
 }
+
+func TestMuninnListOnlyStartupAndManualReplacement(t *testing.T) {
+	server := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`[]`))
+		}))
+	}
+	first, second := server(), server()
+	defer first.Close()
+	defer second.Close()
+	dbPath := filepath.Join(t.TempDir(), "huginn.db")
+	m, err := New("alice", nil, dbPath, WithMuninnServers([]string{first.URL + "/", first.URL}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := m.Config()
+	if cfg.MuninnAddr != first.URL || len(cfg.MuninnServers) != 0 {
+		t.Fatalf("initial list: %+v", cfg)
+	}
+	cfg.MuninnAddr = second.URL
+	cfg.MuninnServers = nil
+	if err := m.SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := m.store.LoadAppConfig()
+	if err != nil || saved.MuninnAddr != second.URL || len(saved.MuninnServers) != 0 {
+		t.Fatalf("removed server was persisted again: %+v, %v", saved, err)
+	}
+	m.Shutdown()
+	m, err = New("alice", nil, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Shutdown()
+	if got := m.Config(); got.MuninnAddr != second.URL || len(got.MuninnServers) != 0 {
+		t.Fatalf("restart restored removed server: %+v", got)
+	}
+	invalid := m.Config()
+	invalid.MuninnServers = []string{"https://host/path"}
+	if err := m.SaveConfig(invalid); err == nil {
+		t.Fatal("saved an invalid candidate")
+	}
+	saved, err = m.store.LoadAppConfig()
+	if err != nil || len(saved.MuninnServers) != 0 {
+		t.Fatalf("invalid config changed SQLite: %+v, %v", saved, err)
+	}
+}
+
+func TestExplicitMuninnListReplacesSavedServers(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "huginn.db")
+	st, err := store.New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAppConfig(&config.Config{Username: "alice", MuninnAddr: "https://removed.example"}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+	m, err := New("alice", nil, dbPath, WithMuninnServers([]string{server.URL}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Shutdown()
+	if got := m.Config(); got.MuninnAddr != server.URL || len(got.MuninnServers) != 0 {
+		t.Fatalf("explicit candidates did not replace saved ones: %+v", got)
+	}
+}
