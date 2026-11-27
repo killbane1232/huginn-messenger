@@ -31,6 +31,10 @@ type ReplicationSnapshot struct {
 	Groups   []GroupChat         `json:"groups"`
 }
 
+// Failed sends belong to the originating device until queued successfully.
+// Replicating them would leave stale failures on devices that import by ID.
+const replicableMessage = `(CASE WHEN json_valid(data) THEN COALESCE(json_extract(data, '$.send_error'), '') ELSE '' END) = ''`
+
 func (s *SQLiteStore) ExportReplicationSnapshot() (ReplicationSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -61,7 +65,7 @@ func readReplicatedMessages(tx *sql.Tx) ([]ReplicatedMessage, error) {
 	rows, err := tx.Query(`
 		SELECT message_uid, login, sender_login, chat_id, data, CAST(created_at AS INTEGER)
 		FROM messages
-		ORDER BY created_at, message_uid`)
+		WHERE ` + replicableMessage + ` ORDER BY created_at, message_uid`)
 	if err != nil {
 		return nil, fmt.Errorf("read replicated messages: %w", err)
 	}

@@ -140,9 +140,15 @@ func (m *Messenger) requestMissingChunk(fileID string, chunkIndex int, senderID 
 
 func (m *Messenger) requestMissingChunkWithContext(ctx context.Context, fileID string, chunkIndex int, senderID string) {
 	targets := []string{}
-	p := m.findPeerByKey(senderID)
+	p := m.findPeerByKeyWithContext(ctx, senderID)
 	if p == nil {
 		return
+	}
+	if len(p.IDS) == 0 {
+		p = m.refreshPeerByKey(ctx, senderID)
+		if p == nil {
+			return
+		}
 	}
 	targets = p.IDS
 	for _, pid := range targets {

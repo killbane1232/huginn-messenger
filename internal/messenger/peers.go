@@ -1,6 +1,7 @@
 package messenger
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -82,23 +83,26 @@ func (m *Messenger) upsertPeer(peerID, peerKey, login, encryptionKey, signatureK
 		IsFake:       isFake,
 	}).DisplayLogin()
 	m.mu.Lock()
-	found := false
 	peer, found := m.peersMap[peerKey]
 	if found {
-		if !slices.Contains(peer.IDS, peerID) {
-			peer.IDS = append(peer.IDS, peerID)
+		if peerID != "" {
+			if !slices.Contains(peer.IDS, peerID) {
+				peer.IDS = append(slices.Clone(peer.IDS), peerID)
+			}
+			peer.ID = peerID
 		}
-		peer.ID = peerID
 		peer.Login = login
-		peer.EncryptionKey = encryptionKey
-		peer.SignatureKey = signatureKey
+		if encryptionKey != "" {
+			peer.EncryptionKey = encryptionKey
+		}
+		if signatureKey != "" {
+			peer.SignatureKey = signatureKey
+		}
 		peer.LastSeen = lastSeen
 		peer.TTLSeconds = ttlSeconds
 		peer.IsFake = isFake
-		m.peersMap[peerKey] = peer
-	}
-	if !found {
-		m.peersMap[peerKey] = muninn.Peer{
+	} else {
+		peer = muninn.Peer{
 			ID:            peerID,
 			Login:         login,
 			EncryptionKey: encryptionKey,
@@ -106,11 +110,16 @@ func (m *Messenger) upsertPeer(peerID, peerKey, login, encryptionKey, signatureK
 			LastSeen:      lastSeen,
 			TTLSeconds:    ttlSeconds,
 			IsFake:        isFake,
-			IDS:           []string{peerID},
 		}
-		if err := m.store.StorePeer(login, peerKey, encryptionKey, signatureKey, lastSeen, isFake); err != nil {
-			log.Printf("store peer %s: %v", peerID, err)
+		if peerID != "" {
+			peer.IDS = []string{peerID}
 		}
+	}
+	m.peersMap[peerKey] = peer
+	// Persist updates as well as new contacts, retaining keys omitted by a
+	// partial presence response. Offline sending must work after a restart.
+	if err := m.store.StorePeer(login, peerKey, peer.EncryptionKey, peer.SignatureKey, lastSeen, isFake); err != nil {
+		log.Printf("store peer %s: %v", peerID, err)
 	}
 	m.peers = m.PeerSlice()
 	m.mu.Unlock()
@@ -223,35 +232,56 @@ func (m *Messenger) findPeerByID(id string) *muninn.Peer {
 }
 
 func (m *Messenger) findPeerByKey(key string) *muninn.Peer {
-	keySplit := strings.Split(key, ":")
-	if len(keySplit) < 2 {
-		return nil
+	return m.findPeerByKeyWithContext(m.ctx, key)
+}
+
+func (m *Messenger) findPeerByKeyWithContext(ctx context.Context, key string) *muninn.Peer {
+	if peer := m.cachedPeerByKey(key); peer != nil {
+		return peer
 	}
 
-	login := keySplit[0]
-	signature := keySplit[1]
+	// A contact may have been imported or found in SQLite after startup.
+	// Its encryption/signature keys suffice; an active endpoint is optional.
+	if stored, err := m.store.GetStoredPeer(key); err == nil {
+		m.mu.Lock()
+		peer, exists := m.peersMap[key]
+		if !exists {
+			peer = stored.ToMuninnPeer()
+			m.peersMap[key] = peer
+			m.peers = m.PeerSlice()
+		}
+		m.mu.Unlock()
+		return &peer
+	}
+
+	return m.refreshPeerByKey(ctx, key)
+}
+
+func (m *Messenger) cachedPeerByKey(key string) *muninn.Peer {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	peer, exists := m.peersMap[key]
-	m.mu.RUnlock()
-	if exists && peer.ID != "" {
-		return &peer
-	}
-
-	stored, err := m.muninnClient.GetAllByKey(m.ctx, login, signature)
-	if err != nil || stored == nil {
+	if !exists {
 		return nil
 	}
+	peer.IDS = slices.Clone(peer.IDS)
+	return &peer
+}
 
-	for _, p := range stored {
-		m.upsertPeer(p.ID, p.Key(), p.Login, p.EncryptionKey, p.SignatureKey, p.LastSeen, p.TTLSeconds, p.IsFake)
+// refreshPeerByKey resolves network endpoints when a transport needs them.
+// A directory failure must not discard the locally known identity.
+func (m *Messenger) refreshPeerByKey(ctx context.Context, key string) *muninn.Peer {
+	login, signature, ok := strings.Cut(key, ":")
+	if !ok || login == "" || signature == "" {
+		return m.cachedPeerByKey(key)
 	}
-	m.mu.RLock()
-	peer, exists = m.peersMap[key]
-	m.mu.RUnlock()
-	if exists {
-		return &peer
+	stored, err := m.muninnClient.GetAllByKey(ctx, login, signature)
+	if err == nil {
+		for _, p := range stored {
+			m.upsertPeer(p.ID, p.Key(), p.Login, p.EncryptionKey, p.SignatureKey, p.LastSeen, p.TTLSeconds, p.IsFake)
+		}
 	}
-	return nil
+	return m.cachedPeerByKey(key)
 }
 
 func (m *Messenger) ConnectPeer(toPeerID string) error {

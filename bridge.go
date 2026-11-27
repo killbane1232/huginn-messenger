@@ -391,7 +391,8 @@ func messenger_get_messages_paginated(handle C.long, peerID *C.char, limit, offs
 	return C.CString(string(data))
 }
 
-// Success means the message and retry payloads were committed locally.
+// Success means the message was committed locally, including a failed send
+// when the recipient cannot be resolved.
 // Validation, attachment and database errors are returned before acceptance.
 //
 //export messenger_send_message
@@ -410,7 +411,8 @@ func messenger_send_message(handle C.long, to, text *C.char, ttl C.int) *C.char 
 	return okJSON()
 }
 
-// Success includes durable storage of the encrypted attachment for retry.
+// Resolved recipients include durable storage of encrypted attachments.
+// Otherwise, the failed message retains local attachment paths for manual retry.
 //
 //export messenger_send_file
 func messenger_send_file(handle C.long, to, text, filePath *C.char, ttl C.int) *C.char {
@@ -423,6 +425,32 @@ func messenger_send_file(handle C.long, to, text, filePath *C.char, ttl C.int) *
 		ttlSeconds = config.ChunkTTLSeconds(inst.cfg.ChunkTTL)
 	}
 	if err := inst.m.SendMessage(C.GoString(to), C.GoString(text), []string{C.GoString(filePath)}, ttlSeconds); err != nil {
+		return errorJSON(err.Error())
+	}
+	return okJSON()
+}
+
+//export messenger_retry_message
+func messenger_retry_message(handle C.long, msgID *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	msg, err := inst.m.RetryMessage(C.GoString(msgID))
+	if err != nil {
+		return errorJSON(err.Error())
+	}
+	data, _ := json.Marshal(map[string]any{"status": "ok", "message": msg})
+	return C.CString(string(data))
+}
+
+//export messenger_delete_failed_message
+func messenger_delete_failed_message(handle C.long, msgID *C.char) *C.char {
+	inst := getInstance(int64(handle))
+	if inst == nil {
+		return errorJSON("invalid handle")
+	}
+	if err := inst.m.DeleteFailedMessage(C.GoString(msgID)); err != nil {
 		return errorJSON(err.Error())
 	}
 	return okJSON()
