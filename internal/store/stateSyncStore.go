@@ -83,7 +83,7 @@ func (s *SQLiteStore) ExportMessagesForStateSync(since, checkpoint time.Time) (M
 		SELECT message_uid, login, sender_login, chat_id, data, CAST(created_at AS INTEGER)
 		FROM messages
 		WHERE state_updated_at >= ? AND state_updated_at <= ?
-		ORDER BY state_updated_at, message_uid`, sinceUnixMicro, checkpointUnixMicro)
+		AND `+replicableMessage+` ORDER BY state_updated_at, message_uid`, sinceUnixMicro, checkpointUnixMicro)
 	if err != nil {
 		return MessageReplicationDelta{}, fmt.Errorf("export messages for state sync: %w", err)
 	}

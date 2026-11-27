@@ -1,9 +1,9 @@
 package store
 
 import (
-	_ "database/sql"
 	"strings"
 	"time"
+
 	"github.com/killbane1232/huginn-messenger/internal/muninn"
 )
 
@@ -20,7 +20,7 @@ func (s *StoredPeer) ToMuninnPeer() muninn.Peer {
 		Login:         getLogin(s.PeerID),
 		EncryptionKey: s.EncryptionKey,
 		SignatureKey:  s.SignatureKey,
-		LastSeen:      time.Now(),
+		LastSeen:      s.LastSeen,
 		IsFake:        s.IsFake,
 	}
 }
@@ -60,6 +60,8 @@ func (s *SQLiteStore) SearchStoredPeers(query string) ([]muninn.Peer, error) {
 }
 
 func (s *SQLiteStore) GetStoredPeers() ([]StoredPeer, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	rows, err := s.db.Query("SELECT peer_id, encryption_key, signature_key, last_seen, is_fake FROM stored_peers where is_fake = FALSE ORDER BY last_seen DESC")
 	if err != nil {
 		return nil, err
@@ -74,4 +76,19 @@ func (s *SQLiteStore) GetStoredPeers() ([]StoredPeer, error) {
 		peers = append(peers, p)
 	}
 	return peers, rows.Err()
+}
+
+// GetStoredPeer looks up a contact by its permanent login:signature key,
+// independently of whether any of its network endpoints are online.
+func (s *SQLiteStore) GetStoredPeer(key string) (*StoredPeer, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var peer StoredPeer
+	err := s.db.QueryRow(`SELECT peer_id, encryption_key, signature_key, last_seen, is_fake
+		FROM stored_peers WHERE peer_id = ? AND is_fake = FALSE`, key).
+		Scan(&peer.PeerID, &peer.EncryptionKey, &peer.SignatureKey, &peer.LastSeen, &peer.IsFake)
+	if err != nil {
+		return nil, err
+	}
+	return &peer, nil
 }

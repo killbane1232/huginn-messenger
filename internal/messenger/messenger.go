@@ -26,12 +26,14 @@ import (
 )
 
 type ChatMessage struct {
-	From      string     `json:"from"`
-	ChatID    string     `json:"chat_id,omitempty"`
-	Text      string     `json:"text"`
-	Timestamp time.Time  `json:"timestamp"`
-	MsgID     string     `json:"msg_id,omitempty"`
-	Files     []FileMeta `json:"files,omitempty"`
+	From       string     `json:"from"`
+	ChatID     string     `json:"chat_id,omitempty"`
+	Text       string     `json:"text"`
+	Timestamp  time.Time  `json:"timestamp"`
+	MsgID      string     `json:"msg_id,omitempty"`
+	Files      []FileMeta `json:"files,omitempty"`
+	SendError  string     `json:"send_error,omitempty"`
+	TTLSeconds int        `json:"ttl_seconds,omitempty"`
 }
 
 type FileMeta struct {
@@ -383,7 +385,6 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		default:
 		}
 	})
-	m.startBackground(m.rtcReconnectLoop)
 	storedPeers, _ := st.GetStoredPeers()
 	for _, sp := range storedPeers {
 		munPeer := sp.ToMuninnPeer()
@@ -391,6 +392,7 @@ func New(username string, muninnClient *muninn.Client, dbPath string, opts ...Me
 		m.peers = append(m.peers, munPeer)
 	}
 
+	m.startBackground(m.rtcReconnectLoop)
 	m.startBackground(m.heartbeatLoop)
 	m.startBackground(m.groupRefreshLoop)
 	m.startBackground(m.peerRefreshLoop)
@@ -590,7 +592,7 @@ func (m *Messenger) processReceivedFileFromPeer(f FileMeta, senderID, preferredP
 
 	senderSignKey := m.signPublic
 	if senderID != m.Key {
-		senderPeer := m.findPeerByKey(senderID)
+		senderPeer := m.findPeerByKeyWithContext(ctx, senderID)
 		if senderPeer == nil {
 			log.Printf("sender %s not found for file %s", senderID, f.FileID)
 			return

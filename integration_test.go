@@ -1491,12 +1491,23 @@ func TestGroupFileSendAndReceive(t *testing.T) {
 }
 
 func TestFirstMessageEstablishesWebRTC(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		name := "current session"
+		if restart {
+			name = "restored contact after restart"
+		}
+		t.Run(name, func(t *testing.T) { testFirstMessageEstablishesWebRTC(t, restart) })
+	}
+}
+
+func testFirstMessageEstablishesWebRTC(t *testing.T, restart bool) {
 	mn := newTestMuninnServer()
 	defer mn.Close()
 
 	mc := muninn.NewClient(mn.URL())
 
-	alice, err := messenger.New("alice", mc, t.TempDir()+"/alice.db",
+	aliceDB := t.TempDir() + "/alice.db"
+	alice, err := messenger.New("alice", mc, aliceDB,
 		messenger.WithICEServers(iceServers()),
 		messenger.WithPoll())
 	if err != nil {
@@ -1522,6 +1533,18 @@ func TestFirstMessageEstablishesWebRTC(t *testing.T) {
 	alice.SearchPeers("bob")
 	bob.SearchPeers("alice")
 	time.Sleep(100 * time.Millisecond)
+	if restart {
+		alice.Shutdown()
+		alice, err = messenger.New("alice", mc, aliceDB,
+			messenger.WithICEServers(iceServers()), messenger.WithPoll())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer alice.Shutdown()
+		if err := alice.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	msgCh := bob.SubscribeMessages()
 	defer bob.UnsubscribeMessages(msgCh)

@@ -8,6 +8,14 @@ import (
 // QueueOutgoing commits the visible message and every retry payload together.
 // A successful send response must never precede this transaction.
 func (s *SQLiteStore) QueueOutgoing(msgID, login, sender, chatID string, data []byte, sentAt time.Time, chunks []PendingChunk) error {
+	return s.queueOutgoing(msgID, login, sender, chatID, data, sentAt, chunks, false)
+}
+
+func (s *SQLiteStore) RetryOutgoing(msgID, login, sender, chatID string, data []byte, sentAt time.Time, chunks []PendingChunk) error {
+	return s.queueOutgoing(msgID, login, sender, chatID, data, sentAt, chunks, true)
+}
+
+func (s *SQLiteStore) queueOutgoing(msgID, login, sender, chatID string, data []byte, sentAt time.Time, chunks []PendingChunk, retry bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
@@ -15,8 +23,15 @@ func (s *SQLiteStore) QueueOutgoing(msgID, login, sender, chatID string, data []
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec(`INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at, state_updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, msgID, login, sender, chatID, data, sentAt.UnixMicro(), time.Now().UTC().UnixMicro())
+	query := `INSERT INTO messages (message_uid, login, sender_login, chat_id, data, created_at, state_updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`
+	args := []any{msgID, login, sender, chatID, data, sentAt.UnixMicro(), time.Now().UTC().UnixMicro()}
+	if retry {
+		query = `UPDATE messages SET login = ?, sender_login = ?, chat_id = ?, data = ?, created_at = ?, state_updated_at = ?
+			WHERE message_uid = ? AND json_valid(data) AND json_extract(data, '$.send_error') != ''`
+		args = []any{login, sender, chatID, data, sentAt.UnixMicro(), time.Now().UTC().UnixMicro(), msgID}
+	}
+	result, err := tx.Exec(query, args...)
 	if err != nil {
 		return err
 	}
@@ -25,6 +40,9 @@ func (s *SQLiteStore) QueueOutgoing(msgID, login, sender, chatID string, data []
 		return err
 	}
 	if count == 0 {
+		if retry {
+			return fmt.Errorf("failed message no longer exists")
+		}
 		return ErrDeletedMessage
 	}
 	for _, c := range chunks {

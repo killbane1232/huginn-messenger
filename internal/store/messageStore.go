@@ -1,8 +1,44 @@
 package store
 
 import (
+	"fmt"
 	"time"
 )
+
+func (s *SQLiteStore) GetMessage(msgID string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var data []byte
+	err := s.db.QueryRow(`SELECT data FROM messages WHERE message_uid = ?`, msgID).Scan(&data)
+	return data, err
+}
+
+func (s *SQLiteStore) DeleteOutgoingFailure(msgID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`INSERT OR IGNORE INTO deleted_messages (message_uid)
+		SELECT message_uid FROM messages WHERE message_uid = ?
+		AND json_valid(data) AND json_extract(data, '$.send_error') != ''`, msgID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return fmt.Errorf("failed message no longer exists")
+	}
+	if _, err := tx.Exec(`DELETE FROM messages WHERE message_uid = ?`, msgID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 const messageHistorySelect = `
 		SELECT data

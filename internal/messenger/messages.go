@@ -68,7 +68,9 @@ func (m *Messenger) SendMessage(to, text string, filePaths []string, ttlSeconds 
 	}
 	// Queue saturation or shutdown cannot discard an accepted message: the
 	// periodic worker (including after restart) reads the same SQLite outbox.
-	m.async.trySubmit(func() { m.deliverOutgoing(outgoing) })
+	if outgoing.message.SendError == "" {
+		m.async.trySubmit(func() { m.deliverOutgoing(outgoing) })
+	}
 	return nil
 }
 
@@ -77,8 +79,42 @@ func (m *Messenger) SendMessageSync(to, text string, filePaths []string, ttlSeco
 	if err != nil {
 		return err
 	}
-	m.deliverOutgoing(outgoing)
+	if outgoing.message.SendError == "" {
+		m.deliverOutgoing(outgoing)
+	}
 	return nil
+}
+
+// RetryMessage replaces a saved failure only after its delivery payload is durable.
+func (m *Messenger) RetryMessage(msgID string) (*ChatMessage, error) {
+	data, err := m.store.GetMessage(msgID)
+	if err != nil {
+		return nil, err
+	}
+	var msg ChatMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return nil, err
+	}
+	if msg.SendError == "" {
+		return nil, fmt.Errorf("message is not a failed send")
+	}
+	paths := make([]string, 0, len(msg.Files))
+	for _, file := range msg.Files {
+		if file.FilePath == "" {
+			return nil, fmt.Errorf("attachment is not available")
+		}
+		paths = append(paths, file.FilePath)
+	}
+	outgoing, err := m.prepareOutgoingMessage(msg, paths, msg.TTLSeconds, true)
+	if err != nil {
+		return nil, err
+	}
+	m.async.trySubmit(func() { m.deliverOutgoing(outgoing) })
+	return &outgoing.message, nil
+}
+
+func (m *Messenger) DeleteFailedMessage(msgID string) error {
+	return m.store.DeleteOutgoingFailure(msgID)
 }
 
 func (m *Messenger) waitForPeerConnection(peerID string, timeout time.Duration) bool {
